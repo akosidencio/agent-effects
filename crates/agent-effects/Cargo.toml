@@ -1,0 +1,28 @@
+[package]
+name = "agent-effects"
+description = "Reliable side-effect execution for AI agents and autonomous applications"
+keywords = ["agents", "idempotency", "side-effects", "reliability", "recovery"]
+categories = ["asynchronous", "development-tools"]
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+agent-effects-store.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "time", "macros"] }
+tracing.workspace = true
+
+[dev-dependencies]
+agent-effects-memory.workspace = true
+proptest.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "test-util"] }
+
+[lints]
+workspace = true
