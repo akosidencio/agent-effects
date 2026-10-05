@@ -41,8 +41,8 @@
 //!
 //! **Status:** pre-release. The runtime runs effects with retries,
 //! timeouts, preconditions and verification, records their outcome, and
-//! re-attaches later calls to it. Recovery tooling and the SQLite store come
-//! next; see `docs/roadmap.md`. The persisted vocabulary
+//! re-attaches later calls to it; [`recovery`] adds the operator tools. The
+//! SQLite store comes next; see `docs/roadmap.md`. The persisted vocabulary
 //! (identity, kinds, the state machine) and the [`EffectStore`] contract come
 //! from [`agent-effects-store`](store) and are re-exported here.
 
@@ -50,6 +50,7 @@ pub mod clock;
 pub mod effect;
 pub mod error;
 pub mod policy;
+pub mod recovery;
 pub mod retry;
 pub mod runtime;
 #[cfg(feature = "testkit")]
@@ -70,6 +71,7 @@ pub use clock::{Clock, ManualClock, SystemClock, TokioClock};
 pub use effect::{EffectBuilder, EffectContext, EffectFailure, EffectOutcome, Precondition};
 pub use error::RuntimeError;
 pub use policy::{Capabilities, UnknownPlan};
+pub use recovery::{RecoveryReport, Resolution};
 pub use retry::RetryPolicy;
 pub use runtime::{Runtime, RuntimeBuilder};
 pub use verification::{NotFoundReading, Verification, VerificationMode};

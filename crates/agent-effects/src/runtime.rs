@@ -218,8 +218,12 @@ impl<S: EffectStore> Runtime<S> {
         self.inner.retry
     }
 
-    fn now(&self) -> SystemTime {
+    pub(crate) fn now(&self) -> SystemTime {
         self.inner.clock.now()
+    }
+
+    pub(crate) fn lease_ttl(&self) -> Duration {
+        self.inner.lease_ttl
     }
 
     pub(crate) async fn execute<T, F, Fut, V>(

@@ -262,11 +262,48 @@ including a worker that stalls past its lease. The new holder escalates, and
 the stalled worker's late success is refused by fencing and does not
 overwrite that decision.
 
-`runtime.recover()` *(M5)* runs in the background. It moves expired
-`Executing`/`Verifying` records to `Unknown` and returns a report of what
-still needs a caller or an operator. `runtime.pending()` lists those records,
-so an application can re-drive them at startup. `runtime.resolve(id,
-Resolution::{Applied(output), NotApplied, Retry})` is the operator path.
+### Recovery and operators
+
+Implemented in `recovery.rs`:
+
+- **`runtime.recover()`** scans for `Executing`/`Verifying` effects whose
+  lease expired (`ListQuery::expired_leases`, paged 100 at a time). It takes
+  each one under its own lease, re-checks the status, applies `LeaseExpired`
+  (→ `Unknown`, actor `recovery:<worker>`) and releases. Effects that another
+  worker grabs first are reported as `skipped`. It changes nothing else:
+  `Pending`, `Unknown` and settled effects are left alone, because only a
+  caller holding the closures can move them further. It is safe to run on
+  several workers at once, and running it twice in a row is a no-op.
+- **`runtime.run_recovery(interval)`** runs `recover` on a timer, forever.
+  Spawn it. A failed pass is logged and retried at the next tick.
+- **`runtime.pending(after, limit)`** lists unsettled effects that nobody
+  holds: `Pending`, expired `Executing`/`Verifying`, `Unknown` and
+  `NeedsIntervention`. That is the startup list of what to re-run or hand to
+  an operator.
+- **`runtime.resolve(id, resolution, actor, note)`** records an operator's
+  decision on an `Unknown` or `NeedsIntervention` effect, as a lease-less
+  transition (refused while anyone holds the effect):
+  - `Resolution::Applied { output }` → `Committed`; later calls replay
+    `output`.
+  - `NotApplied` → `Failed`, with the note as the error.
+  - `Retry` → `Pending`; the next call runs it, even with the retry budget
+    spent, because the operator decided.
+
+  The note is stored in the audit event's payload.
+
+The M5 exit test, a stalled-worker takeover, is in `tests/recovery.rs`, in
+three variants. In each, worker *a* stalls past its lease, recovery marks the
+effect unknown, and worker *b* takes over:
+
+| *a*'s request | *b*'s effect has | Result |
+|---|---|---|
+| applied before the stall | verification | *b* confirms, never re-runs; created once |
+| still in flight, lands after *b* re-runs | remote idempotency | both send, the remote applies once |
+| unknown | neither | *b* escalates; an operator resolves; *b*'s action never runs |
+
+In every case *a*'s late write is fenced off and its call reports the
+outcome *b* recorded. Mutation checks confirm the first two depend on
+verification and on the stable idempotency key respectively.
 
 A durable handler registry, which would let the recovery worker finish
 effects with no caller, is planned for v0.2. The storage format already
@@ -474,6 +511,8 @@ Crates are added when their milestone starts, not as empty placeholders.
 | D18 | 2026-10-05 | Verification also runs after every success (postcondition); inconclusive checks leave the effect `Unknown`, not escalated | "200 OK" is not proof; an unreachable lookup is a reason to look again later, not to page an operator |
 | D19 | 2026-10-05 | `max_attempts` is a lifetime budget per effect; it also caps checks per call | Restarts and re-attaching calls cannot reset the budget; every loop is bounded |
 | D20 | 2026-10-05 | `TokioClock`, plus a `testkit` feature with `FakeRemote` | Paused-time tests run real backoff schedules instantly; a scripted provider makes duplicates countable |
+| D21 | 2026-10-05 | Recovery only marks expired attempts `Unknown`; it never verifies, re-runs or escalates | Without durable closures it has nothing safe to run; honest state plus `pending()` lets callers and operators act |
+| D22 | 2026-10-05 | `Resolution::Retry` grants an attempt beyond the budget | It is an explicit human decision; refusing it would force a workaround |
 
 ## Open questions
 

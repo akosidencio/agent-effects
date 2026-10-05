@@ -10,8 +10,8 @@ safe retry instead of guessing.
 
 > **Status: pre-release.** On an in-memory store, the runtime runs effects
 > with retries, timeouts, preconditions and verification. It records
-> outcomes, replays them, and re-attaches after crashes. Recovery tooling
-> and the SQLite store are in progress. See
+> outcomes, replays them, re-attaches after crashes, and gives operators
+> `recover`, `pending` and `resolve`. The SQLite store is in progress. See
 > [docs/roadmap.md](docs/roadmap.md).
 
 ## The problem
