@@ -369,56 +369,93 @@ resolution, terminal finality, and listing/paging. Its sensitivity was checked
 by breaking `MemoryStore` on purpose: ignoring the unique key, or persisting
 the event without the record. The suite caught both.
 
-## 9. Storage: SQLite via sqlx *(planned, M6)*
+## 9. Storage: SQLite via sqlx
 
-- `sqlx` with the `sqlite` feature and runtime-checked queries (no
-  `DATABASE_URL` at build time). Migrations are embedded with
-  `sqlx::migrate!`. The same tooling serves Postgres in v0.2.
-- WAL mode, `busy_timeout`. Compare-and-set transitions run in
-  `BEGIN IMMEDIATE` transactions.
-- Times are stored as integer Unix milliseconds, ids as text, payloads as
-  JSON text.
+`agent-effects-sqlite`, built in M6. It depends on `agent-effects-store`
+only.
+
+- **Connection settings** (`SqliteStore::open`):
+  - WAL journal, so readers don't block the writer.
+  - `synchronous = FULL`: the runtime persists an attempt *before* calling
+    the remote system. Under `NORMAL`, a power cut could lose that write and
+    leave a `Pending` record for an effect that may have run, which the next
+    call would run again.
+  - `busy_timeout` 5 s, foreign keys on, up to 8 pooled connections.
+- **Writes.** Every write is "load → pure `EffectRecord` operation → save"
+  inside a `BEGIN IMMEDIATE` transaction (`Pool::begin_with`). That takes the
+  write lock up front. With a deferred `BEGIN`, two processes can both read
+  and then fail to upgrade their lock. The multi-process test catches exactly
+  that, and the in-process conformance suite does not. The `UPDATE` also
+  checks the version it read, as a second guard.
+- **Inserts** are `INSERT … ON CONFLICT (effect_name, logical_key) DO
+  NOTHING`, then a read of the winner.
+- **Queries and migrations.** Queries are checked at runtime, so no
+  `DATABASE_URL` is needed at build time. Migrations are embedded
+  (`sqlx::migrate!`, `migrations/0001_effects.sql`) and run on open. The
+  sqlx migrations table records the schema version.
+- **Encoding.** Times are Unix milliseconds; returned records are normalized
+  to that precision so they equal what a later read returns. Ids are
+  hyphenated UUID text, whose text order equals byte order, so `ORDER BY id`
+  is creation order. JSON columns are stored as text.
+
+Schema as built:
 
 ```sql
 CREATE TABLE effects (
-    id                TEXT PRIMARY KEY,
-    effect_name       TEXT NOT NULL,
-    logical_key       TEXT NOT NULL,
-    kind              TEXT NOT NULL,
-    status            TEXT NOT NULL,
-    input             TEXT,             -- JSON, redacted per §10
-    input_fingerprint TEXT,
-    output            TEXT,             -- JSON
-    last_error        TEXT,             -- JSON
-    attempt_count     INTEGER NOT NULL DEFAULT 0,
-    next_attempt_at   INTEGER,
-    current_attempt_started_at INTEGER,
-    lease_owner       TEXT,
-    lease_epoch       INTEGER NOT NULL DEFAULT 0,
-    lease_expires_at  INTEGER,
-    version           INTEGER NOT NULL DEFAULT 0,
-    created_at        INTEGER NOT NULL,
-    updated_at        INTEGER NOT NULL,
-    committed_at      INTEGER,
+    id                 TEXT    PRIMARY KEY NOT NULL,
+    effect_name        TEXT    NOT NULL,
+    logical_key        TEXT    NOT NULL,
+    kind               TEXT    NOT NULL,
+    status             TEXT    NOT NULL,
+    input              TEXT,             -- JSON
+    input_fingerprint  TEXT,
+    output             TEXT,             -- JSON
+    last_error         TEXT,             -- JSON ErrorRecord
+    created_by         TEXT,
+    attempt_count      INTEGER NOT NULL,
+    next_attempt_at    INTEGER,
+    attempt_started_at INTEGER,
+    lease_owner        TEXT,
+    lease_epoch        INTEGER NOT NULL,
+    lease_expires_at   INTEGER,
+    version            INTEGER NOT NULL,
+    created_at         INTEGER NOT NULL,
+    updated_at         INTEGER NOT NULL,
+    committed_at       INTEGER,
     UNIQUE (effect_name, logical_key)
 );
+CREATE INDEX effects_status_lease ON effects (status, lease_expires_at);
 
 CREATE TABLE effect_events (
-    effect_id  TEXT NOT NULL REFERENCES effects(id),
-    sequence   INTEGER NOT NULL,
-    event      TEXT NOT NULL,
-    attempt    INTEGER NOT NULL,
-    actor      TEXT,
-    payload    TEXT,
-    created_at INTEGER NOT NULL,
+    effect_id   TEXT    NOT NULL REFERENCES effects (id),
+    sequence    INTEGER NOT NULL,
+    transition  TEXT    NOT NULL,     -- Transition::as_str, e.g. effect.attempt_started
+    from_status TEXT    NOT NULL,
+    to_status   TEXT    NOT NULL,
+    attempt     INTEGER NOT NULL,
+    actor       TEXT,
+    payload     TEXT,                 -- JSON
+    at          INTEGER NOT NULL,
     PRIMARY KEY (effect_id, sequence)
 );
-
-CREATE INDEX effects_recoverable ON effects (status, lease_expires_at);
 ```
 
-The schema version is recorded by sqlx's migrations table and is part of the
-stability contract from 1.0.
+Tests (`crates/agent-effects-sqlite/tests/`):
+
+- **Conformance.** The full suite, each case on a fresh database file.
+- **Reopening.** A committed effect and its audit trail survive closing and
+  reopening the file.
+- **Multiple processes.** The test binary re-runs itself as 3 worker
+  processes on one database file. Each runs the same 150 effects in the same
+  order, and every action appends a line to a shared log. Every effect ran
+  exactly once, more than one process did real work, and every record is
+  `Committed` after one attempt.
+
+Mutation checks:
+
+- A deferred `BEGIN` breaks the multi-process test.
+- Dropping `ON CONFLICT` breaks conformance and reopening.
+- Dropping the lease filter from `list` breaks conformance.
 
 ## 10. Sensitive data
 
@@ -466,7 +503,7 @@ agent-effects/
 │   ├── agent-effects-store      the contract: ids, kinds, failure classes, state
 │   │                            machine, records, leases, EffectStore, testkit
 │   ├── agent-effects-memory     MemoryStore
-│   ├── agent-effects-sqlite     (M6)
+│   ├── agent-effects-sqlite     SqliteStore (sqlx)
 │   ├── agent-effects-postgres   (v0.2)
 │   ├── agent-effects-http       (v0.2)
 │   ├── agent-effects-otel       (v0.2)
@@ -513,6 +550,8 @@ Crates are added when their milestone starts, not as empty placeholders.
 | D20 | 2026-10-05 | `TokioClock`, plus a `testkit` feature with `FakeRemote` | Paused-time tests run real backoff schedules instantly; a scripted provider makes duplicates countable |
 | D21 | 2026-10-05 | Recovery only marks expired attempts `Unknown`; it never verifies, re-runs or escalates | Without durable closures it has nothing safe to run; honest state plus `pending()` lets callers and operators act |
 | D22 | 2026-10-05 | `Resolution::Retry` grants an attempt beyond the budget | It is an explicit human decision; refusing it would force a workaround |
+| D23 | 2026-10-05 | SQLite runs with `synchronous = FULL` and `BEGIN IMMEDIATE` | Intent must be durable before the remote call; immediate locking avoids lock-upgrade failures between processes |
+| D24 | 2026-10-05 | `agent-effects-sqlite` has its own MSRV, 1.94 (sqlx 0.9); the other crates stay at 1.90 | Users without SQLite are not forced onto a newer compiler |
 
 ## Open questions
 

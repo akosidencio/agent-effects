@@ -11,7 +11,8 @@ safe retry instead of guessing.
 > **Status: pre-release.** On an in-memory store, the runtime runs effects
 > with retries, timeouts, preconditions and verification. It records
 > outcomes, replays them, re-attaches after crashes, and gives operators
-> `recover`, `pending` and `resolve`. The SQLite store is in progress. See
+> `recover`, `pending` and `resolve`, on in-memory or SQLite storage. The
+> crash and fault-injection suite is in progress. See
 > [docs/roadmap.md](docs/roadmap.md).
 
 ## The problem
@@ -61,7 +62,8 @@ still applies.
 cargo test --workspace --all-features
 cargo clippy --workspace --all-targets --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
-cargo +1.90 test --workspace --all-features   # MSRV
+cargo +1.90 test --workspace --exclude agent-effects-sqlite --all-features   # MSRV
+cargo +1.94 test -p agent-effects-sqlite                                      # its MSRV (sqlx)
 ```
 
 | Crate | Purpose |
@@ -69,6 +71,7 @@ cargo +1.90 test --workspace --all-features   # MSRV
 | `agent-effects` | the runtime; the crate applications depend on |
 | `agent-effects-store` | storage contract, state machine, backend conformance suite |
 | `agent-effects-memory` | in-memory store for tests and development |
+| `agent-effects-sqlite` | SQLite store; several processes may share one file |
 
 ## License
 

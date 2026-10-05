@@ -204,6 +204,11 @@ pub const ALL_TRANSITIONS: [Transition; 18] = [
 ];
 
 impl Transition {
+    /// Parses the audit-event name produced by [`Self::as_str`].
+    pub fn parse(s: &str) -> Option<Self> {
+        ALL_TRANSITIONS.into_iter().find(|t| t.as_str() == s)
+    }
+
     /// The stable audit-event name, e.g. `effect.attempt_started`.
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -366,6 +371,9 @@ mod tests {
         }
         let names: HashSet<_> = ALL_TRANSITIONS.iter().map(|t| t.as_str()).collect();
         assert_eq!(names.len(), ALL_TRANSITIONS.len());
+        for transition in ALL_TRANSITIONS {
+            assert_eq!(Transition::parse(transition.as_str()), Some(transition));
+        }
     }
 
     fn transition() -> impl Strategy<Value = Transition> {

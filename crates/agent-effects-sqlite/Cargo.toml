@@ -1,0 +1,26 @@
+[package]
+name = "agent-effects-sqlite"
+description = "SQLite store for agent-effects"
+keywords = ["agents", "idempotency", "side-effects", "sqlite"]
+categories = ["asynchronous", "database"]
+version.workspace = true
+edition.workspace = true
+rust-version = "1.94"   # sqlx 0.9 requires it; the other crates stay at the workspace MSRV
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+agent-effects-store.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx = { workspace = true }
+uuid.workspace = true
+
+[dev-dependencies]
+agent-effects = { workspace = true, features = ["testkit"] }
+agent-effects-store = { workspace = true, features = ["testkit"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+
+[lints]
+workspace = true
