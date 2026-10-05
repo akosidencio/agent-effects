@@ -22,6 +22,9 @@ use crate::effect::{
 };
 use crate::error::RuntimeError;
 use crate::failure::{Disposition, FailureClass};
+#[cfg(feature = "fault-injection")]
+use crate::fault::FaultInjector;
+use crate::fault::FaultPoint;
 use crate::id::{EffectId, WorkerId};
 use crate::policy::UnknownPlan;
 use crate::retry::RetryPolicy;
@@ -46,6 +49,8 @@ struct Inner<S> {
     worker: WorkerId,
     lease_ttl: Duration,
     retry: RetryPolicy,
+    #[cfg(feature = "fault-injection")]
+    faults: Option<Arc<FaultInjector>>,
 }
 
 impl<S> Clone for Runtime<S> {
@@ -64,6 +69,8 @@ pub struct RuntimeBuilder<S> {
     worker: Option<WorkerId>,
     lease_ttl: Duration,
     retry: RetryPolicy,
+    #[cfg(feature = "fault-injection")]
+    faults: Option<Arc<FaultInjector>>,
 }
 
 impl<S: EffectStore> RuntimeBuilder<S> {
@@ -100,6 +107,14 @@ impl<S: EffectStore> RuntimeBuilder<S> {
         self
     }
 
+    /// Simulates crashes at the injector's armed points. For tests; see
+    /// [`fault`](crate::fault).
+    #[cfg(feature = "fault-injection")]
+    pub fn fault_injector(mut self, injector: Arc<FaultInjector>) -> Self {
+        self.faults = Some(injector);
+        self
+    }
+
     /// Builds the runtime.
     pub fn build(self) -> Runtime<S> {
         Runtime {
@@ -109,20 +124,12 @@ impl<S: EffectStore> RuntimeBuilder<S> {
                 worker: self.worker.unwrap_or_else(WorkerId::random),
                 lease_ttl: self.lease_ttl,
                 retry: self.retry,
+                #[cfg(feature = "fault-injection")]
+                faults: self.faults,
             }),
         }
     }
 }
-
-/// Points where a crash can be simulated. Wired to the fault injector in M7.
-#[derive(Clone, Copy, Debug)]
-enum FaultPoint {
-    Inserted,
-    AttemptPersisted,
-    ActionReturned,
-}
-
-fn checkpoint(_point: FaultPoint) {}
 
 /// Why moving an effect forward stopped early.
 enum Interrupt {
@@ -154,6 +161,8 @@ impl<S: EffectStore> Runtime<S> {
             worker: None,
             lease_ttl: Duration::from_secs(30),
             retry: RetryPolicy::default(),
+            #[cfg(feature = "fault-injection")]
+            faults: None,
         }
     }
 
@@ -226,6 +235,18 @@ impl<S: EffectStore> Runtime<S> {
         self.inner.lease_ttl
     }
 
+    /// A point where a crash can be injected; a no-op without the
+    /// `fault-injection` feature.
+    #[cfg_attr(not(feature = "fault-injection"), allow(clippy::unused_self))]
+    fn checkpoint(&self, point: FaultPoint) {
+        #[cfg(feature = "fault-injection")]
+        if let Some(faults) = &self.inner.faults {
+            faults.reach(point);
+        }
+        #[cfg(not(feature = "fault-injection"))]
+        let _ = point;
+    }
+
     pub(crate) async fn execute<T, F, Fut, V>(
         &self,
         spec: EffectSpec,
@@ -277,6 +298,7 @@ impl<S: EffectStore> Runtime<S> {
         Fut: Future<Output = Result<T, EffectFailure>> + Send + 'static,
         V: Verifier<T>,
     {
+        self.checkpoint(FaultPoint::BeforeInsert);
         let store = self.store();
         let inserted = store
             .insert_or_get(NewEffect {
@@ -291,7 +313,7 @@ impl<S: EffectStore> Runtime<S> {
             .await?;
         let mut record = inserted.record;
         Span::current().record("effect.id", field::display(record.id));
-        checkpoint(FaultPoint::Inserted);
+        self.checkpoint(FaultPoint::AfterInsert);
         if !inserted.inserted {
             check_matches(&record, &spec)?;
         }
@@ -417,7 +439,7 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
                         })
                         .await?;
                     Span::current().record("effect.attempt", record.attempt_count);
-                    checkpoint(FaultPoint::AttemptPersisted);
+                    self.rt.checkpoint(FaultPoint::AfterAttemptPersisted);
                     let (next, produced) = self.attempt(record).await?;
                     record = next;
                     if produced.is_some() {
@@ -473,6 +495,7 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
         // If the lease is lost while waiting, the handle is dropped and the
         // task finishes detached: the request is already in flight.
         let mut task = tokio::spawn((self.action)(context(&record)));
+        self.rt.checkpoint(FaultPoint::AfterActionStarted);
         let joined = match self.spec.attempt_timeout {
             None => self.leased(&mut task).await?,
             Some(limit) => match self.leased(tokio::time::timeout(limit, &mut task)).await? {
@@ -485,7 +508,7 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
                 }
             },
         };
-        checkpoint(FaultPoint::ActionReturned);
+        self.rt.checkpoint(FaultPoint::AfterActionReturned);
 
         match joined {
             Ok(Ok(value)) if self.spec.capabilities.verification != VerificationMode::None => {
@@ -567,6 +590,7 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
                 }
             })
             .await?;
+        self.rt.checkpoint(FaultPoint::AfterVerificationStarted);
         let mode = self.spec.capabilities.verification;
         let max_checks = self.retry().max_attempts.max(1);
         let mut last_problem = String::from("no check completed");

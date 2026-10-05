@@ -49,6 +49,7 @@
 pub mod clock;
 pub mod effect;
 pub mod error;
+pub mod fault;
 pub mod policy;
 pub mod recovery;
 pub mod retry;

@@ -38,7 +38,10 @@ pub enum Behavior {
 ///
 /// A request with an idempotency key the remote has already applied returns
 /// the earlier result without applying again, like a provider that honours
-/// `Idempotency-Key`. [`FakeRemote::find`] sees a resource only `lag` after
+/// `Idempotency-Key`. That includes a request scripted to
+/// [`Behavior::Fail`]: the remote answers a replay before it would evaluate
+/// the request. Network-level behaviors (`Unreachable`, `LoseRequest`,
+/// `CommitThenDrop`'s dropped answer, `Hang`) still happen. [`FakeRemote::find`] sees a resource only `lag` after
 /// it was created, like an eventually consistent search API.
 #[derive(Clone)]
 pub struct FakeRemote {
@@ -90,14 +93,23 @@ impl FakeRemote {
         resource: &str,
         idempotency_key: Option<IdempotencyKey>,
     ) -> Result<String, EffectFailure> {
-        let behavior = {
+        let (behavior, replay) = {
             let mut state = self.lock();
             state.requests += 1;
-            state.script.pop_front().unwrap_or(Behavior::Succeed)
+            let replay = idempotency_key.and_then(|k| state.by_idempotency_key.get(&k).cloned());
+            (
+                state.script.pop_front().unwrap_or(Behavior::Succeed),
+                replay,
+            )
         };
         match behavior {
             Behavior::Succeed => Ok(self.apply(resource, idempotency_key)),
-            Behavior::Fail(class) => Err(EffectFailure::new(class, "remote refused the request")),
+            // A remote that deduplicates answers a replayed key with the
+            // original result before it would evaluate the request again.
+            Behavior::Fail(class) => match replay {
+                Some(id) => Ok(id),
+                None => Err(EffectFailure::new(class, "remote refused the request")),
+            },
             Behavior::Unreachable => {
                 Err(EffectFailure::ambiguous("connection refused").request_sent(false))
             }

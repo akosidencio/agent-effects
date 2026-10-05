@@ -13,6 +13,8 @@ authors.workspace = true
 [features]
 # Test doubles (`testkit::FakeRemote`) for exercising failure handling.
 testkit = []
+# `fault::FaultInjector`: simulated crashes at chosen points, for recovery tests.
+fault-injection = []
 
 [dependencies]
 agent-effects-store.workspace = true
@@ -25,7 +27,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 # Enables the testkit for this crate's own integration tests.
-agent-effects = { path = ".", features = ["testkit"] }
+agent-effects = { path = ".", features = ["testkit", "fault-injection"] }
 agent-effects-memory.workspace = true
 proptest.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "test-util"] }

@@ -472,19 +472,59 @@ audit. With the planned registry, it is also for re-execution. Therefore:
 
 ## 11. Crash points
 
-| Crash point | Record left in | Recovery |
-|---|---|---|
-| before the record is inserted | nothing | caller retries, starts fresh |
-| after insert, before `StartAttempt` | Pending | next call or lease expiry resumes; nothing was sent |
-| after `StartAttempt`, before the request is sent | Executing | lease expiry → Unknown → unknown plan (the runtime cannot prove nothing was sent) |
-| while the request is in flight | Executing | same |
-| after remote commit, before the response | Executing | same; verification or idempotency resolves it, else escalate |
-| after the response, before persisting it | Executing | same |
-| during verification | Verifying | lease expiry → Unknown → verify again |
-| during compensation | — | v0.2 |
+Every point has a tested recovery path (M7). `FaultPoint` names the points.
+`FaultInjector` (feature `fault-injection`) stops the runtime at one of them:
+`crash()` panics inside the runtime's task, and `abort()` kills the process.
+Either way nothing after the point runs: no writes, no lease release, no
+heartbeat. An action already spawned keeps running, like a request on the
+wire.
 
-Each row becomes a fault-injection test (M7), run both in-process (drop the
-runtime, rebuild it on the same store) and as a killed subprocess on SQLite.
+| Crash point (`FaultPoint`) | Record left in | Recovery | verified / idempotent | unprotected |
+|---|---|---|---|---|
+| `BeforeInsert` | nothing | the next call starts fresh | created once | created once |
+| `AfterInsert` | `Pending`, no lease | the next call runs it; nothing was sent | created once | created once |
+| `AfterAttemptPersisted` (before the request is sent) | `Executing` | lease expiry → `recover()` → `Unknown` → unknown plan; the runtime cannot prove nothing was sent | created once | operator, created 0 times |
+| `AfterActionStarted` (request in flight) | `Executing` | same | created once | operator, created ≤ 1 times |
+| `AfterActionReturned` (after the remote commit, before persisting the result; this also covers "before the response") | `Executing` | same | created once | operator, created once |
+| `AfterVerificationStarted` | `Verifying` | lease expiry → `Unknown` → verify again | created once | not on this path |
+| during compensation | — | v0.2 | | |
+
+"verified" means irreversible with an authoritative lookup. "idempotent"
+means irreversible with a remote that deduplicates on the key.
+"unprotected" means neither. "operator" means the effect ends
+`NeedsIntervention`, and a re-run never runs the action again.
+
+Three suites cover it:
+
+- **`tests/crash.rs`** (in-process). One test per point, each across all
+  three protections. The runtime crashes; paused time runs out the lease;
+  `recover()` runs; a fresh runtime over the same `MemoryStore` re-runs the
+  effect. The test asserts that every point is reached on its path, so it
+  cannot pass because nothing crashed.
+- **`agent-effects-sqlite/tests/crash_subprocess.rs`** (real process death).
+  The same matrix, with a child process that `abort()`s at the point on a
+  SQLite file and a remote whose state is a file. The parent asserts the
+  child died exactly when the point was reachable, then waits out the lease,
+  recovers and re-runs. For a kill while the request is in flight, it allows
+  that the request may not have left yet.
+- **`tests/model.rs`** (model-based, 512 cases per run). Proptest generates
+  random effect configurations, `FakeRemote` scripts, and sequences of
+  calls, crashes at random points, lease expiries and recovery passes. After
+  each case:
+  - the audit trail must replay through the transition table from `Pending`
+    with contiguous sequence numbers, ending at the record's status and
+    version;
+  - an effect that is not naturally idempotent must have been created at
+    most once;
+  - `Committed` implies created, and `Failed` (for such effects) implies not
+    created.
+
+Mutation checks:
+
+- Disabling the checkpoints fails every crash test.
+- Blind re-running of unknown outcomes fails exactly the three in-doubt
+  points, in both crash suites, and the model test (shrunk to a duplicate).
+- Recording ambiguous failures as `Failed` fails the model test.
 
 ## 12. Observability
 
@@ -552,6 +592,8 @@ Crates are added when their milestone starts, not as empty placeholders.
 | D22 | 2026-10-05 | `Resolution::Retry` grants an attempt beyond the budget | It is an explicit human decision; refusing it would force a workaround |
 | D23 | 2026-10-05 | SQLite runs with `synchronous = FULL` and `BEGIN IMMEDIATE` | Intent must be durable before the remote call; immediate locking avoids lock-upgrade failures between processes |
 | D24 | 2026-10-05 | `agent-effects-sqlite` has its own MSRV, 1.94 (sqlx 0.9); the other crates stay at 1.90 | Users without SQLite are not forced onto a newer compiler |
+| D25 | 2026-10-05 | Simulated crashes: a panic in the runtime's task in-process, `process::abort()` in subprocesses | Both stop at the exact point with no cleanup, the way a real crash does; no special shutdown path in the runtime to keep honest |
+| D26 | 2026-10-05 | `FakeRemote` answers a replayed idempotency key with the original result even when scripted to fail | Real deduplicating providers check the key before evaluating; otherwise the model test reports duplicates that cannot happen |
 
 ## Open questions
 

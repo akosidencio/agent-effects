@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc e84bb99241b1ab6cd547efc4720cce990b04fc3f5ff4da89ffd8f8471273bdd4 # shrinks to case = Case { kind: ReversibleWrite, remote_idempotency: false, verify: false, script: [CommitThenDrop], steps: [Call] }
+cc 99e69f3184385687394eaed944d62afdd9dcd5cbea78b50d47b7503464bcf299 # shrinks to case = Case { kind: ReversibleWrite, remote_idempotency: false, verify: false, script: [CommitThenDrop], steps: [Call] }

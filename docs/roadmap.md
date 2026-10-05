@@ -13,7 +13,7 @@ Design reference: [design.md](design.md). Status as of 2026-10-05.
 | M4 | Failure semantics | Classification → retry/fail/Unknown, per-attempt timeouts, preconditions, verification with settle delay, unknown plan, `InProgress` + `wait` | Testkit **fake remote service** (commits then drops the connection, eventually consistent lookup, honours idempotency keys); every `FailureClass` × `EffectKind` combination tested | **done** |
 | M5 | Recovery + operator API | `recover()` (expired leases → Unknown, report), `pending()`, `resolve()` | Stalled-worker takeover scenario does not duplicate the effect | **done** |
 | M6 | `agent-effects-sqlite` | sqlx + embedded migrations, WAL, `BEGIN IMMEDIATE` around the pure `EffectRecord` operations, schema per design §9; depends on `agent-effects-store` only | Passes the conformance suite; two processes sharing one database file | **done** |
-| M7 | Crash + fault suite | `FaultInjector` behind a `fault-injection` feature; one test per crash point in design §11, in-process and as a killed subprocess; model-based property test of the runtime against the transition table | Every crash point has a tested recovery path | |
+| M7 | Crash + fault suite | `FaultInjector` behind a `fault-injection` feature; one test per crash point in design §11, in-process and as a killed subprocess; model-based property test of the runtime against the transition table | Every crash point has a tested recovery path | **done** |
 | M8 | Docs + release | README, `docs/crash-semantics.md`, examples (payment against the fake provider, agent tool), CHANGELOG, name reserved on crates.io | `cargo publish --dry-run` clean; 0.1.0 published | |
 
 Dependency order: M2 → M3 → M4 → M5 → M7, with M6 in parallel after M2.

@@ -11,8 +11,9 @@ safe retry instead of guessing.
 > **Status: pre-release.** On an in-memory store, the runtime runs effects
 > with retries, timeouts, preconditions and verification. It records
 > outcomes, replays them, re-attaches after crashes, and gives operators
-> `recover`, `pending` and `resolve`, on in-memory or SQLite storage. The
-> crash and fault-injection suite is in progress. See
+> `recover`, `pending` and `resolve`, on in-memory or SQLite storage. Every
+> crash point has a tested recovery path, in-process and with real process
+> death. Examples and the 0.1.0 release are next. See
 > [docs/roadmap.md](docs/roadmap.md).
 
 ## The problem
