@@ -8,10 +8,10 @@ autonomous software. It records intent before acting, tells "failed" apart
 from "don't know", and resolves unknown outcomes by verification or provably
 safe retry instead of guessing.
 
-> **Status: pre-release.** The runtime runs effects, records outcomes,
-> replays them and re-attaches after crashes, on an in-memory store.
-> Retries, preconditions, verification and the SQLite store are in
-> progress. See
+> **Status: pre-release.** On an in-memory store, the runtime runs effects
+> with retries, timeouts, preconditions and verification. It records
+> outcomes, replays them, and re-attaches after crashes. Recovery tooling
+> and the SQLite store are in progress. See
 > [docs/roadmap.md](docs/roadmap.md).
 
 ## The problem

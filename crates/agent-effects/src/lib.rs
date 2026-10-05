@@ -39,9 +39,10 @@
 //! # }
 //! ```
 //!
-//! **Status:** pre-release. The runtime runs effects once, records their
-//! outcome, and re-attaches later calls to it. Retries, preconditions and
-//! verification arrive next; see `docs/roadmap.md`. The persisted vocabulary
+//! **Status:** pre-release. The runtime runs effects with retries,
+//! timeouts, preconditions and verification, records their outcome, and
+//! re-attaches later calls to it. Recovery tooling and the SQLite store come
+//! next; see `docs/roadmap.md`. The persisted vocabulary
 //! (identity, kinds, the state machine) and the [`EffectStore`] contract come
 //! from [`agent-effects-store`](store) and are re-exported here.
 
@@ -51,6 +52,8 @@ pub mod error;
 pub mod policy;
 pub mod retry;
 pub mod runtime;
+#[cfg(feature = "testkit")]
+pub mod testkit;
 pub mod verification;
 
 mod fingerprint;
@@ -63,10 +66,10 @@ pub use agent_effects_store::{
     EffectStore, ErrorRecord, FailureClass, IdempotencyKey, IdentityError, InvalidTransition,
     Lease, LogicalKey, StoreError, Transition, WorkerId,
 };
-pub use clock::{Clock, ManualClock, SystemClock};
-pub use effect::{EffectBuilder, EffectContext, EffectFailure, EffectOutcome};
+pub use clock::{Clock, ManualClock, SystemClock, TokioClock};
+pub use effect::{EffectBuilder, EffectContext, EffectFailure, EffectOutcome, Precondition};
 pub use error::RuntimeError;
 pub use policy::{Capabilities, UnknownPlan};
 pub use retry::RetryPolicy;
 pub use runtime::{Runtime, RuntimeBuilder};
-pub use verification::{NotFoundReading, VerificationMode};
+pub use verification::{NotFoundReading, Verification, VerificationMode};

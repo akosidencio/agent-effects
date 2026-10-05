@@ -8,8 +8,8 @@ use std::time::Duration;
 use agent_effects::store::{EffectStore, ErrorRecord, NewEffect, TransitionRequest};
 use agent_effects::{
     Clock, EffectContext, EffectFailure, EffectKey, EffectKind, EffectName, EffectOutcome,
-    EffectStatus, FailureClass, LogicalKey, ManualClock, Runtime, RuntimeError, Transition,
-    WorkerId,
+    EffectStatus, FailureClass, LogicalKey, ManualClock, RetryPolicy, Runtime, RuntimeError,
+    Transition, WorkerId,
 };
 use agent_effects_memory::MemoryStore;
 use serde_json::json;
@@ -17,11 +17,22 @@ use tokio::sync::Notify;
 
 const TTL: Duration = Duration::from_secs(30);
 
+/// Retries without waiting: these tests run on a manual clock and real time.
+/// Failure semantics with realistic backoff live in `failure_semantics.rs`.
+const NO_WAIT: RetryPolicy = RetryPolicy {
+    max_attempts: 5,
+    initial_delay: Duration::ZERO,
+    max_delay: Duration::ZERO,
+    multiplier: 1.0,
+    jitter: false,
+};
+
 fn runtime(store: &MemoryStore, clock: &Arc<ManualClock>, worker: &str) -> Runtime<MemoryStore> {
     Runtime::builder(store.clone())
         .clock(Arc::clone(clock))
         .worker_id(WorkerId::new(worker))
         .lease_ttl(TTL)
+        .retry_policy(NO_WAIT)
         .build()
 }
 
@@ -274,8 +285,8 @@ async fn an_ambiguous_irreversible_effect_goes_to_an_operator() {
 }
 
 #[tokio::test]
-async fn an_unsent_request_is_not_ambiguous() {
-    let (_, _, rt) = setup();
+async fn an_unsent_request_is_retried_not_escalated() {
+    let (store, _, rt) = setup();
     let outcome = rt
         .effect("email.send", "welcome-2")
         .run(|_| async {
@@ -292,6 +303,15 @@ async fn an_unsent_request_is_not_ambiguous() {
             })
         ),
         "{outcome:?}"
+    );
+    let record = store
+        .get_by_key(&key("email.send", "welcome-2"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        record.attempt_count, NO_WAIT.max_attempts,
+        "retried to the budget"
     );
 }
 
@@ -321,15 +341,12 @@ async fn safely_repeatable_effects_are_rerun_after_an_unknown_outcome() {
         };
 
         let first = flaky().await.unwrap();
-        assert!(
-            matches!(first, EffectOutcome::Unknown { .. }),
-            "{kind:?}: {first:?}"
-        );
-        let second = flaky().await.unwrap();
         assert_eq!(
-            second,
-            EffectOutcome::Committed("updated on attempt 2".into())
+            first,
+            EffectOutcome::Committed("updated on attempt 2".into()),
+            "{kind:?}: re-run within the same call"
         );
+        assert_eq!(flaky().await.unwrap(), first, "and replayed afterwards");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(
             transitions(&store, &key("crm.update", "contact-5")).await,

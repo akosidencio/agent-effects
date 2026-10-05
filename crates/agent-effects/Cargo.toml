@@ -10,6 +10,10 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+# Test doubles (`testkit::FakeRemote`) for exercising failure handling.
+testkit = []
+
 [dependencies]
 agent-effects-store.workspace = true
 serde.workspace = true
@@ -20,6 +24,8 @@ tokio = { workspace = true, features = ["rt", "time", "macros"] }
 tracing.workspace = true
 
 [dev-dependencies]
+# Enables the testkit for this crate's own integration tests.
+agent-effects = { path = ".", features = ["testkit"] }
 agent-effects-memory.workspace = true
 proptest.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "test-util"] }

@@ -3,6 +3,8 @@
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Serialize;
@@ -15,9 +17,10 @@ use crate::fingerprint::fingerprint;
 use crate::id::{EffectId, EffectKey, IdempotencyKey};
 use crate::kind::EffectKind;
 use crate::policy::Capabilities;
+use crate::retry::RetryPolicy;
 use crate::runtime::Runtime;
 use crate::store::{EffectStore, ErrorRecord};
-use crate::verification::VerificationMode;
+use crate::verification::{NoVerification, Verification, VerificationMode, Verifier, VerifyWith};
 
 /// What an effect's action knows about the attempt it is running.
 #[derive(Clone, Debug)]
@@ -178,12 +181,54 @@ pub enum EffectOutcome<T> {
     },
 }
 
+/// Whether an effect may still run, checked before its first attempt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Precondition {
+    /// Go ahead.
+    Satisfied,
+    /// Never run this effect, e.g. "order is no longer pending". The effect
+    /// ends [`EffectOutcome::Rejected`].
+    Rejected {
+        /// Why, recorded on the effect.
+        reason: String,
+    },
+    /// Not yet; check again after `after`, e.g. while a dependency settles.
+    /// After as many checks as the retry policy allows attempts, the effect
+    /// is rejected.
+    RetryLater {
+        /// How long to wait before the next check.
+        after: Duration,
+        /// Why, recorded if the effect is eventually rejected.
+        reason: String,
+    },
+}
+
+impl Precondition {
+    /// A rejection with `reason`.
+    pub fn reject(reason: impl Into<String>) -> Self {
+        Self::Rejected {
+            reason: reason.into(),
+        }
+    }
+
+    /// A deferral of `after`, with `reason`.
+    pub fn retry_later(after: Duration, reason: impl Into<String>) -> Self {
+        Self::RetryLater {
+            after,
+            reason: reason.into(),
+        }
+    }
+}
+
+pub(crate) type PreconditionFn =
+    Arc<dyn Fn(EffectContext) -> Pin<Box<dyn Future<Output = Precondition> + Send>> + Send + Sync>;
+
 /// Builds and runs one effect. Created by [`Runtime::effect`].
 ///
 /// Invalid names, keys or inputs are reported when the effect is run, so the
 /// whole chain needs a single `?`.
 #[must_use = "an effect does nothing until `run` is awaited"]
-pub struct EffectBuilder<S> {
+pub struct EffectBuilder<S, V = NoVerification> {
     runtime: Runtime<S>,
     name: String,
     key: String,
@@ -191,10 +236,16 @@ pub struct EffectBuilder<S> {
     remote_idempotency: bool,
     input: Option<Result<Value, serde_json::Error>>,
     actor: Option<String>,
+    retry: RetryPolicy,
+    attempt_timeout: Option<Duration>,
+    precondition: Option<PreconditionFn>,
+    verification: VerificationMode,
+    verifier: V,
 }
 
 impl<S: EffectStore> EffectBuilder<S> {
     pub(crate) fn new(runtime: Runtime<S>, name: String, key: String) -> Self {
+        let retry = runtime.default_retry();
         Self {
             runtime,
             name,
@@ -203,9 +254,67 @@ impl<S: EffectStore> EffectBuilder<S> {
             remote_idempotency: false,
             input: None,
             actor: None,
+            retry,
+            attempt_timeout: None,
+            precondition: None,
+            verification: VerificationMode::None,
+            verifier: NoVerification,
         }
     }
 
+    /// Verifies the effect against a remote system that reads its own
+    /// writes: [`Verification::NotApplied`] is trusted at once.
+    ///
+    /// The check runs after every successful attempt (a postcondition) and
+    /// to reconcile an attempt whose outcome is unknown. It makes re-running
+    /// safe even for irreversible effects, because the runtime only re-runs
+    /// an effect the remote system says did not apply.
+    pub fn verify<T, F, Fut>(self, check: F) -> EffectBuilder<S, VerifyWith<F>>
+    where
+        F: Fn(EffectContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Verification<T>, EffectFailure>> + Send + 'static,
+    {
+        self.with_verifier(VerificationMode::Authoritative, VerifyWith(check))
+    }
+
+    /// Like [`Self::verify`], for a remote lookup that lags behind its writes
+    /// by up to `settle`. [`Verification::NotApplied`] is trusted only once
+    /// `settle` has passed since the attempt started; until then the runtime
+    /// waits and checks again.
+    pub fn verify_eventually<T, F, Fut>(
+        self,
+        settle: Duration,
+        check: F,
+    ) -> EffectBuilder<S, VerifyWith<F>>
+    where
+        F: Fn(EffectContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Verification<T>, EffectFailure>> + Send + 'static,
+    {
+        self.with_verifier(
+            VerificationMode::EventuallyConsistent { settle },
+            VerifyWith(check),
+        )
+    }
+
+    fn with_verifier<V>(self, mode: VerificationMode, verifier: V) -> EffectBuilder<S, V> {
+        EffectBuilder {
+            runtime: self.runtime,
+            name: self.name,
+            key: self.key,
+            kind: self.kind,
+            remote_idempotency: self.remote_idempotency,
+            input: self.input,
+            actor: self.actor,
+            retry: self.retry,
+            attempt_timeout: self.attempt_timeout,
+            precondition: self.precondition,
+            verification: mode,
+            verifier,
+        }
+    }
+}
+
+impl<S: EffectStore, V> EffectBuilder<S, V> {
     /// The effect's kind. Defaults to [`EffectKind::IrreversibleWrite`], the
     /// most cautious choice.
     pub fn kind(mut self, kind: EffectKind) -> Self {
@@ -239,6 +348,40 @@ impl<S: EffectStore> EffectBuilder<S> {
         self
     }
 
+    /// The retry policy. Defaults to the runtime's
+    /// ([`RuntimeBuilder::retry_policy`](crate::RuntimeBuilder::retry_policy)).
+    ///
+    /// `max_attempts` bounds the attempts over the effect's whole life,
+    /// across calls and restarts. It also bounds verification and
+    /// precondition checks per call.
+    pub fn retry(mut self, policy: RetryPolicy) -> Self {
+        self.retry = policy;
+        self
+    }
+
+    /// Gives up waiting for an attempt after `timeout`. The request may have
+    /// been sent, so a timeout is an ambiguous failure.
+    pub fn attempt_timeout(mut self, timeout: Duration) -> Self {
+        self.attempt_timeout = Some(timeout);
+        self
+    }
+
+    /// A check that must pass before the effect's first attempt, so a stale
+    /// decision is not carried out, e.g. "refund only if the order is still
+    /// unrefunded".
+    ///
+    /// It runs only before the first attempt. Once an attempt may have
+    /// applied, the effect's own success could falsify the check: a refund
+    /// that went through makes "not yet refunded" false.
+    pub fn precondition<F, Fut>(mut self, check: F) -> Self
+    where
+        F: Fn(EffectContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Precondition> + Send + 'static,
+    {
+        self.precondition = Some(Arc::new(move |ctx| Box::pin(check(ctx))));
+        self
+    }
+
     /// Runs the effect, or attaches to an earlier run with the same key.
     ///
     /// The action may be called more than once over the effect's life (for
@@ -256,6 +399,7 @@ impl<S: EffectStore> EffectBuilder<S> {
         T: Serialize + DeserializeOwned + Send + 'static,
         F: Fn(EffectContext) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<T, EffectFailure>> + Send + 'static,
+        V: Verifier<T>,
     {
         let key = EffectKey::new(
             crate::id::EffectName::new(self.name)?,
@@ -269,20 +413,25 @@ impl<S: EffectStore> EffectBuilder<S> {
             capabilities: Capabilities {
                 kind: self.kind,
                 remote_idempotency: self.remote_idempotency,
-                verification: VerificationMode::None,
+                verification: self.verification,
             },
             actor: self.actor,
+            retry: self.retry,
+            attempt_timeout: self.attempt_timeout,
+            precondition: self.precondition,
         };
-        self.runtime.execute(spec, action).await
+        self.runtime.execute(spec, action, self.verifier).await
     }
 }
 
-/// Everything about an effect except its closures.
-#[derive(Debug)]
+/// Everything about an effect except its action and verifier.
 pub(crate) struct EffectSpec {
     pub(crate) key: EffectKey,
     pub(crate) capabilities: Capabilities,
     pub(crate) input: Option<Value>,
     pub(crate) fingerprint: Option<String>,
     pub(crate) actor: Option<String>,
+    pub(crate) retry: RetryPolicy,
+    pub(crate) attempt_timeout: Option<Duration>,
+    pub(crate) precondition: Option<PreconditionFn>,
 }

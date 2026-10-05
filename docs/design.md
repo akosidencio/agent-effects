@@ -136,7 +136,7 @@ sample as an argument.
 
 ## 7. API (v0.1: closures)
 
-Built in M3, except the parts marked *(M4)*.
+Built in M3 and M4.
 
 ```rust
 let runtime = Runtime::builder(SqliteStore::open("effects.db").await?)
@@ -150,10 +150,11 @@ let outcome = runtime
     .input(&charge)                                // fingerprinted + stored
     .remote_idempotency(true)                      // target honours ctx.idempotency_key()
     .actor("agent:refund-agent")                   // recorded on the effect and its events
-    .retry(RetryPolicy::default())                 // (M4)
-    .precondition(|ctx| async move { /* ... */ })  // (M4)
-    .verify(VerificationMode::EventuallyConsistent { settle: Duration::from_secs(10) },
-            |ctx| async move { /* ... */ })        // (M4)
+    .retry(RetryPolicy::default())                 // default: the runtime's policy
+    .attempt_timeout(Duration::from_secs(20))      // a timeout is an ambiguous failure
+    .precondition(|ctx| async move { /* -> Precondition */ })
+    .verify_eventually(Duration::from_secs(10),    // or .verify(...) if the lookup
+        |ctx| async move { /* -> Result<Verification<Payment>, EffectFailure> */ })
     .run(move |ctx| {
         let (stripe, charge) = (stripe.clone(), charge.clone());
         async move {
@@ -199,15 +200,44 @@ Rules:
   its TTL. If renewal reports the lease lost, the attempt keeps running (it
   is already in flight), but none of its writes will be accepted.
 - **Concurrent callers.** A second caller whose key is held by a live lease
-  gets `InProgress { id }` immediately. *(M4: `runtime.wait(id, timeout)`.)*
+  gets `InProgress { id }` immediately. `runtime.wait::<T>(id, timeout)` polls
+  the store until nobody holds the effect (10 ms doubling to 250 ms), then
+  reports it.
 - **Closures must be `Fn`**, not `FnOnce`, because an effect may be attempted
   more than once. They are `Send + Sync + 'static` because they run on a
   spawned task.
-- **M3 interim behaviour.** With no retry policy yet, a retryable failure
-  (`Transient`, `RateLimited`) is recorded as `Failed`. An unknown outcome
-  that the current call produced is reported as `Unknown`. A safely
-  repeatable effect is re-run by the *next* call. M4 adds in-call retries
-  with a budget.
+- **Retry budget.** `max_attempts` counts attempts over the effect's whole
+  life, across calls and restarts (`attempt_count` on the record). A
+  retryable failure (`Transient`, `RateLimited`) or a safely repeatable
+  unknown outcome schedules a retry while budget remains. With no budget
+  left, the first becomes `Failed` and the second escalates to
+  `NeedsIntervention`.
+- **Waiting between attempts.** `ScheduleRetry` is persisted first: the
+  record is `Pending` with `next_attempt_at`. Then the call waits inline,
+  holding and renewing the lease. A crash during the wait leaves a record
+  that is safe to resume, because nothing is in flight, and the next caller
+  waits out the same schedule. A rate limit's `retry_after` is honoured
+  even when it exceeds `max_delay`.
+- **Attempt timeout.** The attempt's task is aborted and the failure
+  classified `Ambiguous`: the request may have been sent.
+- **Preconditions run only before the first attempt.** A check is
+  `Satisfied`, `Rejected { reason }` (the effect ends `Rejected`, nothing
+  ran) or `RetryLater { after, reason }` (checked again, up to `max_attempts`
+  checks, then rejected). After an attempt that may have applied, the
+  effect's own success can falsify the check ("not yet refunded"), so
+  re-running it could reject an effect that happened. A panicking check
+  rejects.
+- **Verification** runs after every successful attempt (a postcondition)
+  and to reconcile an unknown outcome:
+  - `Confirmed(t)` commits, with `t` as the output.
+  - `NotApplied` is read through the [verification mode](#5-unknown-outcomes).
+    Within the settle delay it waits the rest of the delay and checks again.
+    Once trusted, the effect definitely did not apply, so it is re-run if
+    budget remains, else `Failed`.
+  - `Conflict { details }` goes to `NeedsIntervention`.
+  - `Inconclusive`, a failing check or a panicking check are retried with
+    backoff, up to `max_attempts` checks per call. Then the effect stays
+    `Unknown`, not escalated, and a later call or recovery checks again.
 
 ### Re-attaching
 
@@ -222,7 +252,8 @@ record and continues from its status:
 | Pending | acquire the lease and continue attempts |
 | Executing, lease live | `InProgress` |
 | Executing / Verifying, lease expired | `LeaseExpired` → Unknown, then as below |
-| Unknown | apply the [unknown plan](#5-unknown-outcomes) with this call's closures: re-run, escalate, or *(M4)* verify |
+| Unknown | apply the [unknown plan](#5-unknown-outcomes) with this call's closures: verify, re-run (budget permitting), or escalate |
+| Pending with `next_attempt_at` | wait until then, then attempt |
 | NeedsIntervention | `NeedsIntervention { id }` |
 | any non-terminal status, lease live | `InProgress` |
 
@@ -438,12 +469,14 @@ Crates are added when their milestone starts, not as empty placeholders.
 | D13 | 2026-10-05 | Store rules are pure `EffectRecord` methods; stores only provide atomicity. Lease operations don't bump `version` | Identical semantics across backends; heartbeats can't conflict with transitions |
 | D14 | 2026-10-05 | The builder defers identity and input errors to `run`; the effect key accepts any `Display` | One `?` per effect, and `.effect("x", order_id)` works for integer and UUID ids |
 | D15 | 2026-10-05 | The whole call runs on a spawned task, and the action on a nested one | Cancellation safety for the whole write path; panics become ambiguous failures instead of crashing the call |
+| D16 | 2026-10-05 | Waits between attempts are inline, holding the lease; `ScheduleRetry` is persisted before the wait | Answers the "Scheduled outcome?" question: simple for callers, and a crash mid-wait leaves a safely resumable `Pending` record |
+| D17 | 2026-10-05 | Preconditions run only before the first attempt | A possibly-applied attempt can falsify its own precondition; re-checking would reject effects that happened |
+| D18 | 2026-10-05 | Verification also runs after every success (postcondition); inconclusive checks leave the effect `Unknown`, not escalated | "200 OK" is not proof; an unreachable lookup is a reason to look again later, not to page an operator |
+| D19 | 2026-10-05 | `max_attempts` is a lifetime budget per effect; it also caps checks per call | Restarts and re-attaching calls cannot reset the budget; every loop is bounded |
+| D20 | 2026-10-05 | `TokioClock`, plus a `testkit` feature with `FakeRemote` | Paused-time tests run real backoff schedules instantly; a scripted provider makes duplicates countable |
 
 ## Open questions
 
-- Retries with long delays (e.g. a 2-minute rate limit) currently wait inline
-  while holding the lease. Should the call return a `Scheduled` outcome
-  instead?
 - Cached outputs are deserialized into the caller's `T`. If `T` changes shape
   between releases, old records stop deserializing. Should there be an output
   version tag, or a documented "don't do that"?

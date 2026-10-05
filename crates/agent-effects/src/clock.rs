@@ -29,6 +29,41 @@ impl Clock for SystemClock {
     }
 }
 
+/// Wall-clock time that follows Tokio's clock.
+///
+/// Anchored to the system time when created, then advanced by
+/// [`tokio::time::Instant`]. Under `#[tokio::test(start_paused = true)]`,
+/// Tokio skips idle time, and this clock skips with it. Backoff sleeps,
+/// lease expiry and settle delays then all agree, and a test with minutes of
+/// retries finishes instantly.
+#[derive(Clone, Copy, Debug)]
+pub struct TokioClock {
+    system_base: SystemTime,
+    tokio_base: tokio::time::Instant,
+}
+
+impl TokioClock {
+    /// A clock anchored at the current system and Tokio time.
+    pub fn new() -> Self {
+        Self {
+            system_base: SystemTime::now(),
+            tokio_base: tokio::time::Instant::now(),
+        }
+    }
+}
+
+impl Default for TokioClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clock for TokioClock {
+    fn now(&self) -> SystemTime {
+        self.system_base + self.tokio_base.elapsed()
+    }
+}
+
 /// A clock that only moves when told to. For tests.
 #[derive(Debug)]
 pub struct ManualClock {
@@ -79,6 +114,14 @@ impl Clock for ManualClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn tokio_clock_follows_paused_time() {
+        let clock = TokioClock::new();
+        let start = clock.now();
+        tokio::time::sleep(Duration::from_secs(90)).await;
+        assert_eq!(clock.now(), start + Duration::from_secs(90));
+    }
 
     #[test]
     fn manual_clock_only_moves_when_told() {

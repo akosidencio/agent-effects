@@ -4,27 +4,32 @@
 //! effect's record, then either reports its settled outcome or takes the
 //! execution lease and moves it forward (design §7, "Re-attaching").
 
+use std::collections::hash_map::RandomState;
 use std::fmt::Display;
 use std::future::Future;
+use std::hash::BuildHasher;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use tokio::task::{JoinError, JoinHandle};
 use tracing::{Instrument, Span, debug, field, info_span, warn};
 
 use crate::clock::{Clock, SystemClock};
-use crate::effect::{EffectBuilder, EffectContext, EffectFailure, EffectOutcome, EffectSpec};
+use crate::effect::{
+    EffectBuilder, EffectContext, EffectFailure, EffectOutcome, EffectSpec, Precondition,
+};
 use crate::error::RuntimeError;
 use crate::failure::{Disposition, FailureClass};
 use crate::id::{EffectId, WorkerId};
 use crate::policy::UnknownPlan;
+use crate::retry::RetryPolicy;
 use crate::state::{EffectStatus, Transition};
 use crate::store::{
     EffectRecord, EffectStore, ErrorRecord, Lease, NewEffect, StoreError, TransitionRequest,
 };
+use crate::verification::{NotFoundReading, Verification, VerificationMode, Verifier};
 
 /// How many times one call re-reads the record after losing a lease race
 /// before reporting the effect as in progress.
@@ -40,6 +45,7 @@ struct Inner<S> {
     clock: Arc<dyn Clock>,
     worker: WorkerId,
     lease_ttl: Duration,
+    retry: RetryPolicy,
 }
 
 impl<S> Clone for Runtime<S> {
@@ -57,10 +63,13 @@ pub struct RuntimeBuilder<S> {
     clock: Arc<dyn Clock>,
     worker: Option<WorkerId>,
     lease_ttl: Duration,
+    retry: RetryPolicy,
 }
 
 impl<S: EffectStore> RuntimeBuilder<S> {
-    /// The time source for leases. Defaults to the system clock.
+    /// The time source for leases and schedules. Defaults to the system
+    /// clock. Tests with paused Tokio time want
+    /// [`TokioClock`](crate::clock::TokioClock).
     pub fn clock(mut self, clock: impl Clock) -> Self {
         self.clock = Arc::new(clock);
         self
@@ -73,12 +82,21 @@ impl<S: EffectStore> RuntimeBuilder<S> {
         self
     }
 
-    /// How long a lease lasts without renewal. Running attempts renew it
-    /// every third of this. If a worker dies, others wait this long before
+    /// How long a lease lasts without renewal. The runtime renews it every
+    /// third of this while it works on an effect, including while it waits
+    /// between retries. If a worker dies, others wait this long before
     /// treating its in-flight effect as unknown. Defaults to 30 seconds;
     /// values under 3 ms are raised to 3 ms.
     pub fn lease_ttl(mut self, ttl: Duration) -> Self {
         self.lease_ttl = ttl.max(Duration::from_millis(3));
+        self
+    }
+
+    /// The retry policy for effects that do not set their own. Defaults to
+    /// [`RetryPolicy::default`]: 5 attempts, 1 s to 30 s exponential backoff
+    /// with jitter.
+    pub fn retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.retry = policy;
         self
     }
 
@@ -90,6 +108,7 @@ impl<S: EffectStore> RuntimeBuilder<S> {
                 clock: self.clock,
                 worker: self.worker.unwrap_or_else(WorkerId::random),
                 lease_ttl: self.lease_ttl,
+                retry: self.retry,
             }),
         }
     }
@@ -134,6 +153,7 @@ impl<S: EffectStore> Runtime<S> {
             clock: Arc::new(SystemClock),
             worker: None,
             lease_ttl: Duration::from_secs(30),
+            retry: RetryPolicy::default(),
         }
     }
 
@@ -154,19 +174,65 @@ impl<S: EffectStore> Runtime<S> {
         &self.inner.worker
     }
 
+    /// Waits until nobody is working on effect `id`, or `timeout` passes, and
+    /// reports where it stands. For a caller that got
+    /// [`EffectOutcome::InProgress`].
+    ///
+    /// Returns `InProgress` if the effect is still being worked on at the
+    /// deadline, or if it is unsettled and nobody holds it (for example a
+    /// worker crashed while waiting to retry). Running the effect again then
+    /// takes it over.
+    ///
+    /// # Errors
+    ///
+    /// [`RuntimeError::Store`] if the store fails or has no such effect, and
+    /// [`RuntimeError::Output`] if a committed output does not deserialize
+    /// into `T`.
+    pub async fn wait<T: DeserializeOwned>(
+        &self,
+        id: EffectId,
+        timeout: Duration,
+    ) -> Result<EffectOutcome<T>, RuntimeError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut pause = Duration::from_millis(10);
+        loop {
+            let record = self
+                .store()
+                .get(id)
+                .await?
+                .ok_or(StoreError::NotFound(id))?;
+            let busy = !settled(record.status) && record.live_lease_owner(self.now()).is_some();
+            let now = tokio::time::Instant::now();
+            if !busy {
+                return report(&record, None);
+            }
+            if now >= deadline {
+                return Ok(EffectOutcome::InProgress { id });
+            }
+            tokio::time::sleep(pause.min(deadline - now)).await;
+            pause = (pause * 2).min(Duration::from_millis(250));
+        }
+    }
+
+    pub(crate) fn default_retry(&self) -> RetryPolicy {
+        self.inner.retry
+    }
+
     fn now(&self) -> SystemTime {
         self.inner.clock.now()
     }
 
-    pub(crate) async fn execute<T, F, Fut>(
+    pub(crate) async fn execute<T, F, Fut, V>(
         &self,
         spec: EffectSpec,
         action: F,
+        verifier: V,
     ) -> Result<EffectOutcome<T>, RuntimeError>
     where
         T: Serialize + DeserializeOwned + Send + 'static,
         F: Fn(EffectContext) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<T, EffectFailure>> + Send + 'static,
+        V: Verifier<T>,
     {
         let span = info_span!(
             "agent_effect.execute",
@@ -188,20 +254,24 @@ impl<S: EffectStore> Runtime<S> {
         // Run on a spawned task so that dropping the caller's future cannot
         // abort an attempt between invoking the action and recording it.
         let runtime = self.clone();
-        let task = tokio::spawn(async move { runtime.drive(spec, action).await }.instrument(span));
+        let task = tokio::spawn(
+            async move { runtime.drive(spec, action, verifier).await }.instrument(span),
+        );
         task.await
             .unwrap_or_else(|e| Err(RuntimeError::Internal(e.to_string())))
     }
 
-    async fn drive<T, F, Fut>(
+    async fn drive<T, F, Fut, V>(
         &self,
         spec: EffectSpec,
         action: F,
+        verifier: V,
     ) -> Result<EffectOutcome<T>, RuntimeError>
     where
         T: Serialize + DeserializeOwned + Send + 'static,
         F: Fn(EffectContext) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<T, EffectFailure>> + Send + 'static,
+        V: Verifier<T>,
     {
         let store = self.store();
         let inserted = store
@@ -246,7 +316,14 @@ impl<S: EffectStore> Runtime<S> {
                 .get(record.id)
                 .await?
                 .ok_or(StoreError::NotFound(record.id))?;
-            let advanced = self.advance(current, &lease, &spec, &action).await;
+            let driver = Driver {
+                rt: self,
+                spec: &spec,
+                action: &action,
+                verifier: &verifier,
+                lease: &lease,
+            };
+            let advanced = driver.advance(current).await;
             if let Err(e) = store.release_lease(&lease).await {
                 warn!(error = %e, "could not release lease; it will expire");
             }
@@ -275,10 +352,7 @@ impl<S: EffectStore> Runtime<S> {
         record: &EffectRecord,
     ) -> Result<Option<EffectOutcome<T>>, RuntimeError> {
         match record.status {
-            EffectStatus::Committed
-            | EffectStatus::Failed
-            | EffectStatus::Rejected
-            | EffectStatus::NeedsIntervention => report(record, None).map(Some),
+            status if settled(status) => report(record, None).map(Some),
             EffectStatus::Pending
             | EffectStatus::Executing
             | EffectStatus::Verifying
@@ -290,60 +364,89 @@ impl<S: EffectStore> Runtime<S> {
             _ => Ok(Some(EffectOutcome::InProgress { id: record.id })),
         }
     }
+}
 
-    /// Moves a leased effect forward until it settles or needs something
-    /// this call cannot do. Returns the record and, if this call ran the
-    /// action successfully, its output.
-    async fn advance<T, F, Fut>(
+/// One call's work on one leased effect.
+struct Driver<'a, S, F, V> {
+    rt: &'a Runtime<S>,
+    spec: &'a EffectSpec,
+    action: &'a F,
+    verifier: &'a V,
+    lease: &'a Lease,
+}
+
+impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
+    /// Moves the effect forward until it settles or needs something this
+    /// call cannot do. Returns the record and, if this call produced one, the
+    /// output to report.
+    async fn advance<T, Fut>(
         &self,
         mut record: EffectRecord,
-        lease: &Lease,
-        spec: &EffectSpec,
-        action: &F,
     ) -> Result<(EffectRecord, Option<T>), Interrupt>
     where
         T: Serialize + Send + 'static,
         F: Fn(EffectContext) -> Fut,
         Fut: Future<Output = Result<T, EffectFailure>> + Send + 'static,
+        V: Verifier<T>,
     {
         let mut output = None;
-        let mut attempted = false;
+        let mut verification_exhausted = false;
         loop {
             match record.status {
                 EffectStatus::Pending => {
+                    if let Some(at) = record.next_attempt_at {
+                        self.sleep_until(at).await?;
+                    }
+                    if record.attempt_count == 0
+                        && let Some(reason) = self.check_precondition(&record).await?
+                    {
+                        record = self
+                            .transition(&record, Transition::PreconditionRejected, |r| {
+                                r.error = Some(reason);
+                            })
+                            .await?;
+                        continue;
+                    }
                     record = self
-                        .transition(&record, lease, spec, Transition::StartAttempt, |r| {
-                            r.payload = Some(json!({ "worker": self.worker_id() }));
+                        .transition(&record, Transition::StartAttempt, |r| {
+                            r.payload = Some(json!({ "worker": self.rt.worker_id() }));
                         })
                         .await?;
                     Span::current().record("effect.attempt", record.attempt_count);
                     checkpoint(FaultPoint::AttemptPersisted);
-                    attempted = true;
-                    (record, output) = self.attempt(record, lease, spec, action).await?;
+                    let (next, produced) = self.attempt(record).await?;
+                    record = next;
+                    if produced.is_some() {
+                        output = produced;
+                    }
                 }
-                // The previous holder's lease expired mid-attempt. Whatever
-                // it was doing may have happened.
+                // The previous holder's lease expired mid-attempt or
+                // mid-verification. Whatever it was doing may have happened.
                 EffectStatus::Executing | EffectStatus::Verifying => {
                     record = self
-                        .transition(&record, lease, spec, Transition::LeaseExpired, |_| {})
+                        .transition(&record, Transition::LeaseExpired, |_| {})
                         .await?;
                 }
-                EffectStatus::Unknown => match spec.capabilities.unknown_plan() {
-                    UnknownPlan::Escalate => {
+                EffectStatus::Unknown => match self.spec.capabilities.unknown_plan() {
+                    UnknownPlan::Verify if !verification_exhausted => {
+                        let (next, verified, exhausted) = self.verify(record, None).await?;
+                        record = next;
+                        output = verified.or(output);
+                        verification_exhausted = exhausted;
+                    }
+                    // Still unknown after every check this call may make;
+                    // a later call or recovery tries again.
+                    UnknownPlan::Verify => break,
+                    UnknownPlan::Reexecute if self.retry().allows_another(record.attempt_count) => {
                         record = self
-                            .transition(&record, lease, spec, Transition::Escalate, |_| {})
+                            .schedule_retry(&record, FailureClass::Ambiguous, None)
                             .await?;
                     }
-                    // Re-run an unknown outcome from an earlier call. One
-                    // that this call produced is left for the next call
-                    // until retry budgets exist (M4).
-                    UnknownPlan::Reexecute if !attempted => {
+                    UnknownPlan::Reexecute | UnknownPlan::Escalate => {
                         record = self
-                            .transition(&record, lease, spec, Transition::ScheduleRetry, |_| {})
+                            .transition(&record, Transition::Escalate, |_| {})
                             .await?;
                     }
-                    // Verification arrives in M4.
-                    UnknownPlan::Reexecute | UnknownPlan::Verify => break,
                 },
                 _ => break,
             }
@@ -351,39 +454,48 @@ impl<S: EffectStore> Runtime<S> {
         Ok((record, output))
     }
 
-    /// Runs the action once, renewing the lease meanwhile, and records the
-    /// result.
-    async fn attempt<T, F, Fut>(
+    /// Runs the action once and records what happened.
+    async fn attempt<T, Fut>(
         &self,
         record: EffectRecord,
-        lease: &Lease,
-        spec: &EffectSpec,
-        action: &F,
     ) -> Result<(EffectRecord, Option<T>), Interrupt>
     where
         T: Serialize + Send + 'static,
         F: Fn(EffectContext) -> Fut,
         Fut: Future<Output = Result<T, EffectFailure>> + Send + 'static,
+        V: Verifier<T>,
     {
-        let ctx = EffectContext {
-            id: record.id,
-            key: record.key.clone(),
-            attempt: record.attempt_count,
-        };
         // A separate task, so a panicking action is caught as a JoinError.
-        let result = self.with_heartbeat(tokio::spawn(action(ctx)), lease).await;
+        // If the lease is lost while waiting, the handle is dropped and the
+        // task finishes detached: the request is already in flight.
+        let mut task = tokio::spawn((self.action)(context(&record)));
+        let joined = match self.spec.attempt_timeout {
+            None => self.leased(&mut task).await?,
+            Some(limit) => match self.leased(tokio::time::timeout(limit, &mut task)).await? {
+                Ok(joined) => joined,
+                Err(_elapsed) => {
+                    task.abort();
+                    Ok(Err(EffectFailure::ambiguous(format!(
+                        "attempt timed out after {limit:?}"
+                    ))))
+                }
+            },
+        };
         checkpoint(FaultPoint::ActionReturned);
 
-        match result {
-            Ok(Ok(value)) => {
-                let (output, payload) = match serde_json::to_value(&value) {
-                    Ok(output) => (Some(output), None),
-                    // The effect applied; failing to store its output must
-                    // not make it look failed. The caller still gets the value.
-                    Err(e) => (None, Some(json!({ "output_not_stored": e.to_string() }))),
+        match joined {
+            Ok(Ok(value)) if self.spec.capabilities.verification != VerificationMode::None => {
+                let (record, verified, _) = self.verify(record, Some(output_json(&value))).await?;
+                let output = match record.status {
+                    EffectStatus::Committed => verified.or(Some(value)),
+                    _ => None,
                 };
+                Ok((record, output))
+            }
+            Ok(Ok(value)) => {
+                let (output, payload) = output_json(&value);
                 let record = self
-                    .transition(&record, lease, spec, Transition::Succeeded, |r| {
+                    .transition(&record, Transition::Succeeded, |r| {
                         r.output = output;
                         r.payload = payload;
                     })
@@ -391,23 +503,32 @@ impl<S: EffectStore> Runtime<S> {
                 Ok((record, Some(value)))
             }
             Ok(Err(failure)) => {
-                let transition = match failure.class().disposition() {
-                    Disposition::Unknown => Transition::OutcomeUnknown,
-                    // No retries before M4: a retryable failure is final.
-                    Disposition::Retry | Disposition::Fail => Transition::FailedDefinitively,
-                };
                 debug!(%failure, "action failed");
-                let record = self
-                    .transition(&record, lease, spec, transition, |r| {
-                        r.error = Some(failure.to_record());
-                    })
-                    .await?;
+                let class = failure.class();
+                let error = failure.to_record();
+                let record = match class.disposition() {
+                    Disposition::Retry if self.retry().allows_another(record.attempt_count) => {
+                        self.schedule_retry(&record, class, Some(error)).await?
+                    }
+                    Disposition::Retry | Disposition::Fail => {
+                        self.transition(&record, Transition::FailedDefinitively, |r| {
+                            r.error = Some(error);
+                        })
+                        .await?
+                    }
+                    Disposition::Unknown => {
+                        self.transition(&record, Transition::OutcomeUnknown, |r| {
+                            r.error = Some(error);
+                        })
+                        .await?
+                    }
+                };
                 Ok((record, None))
             }
             Err(join_error) => {
                 // The action may have sent its request before panicking.
                 let record = self
-                    .transition(&record, lease, spec, Transition::OutcomeUnknown, |r| {
+                    .transition(&record, Transition::OutcomeUnknown, |r| {
                         r.error = Some(ErrorRecord {
                             class: Some(FailureClass::Ambiguous),
                             message: format!("action did not complete: {join_error}"),
@@ -419,27 +540,210 @@ impl<S: EffectStore> Runtime<S> {
         }
     }
 
-    /// Awaits `task`, renewing `lease` every third of its TTL. A lost lease
-    /// stops renewal but not the task: the attempt is already in flight, and
-    /// the store will refuse our writes afterwards.
-    async fn with_heartbeat<T>(
+    /// Asks the remote system what happened, starting from `Executing`
+    /// (after a success, whose output JSON and audit note are `succeeded`)
+    /// or `Unknown`.
+    ///
+    /// Ends in `Committed`, `Failed`, `Pending` (re-run scheduled: the effect
+    /// verifiably did not apply), `NeedsIntervention` (conflict) or `Unknown`.
+    /// The flag reports that the checks ran out while inconclusive.
+    async fn verify<T>(
         &self,
-        mut task: JoinHandle<T>,
-        lease: &Lease,
-    ) -> Result<T, JoinError> {
-        let ttl = self.inner.lease_ttl;
-        let period = ttl / 3;
-        let mut renewing = true;
+        record: EffectRecord,
+        succeeded: Option<(Option<Value>, Option<Value>)>,
+    ) -> Result<(EffectRecord, Option<T>, bool), Interrupt>
+    where
+        T: Serialize + Send + 'static,
+        V: Verifier<T>,
+    {
+        let mut record = self
+            .transition(&record, Transition::StartVerification, |r| {
+                if let Some((output, payload)) = succeeded {
+                    (r.output, r.payload) = (output, payload);
+                }
+            })
+            .await?;
+        let mode = self.spec.capabilities.verification;
+        let max_checks = self.retry().max_attempts.max(1);
+        let mut last_problem = String::from("no check completed");
+
+        for check in 0..max_checks {
+            let Some(future) = self.verifier.check(context(&record)) else {
+                break;
+            };
+            let found = match self.leased(tokio::spawn(future)).await? {
+                Ok(Ok(found)) => found,
+                Ok(Err(failure)) => {
+                    last_problem = format!("check failed: {failure}");
+                    Verification::Inconclusive
+                }
+                Err(join_error) => {
+                    last_problem = format!("check did not complete: {join_error}");
+                    Verification::Inconclusive
+                }
+            };
+            match found {
+                Verification::Confirmed(value) => {
+                    let (output, payload) = output_json(&value);
+                    record = self
+                        .transition(&record, Transition::VerificationConfirmed, |r| {
+                            r.output = output;
+                            r.payload = payload;
+                        })
+                        .await?;
+                    return Ok((record, Some(value), false));
+                }
+                Verification::Conflict { details } => {
+                    record = self
+                        .transition(&record, Transition::VerificationConflict, |r| {
+                            r.error = Some(ErrorRecord {
+                                class: None,
+                                message: details,
+                            });
+                        })
+                        .await?;
+                    return Ok((record, None, false));
+                }
+                Verification::NotApplied => {
+                    let started = record.attempt_started_at.unwrap_or(self.rt.now());
+                    let elapsed = self.rt.now().duration_since(started).unwrap_or_default();
+                    match mode.read_not_found(elapsed) {
+                        NotFoundReading::NotApplied => {
+                            let error = ErrorRecord {
+                                class: None,
+                                message: "verification found that the effect did not apply".into(),
+                            };
+                            record = if self.retry().allows_another(record.attempt_count) {
+                                self.schedule_retry(&record, FailureClass::Transient, Some(error))
+                                    .await?
+                            } else {
+                                self.transition(&record, Transition::VerificationNotApplied, |r| {
+                                    r.error = Some(error);
+                                })
+                                .await?
+                            };
+                            return Ok((record, None, false));
+                        }
+                        NotFoundReading::TooEarly { wait } => {
+                            last_problem = "not visible yet within the settle delay".into();
+                            self.sleep(wait).await?;
+                        }
+                    }
+                }
+                Verification::Inconclusive => {
+                    if last_problem == "no check completed" {
+                        last_problem = "remote system could not tell".into();
+                    }
+                    let delay = self
+                        .retry()
+                        .delay(check, FailureClass::Transient, jitter_sample());
+                    self.sleep(delay).await?;
+                }
+            }
+        }
+
+        record = self
+            .transition(&record, Transition::OutcomeUnknown, |r| {
+                r.error = Some(ErrorRecord {
+                    class: Some(FailureClass::Ambiguous),
+                    message: format!(
+                        "verification inconclusive after {max_checks} checks: {last_problem}"
+                    ),
+                });
+            })
+            .await?;
+        Ok((record, None, true))
+    }
+
+    /// Evaluates the precondition. Returns the reason to reject, if any.
+    async fn check_precondition(
+        &self,
+        record: &EffectRecord,
+    ) -> Result<Option<ErrorRecord>, Interrupt> {
+        let Some(precondition) = &self.spec.precondition else {
+            return Ok(None);
+        };
+        let max_checks = self.retry().max_attempts.max(1);
+        let mut last_reason = String::new();
+        for check in 1..=max_checks {
+            let rejection = |message: String| {
+                Some(ErrorRecord {
+                    class: None,
+                    message,
+                })
+            };
+            match self
+                .leased(tokio::spawn(precondition(context(record))))
+                .await?
+            {
+                Ok(Precondition::Satisfied) => return Ok(None),
+                Ok(Precondition::Rejected { reason }) => return Ok(rejection(reason)),
+                Ok(Precondition::RetryLater { after, reason }) => {
+                    last_reason = reason;
+                    if check < max_checks {
+                        self.sleep(after).await?;
+                    }
+                }
+                // A broken check must not let the effect through.
+                Err(join_error) => {
+                    return Ok(rejection(format!(
+                        "precondition check did not complete: {join_error}"
+                    )));
+                }
+            }
+        }
+        Ok(Some(ErrorRecord {
+            class: None,
+            message: format!("precondition not satisfied after {max_checks} checks: {last_reason}"),
+        }))
+    }
+
+    /// Records that the next attempt waits for a backoff delay. The wait
+    /// itself happens when the loop next sees the record as `Pending`, so a
+    /// crash during it leaves a record that is safe to resume.
+    async fn schedule_retry(
+        &self,
+        record: &EffectRecord,
+        class: FailureClass,
+        error: Option<ErrorRecord>,
+    ) -> Result<EffectRecord, Interrupt> {
+        let retry = record.attempt_count.saturating_sub(1);
+        let delay = self.retry().delay(retry, class, jitter_sample());
+        let at = self.rt.now() + delay;
+        debug!(?delay, ?class, "retry scheduled");
+        self.transition(record, Transition::ScheduleRetry, |r| {
+            r.next_attempt_at = Some(at);
+            r.error = error;
+            r.payload =
+                Some(json!({ "delay_ms": u64::try_from(delay.as_millis()).unwrap_or(u64::MAX) }));
+        })
+        .await
+    }
+
+    async fn sleep_until(&self, at: SystemTime) -> Result<(), Interrupt> {
+        let wait = at.duration_since(self.rt.now()).unwrap_or_default();
+        self.sleep(wait).await
+    }
+
+    async fn sleep(&self, duration: Duration) -> Result<(), Interrupt> {
+        if duration.is_zero() {
+            return Ok(());
+        }
+        self.leased(tokio::time::sleep(duration)).await
+    }
+
+    /// Awaits `future`, renewing the lease every third of its TTL. Stops
+    /// with [`Interrupt::LeaseLost`] if the lease is lost meanwhile.
+    async fn leased<Fut: Future>(&self, future: Fut) -> Result<Fut::Output, Interrupt> {
+        let ttl = self.rt.inner.lease_ttl;
+        tokio::pin!(future);
         loop {
             tokio::select! {
-                result = &mut task => return result,
-                () = tokio::time::sleep(period), if renewing => {
-                    match self.store().renew_lease(lease, self.now(), ttl).await {
+                output = &mut future => return Ok(output),
+                () = tokio::time::sleep(ttl / 3) => {
+                    match self.rt.store().renew_lease(self.lease, self.rt.now(), ttl).await {
                         Ok(_) => {}
-                        Err(StoreError::LeaseLost) => {
-                            warn!("lease lost while the action was running");
-                            renewing = false;
-                        }
+                        Err(StoreError::LeaseLost) => return Err(Interrupt::LeaseLost),
                         Err(e) => warn!(error = %e, "lease renewal failed; will retry"),
                     }
                 }
@@ -450,18 +754,59 @@ impl<S: EffectStore> Runtime<S> {
     async fn transition(
         &self,
         record: &EffectRecord,
-        lease: &Lease,
-        spec: &EffectSpec,
         transition: Transition,
         customize: impl FnOnce(&mut TransitionRequest),
-    ) -> Result<EffectRecord, StoreError> {
-        let mut request = TransitionRequest::new(record, Some(lease), transition, self.now());
-        request.actor.clone_from(&spec.actor);
+    ) -> Result<EffectRecord, Interrupt> {
+        let mut request =
+            TransitionRequest::new(record, Some(self.lease), transition, self.rt.now());
+        request.actor.clone_from(&self.spec.actor);
         customize(&mut request);
-        let record = self.store().transition(request).await?;
+        let record = self.rt.store().transition(request).await?;
         debug!(%transition, status = %record.status, "effect transition");
         Ok(record)
     }
+
+    fn retry(&self) -> &RetryPolicy {
+        &self.spec.retry
+    }
+}
+
+fn context(record: &EffectRecord) -> EffectContext {
+    EffectContext {
+        id: record.id,
+        key: record.key.clone(),
+        attempt: record.attempt_count,
+    }
+}
+
+/// An output as JSON, or a note for the audit trail if it cannot be stored.
+/// The effect applied either way: failing to store its output must not make
+/// it look failed, and the caller still gets the value.
+fn output_json<T: Serialize>(value: &T) -> (Option<Value>, Option<Value>) {
+    match serde_json::to_value(value) {
+        Ok(output) => (Some(output), None),
+        Err(e) => (None, Some(json!({ "output_not_stored": e.to_string() }))),
+    }
+}
+
+/// A uniform sample in `[0, 1)` for jitter, from the standard library's
+/// per-instance random hash keys.
+fn jitter_sample() -> f64 {
+    let bits = RandomState::new().hash_one(0_u8) >> 11;
+    #[allow(clippy::cast_precision_loss)]
+    let sample = bits as f64 / (1_u64 << 53) as f64;
+    sample
+}
+
+/// Statuses a new call reports as they are, without acting.
+fn settled(status: EffectStatus) -> bool {
+    matches!(
+        status,
+        EffectStatus::Committed
+            | EffectStatus::Failed
+            | EffectStatus::Rejected
+            | EffectStatus::NeedsIntervention
+    )
 }
 
 fn check_matches(record: &EffectRecord, spec: &EffectSpec) -> Result<(), RuntimeError> {
@@ -478,7 +823,7 @@ fn check_matches(record: &EffectRecord, spec: &EffectSpec) -> Result<(), Runtime
     Ok(())
 }
 
-/// The outcome a record represents. `fresh` is this call's action output,
+/// The outcome a record represents. `fresh` is this call's output,
 /// preferred over the stored copy.
 fn report<T: DeserializeOwned>(
     record: &EffectRecord,
