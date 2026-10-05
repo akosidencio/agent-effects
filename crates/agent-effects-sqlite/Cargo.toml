@@ -3,6 +3,7 @@ name = "agent-effects-sqlite"
 description = "SQLite store for agent-effects"
 keywords = ["agents", "idempotency", "side-effects", "sqlite"]
 categories = ["asynchronous", "database"]
+readme = "../../README.md"
 version.workspace = true
 edition.workspace = true
 rust-version = "1.94"   # sqlx 0.9 requires it; the other crates stay at the workspace MSRV

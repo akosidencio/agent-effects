@@ -32,5 +32,8 @@ agent-effects-memory.workspace = true
 proptest.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "test-util"] }
 
+[package.metadata.docs.rs]
+all-features = true
+
 [lints]
 workspace = true

@@ -548,8 +548,8 @@ agent-effects/
 │   ├── agent-effects-http       (v0.2)
 │   ├── agent-effects-otel       (v0.2)
 │   └── agent-effects-mcp        (v0.3)
-├── examples/                    (M8)
-├── tests/                       (M7: crash/fault suite)
+├── examples/                    unpublished workspace member: payment, agent_tool
+├── (tests)                      per crate today: crates/*/tests (crash, model, multi-process, …)
 └── docs/
 ```
 

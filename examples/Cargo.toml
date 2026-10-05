@@ -1,0 +1,26 @@
+[package]
+name = "agent-effects-examples"
+description = "Runnable examples for agent-effects"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dev-dependencies]
+agent-effects = { workspace = true, features = ["testkit"] }
+agent-effects-memory.workspace = true
+serde.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[[example]]
+name = "payment"
+path = "payment.rs"
+
+[[example]]
+name = "agent_tool"
+path = "agent_tool.rs"
+
+[lints]
+workspace = true

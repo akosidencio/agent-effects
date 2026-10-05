@@ -3,6 +3,7 @@ name = "agent-effects-memory"
 description = "In-memory store for agent-effects, for tests, examples and development"
 keywords = ["agents", "idempotency", "side-effects", "testing"]
 categories = ["asynchronous", "development-tools::testing"]
+readme = "../../README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
