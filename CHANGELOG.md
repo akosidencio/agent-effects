@@ -86,5 +86,5 @@ First release.
 - A multi-process test on one SQLite file.
 - Mutation checks for each safety rule.
 
-[Unreleased]: https://example.invalid/compare/v0.1.0...HEAD
-[0.1.0]: https://example.invalid/releases/tag/v0.1.0
+[Unreleased]: https://github.com/akosidencio/agent-effects/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/akosidencio/agent-effects/releases/tag/v0.1.0

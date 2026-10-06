@@ -1,0 +1,174 @@
+name: Release
+
+# Pushing a version tag (v0.1.0, v0.2.0-beta.1, …) publishes every crate to
+# crates.io and creates the GitHub release:
+#
+#   git tag -a v0.1.0 -m "agent-effects 0.1.0" && git push origin v0.1.0
+#
+# Before tagging: bump `version` in Cargo.toml ([workspace.package] and the
+# internal entries under [workspace.dependencies]), and move the CHANGELOG's
+# [Unreleased] notes under a `## [x.y.z]` heading. Preflight refuses a tag
+# that disagrees with either.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+# Never run two releases of the same tag at once; never cancel one midway.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # Publish order: each crate after the crates it depends on. Preflight
+  # checks this list against the workspace's publishable crates.
+  CRATES: agent-effects-store agent-effects-memory agent-effects agent-effects-sqlite
+
+jobs:
+  preflight:
+    name: Preflight — tag, versions, changelog, credentials
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.parse.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Tag points at a commit on main
+        run: |
+          if ! git merge-base --is-ancestor "$(git rev-list -n1 "$GITHUB_REF_NAME")" origin/main; then
+            echo "::error::$GITHUB_REF_NAME is not on main"
+            exit 1
+          fi
+
+      - name: Parse version from tag
+        id: parse
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::$GITHUB_REF_NAME is not v<semver>"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # Publishing takes versions from the manifests, not the tag; a mismatch
+      # would ship whatever the files say under this tag's name.
+      - name: Crate versions match the tag, and CRATES lists every publishable crate
+        env:
+          VERSION: ${{ steps.parse.outputs.version }}
+        run: |
+          set -euo pipefail
+          # `publish: null` means publishable; `publish = false` reads as [].
+          cargo metadata --no-deps --format-version 1 --locked \
+            | jq -r '.packages[] | select(.publish == null) | "\(.name) \(.version)"' \
+            | sort > publishable.txt
+          cat publishable.txt
+          bad="$(awk -v v="$VERSION" '$2 != v' publishable.txt)"
+          if [ -n "$bad" ]; then
+            echo "::error::versions differ from $VERSION: $bad"
+            exit 1
+          fi
+          diff <(cut -d' ' -f1 publishable.txt) <(tr ' ' '\n' <<<"$CRATES" | sort) \
+            || { echo "::error::CRATES in release.yml does not match the publishable crates"; exit 1; }
+
+      - name: CHANGELOG has a section for this version
+        env:
+          VERSION: ${{ steps.parse.outputs.version }}
+        run: |
+          grep -qF "## [$VERSION]" CHANGELOG.md \
+            || { echo "::error::CHANGELOG.md has no '## [$VERSION]' section"; exit 1; }
+
+      # crates.io has no token-introspection endpoint, so the token is only
+      # checked for presence here. It needs the publish-new scope until each
+      # crate's first release, publish-update after.
+      - name: Publishing credentials
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "::error::secret CARGO_REGISTRY_TOKEN is not set"
+            exit 1
+          fi
+
+  # The full CI suite at the exact tagged commit: tests on Linux and macOS,
+  # MSRV, clippy, docs and a publish dry run.
+  ci:
+    name: CI
+    needs: preflight
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  publish:
+    name: Publish to crates.io
+    needs: [preflight, ci]
+    runs-on: ubuntu-latest
+    # Add protection rules (e.g. required reviewers) to this environment in
+    # the repository settings to approve each publish by hand.
+    environment: crates-io
+    env:
+      VERSION: ${{ needs.preflight.outputs.version }}
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal --no-self-update
+
+      # Re-running a release that failed partway skips the crates that
+      # already made it; crates.io refuses a version twice. `cargo publish`
+      # waits until each crate is in the index, so the next one can depend on
+      # it.
+      - name: Publish each crate unless this version is already on crates.io
+        run: |
+          set -euo pipefail
+          for crate in $CRATES; do
+            status="$(curl -sS -o /dev/null -w '%{http_code}' \
+              -A "agent-effects release (github.com/${GITHUB_REPOSITORY})" \
+              "https://crates.io/api/v1/crates/$crate/$VERSION")"
+            case "$status" in
+              200) echo "$crate $VERSION is already on crates.io; skipping." ;;
+              404) cargo +stable publish -p "$crate" --locked ;;
+              *) echo "::error::crates.io answered $status for $crate $VERSION"; exit 1 ;;
+            esac
+          done
+
+  github-release:
+    name: GitHub release
+    needs: [preflight, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.preflight.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Release notes from CHANGELOG.md
+        run: |
+          # The `## [VERSION]` section, up to the next version heading or the
+          # link references at the bottom.
+          awk -v heading="## [$VERSION]" '
+            index($0, heading) == 1 { found = 1; next }
+            found && (/^## \[/ || /^\[[^]]+\]: /) { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          {
+            echo
+            echo "Crates: $(for c in $CRATES; do printf '[%s](https://crates.io/crates/%s/%s) ' "$c" "$c" "$VERSION"; done)"
+          } >> notes.md
+          cat notes.md
+
+      - name: Create the release unless it exists
+        run: |
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists."
+            exit 0
+          fi
+          prerelease=()
+          [[ "$VERSION" == *-* ]] && prerelease=(--prerelease)
+          gh release create "$GITHUB_REF_NAME" --verify-tag \
+            --title "agent-effects $VERSION" --notes-file notes.md "${prerelease[@]}"

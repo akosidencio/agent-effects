@@ -579,7 +579,7 @@ Crates are added when their milestone starts, not as empty placeholders.
 | D9 | 2026-10-05 | Store trait uses `-> impl Future + Send`, and the runtime is generic over the store; no `async_trait` | No boxing on the hot path; no `dyn` store needed |
 | D10 | 2026-10-05 | MSRV 1.90, edition 2024 | `uuid` 1.27 requires 1.89 |
 | D11 | 2026-10-05 | ~~Store trait and memory store inside the core crate~~ **Superseded the same day:** follow the spec's crate layout (§13): `agent-effects-store` holds the contract, `agent-effects-memory` the in-memory store | Backends depend only on a small, stable contract crate, never on the runtime |
-| D12 | 2026-10-05 | CI (GitHub Actions) deferred until the repo is published | User decision |
+| D12 | 2026-10-05 | ~~CI deferred until the repo is published~~ **Done 2026-10-06** (D27) | User decision |
 | D13 | 2026-10-05 | Store rules are pure `EffectRecord` methods; stores only provide atomicity. Lease operations don't bump `version` | Identical semantics across backends; heartbeats can't conflict with transitions |
 | D14 | 2026-10-05 | The builder defers identity and input errors to `run`; the effect key accepts any `Display` | One `?` per effect, and `.effect("x", order_id)` works for integer and UUID ids |
 | D15 | 2026-10-05 | The whole call runs on a spawned task, and the action on a nested one | Cancellation safety for the whole write path; panics become ambiguous failures instead of crashing the call |
@@ -594,6 +594,7 @@ Crates are added when their milestone starts, not as empty placeholders.
 | D24 | 2026-10-05 | `agent-effects-sqlite` has its own MSRV, 1.94 (sqlx 0.9); the other crates stay at 1.90 | Users without SQLite are not forced onto a newer compiler |
 | D25 | 2026-10-05 | Simulated crashes: a panic in the runtime's task in-process, `process::abort()` in subprocesses | Both stop at the exact point with no cleanup, the way a real crash does; no special shutdown path in the runtime to keep honest |
 | D26 | 2026-10-05 | `FakeRemote` answers a replayed idempotency key with the original result even when scripted to fail | Real deduplicating providers check the key before evaluating; otherwise the model test reports duplicates that cannot happen |
+| D27 | 2026-10-06 | GitHub Actions: `ci.yml` (format, clippy, tests on Linux + macOS, MSRV 1.90/1.94, docs, publish dry run, one `ci-pass` check) and tag-driven `release.yml` (preflight → CI at the tag → publish crate by crate, skipping versions already on crates.io → GitHub release from the CHANGELOG) | Mirrors the TalaDB release flow; a failed release can be re-run safely |
 
 ## Open questions
 

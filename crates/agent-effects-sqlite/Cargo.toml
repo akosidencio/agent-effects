@@ -8,6 +8,7 @@ version.workspace = true
 edition.workspace = true
 rust-version = "1.94"   # sqlx 0.9 requires it; the other crates stay at the workspace MSRV
 license.workspace = true
+repository.workspace = true
 authors.workspace = true
 
 [dependencies]

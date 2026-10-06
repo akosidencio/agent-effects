@@ -1,0 +1,163 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    # Changes that cannot affect a build or a test.
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE*"
+      - ".github/workflows/release.yml"
+  # No paths-ignore here: `ci-pass` is meant to be the required status check,
+  # and a skipped workflow never reports one, so a docs-only PR would wait
+  # forever.
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  # release.yml re-runs the whole suite at the tagged commit before publishing.
+  workflow_call:
+
+# One run per PR or ref. A new push to a PR cancels its in-flight run.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal --component rustfmt --no-self-update
+      - run: cargo +stable fmt --all --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal --component clippy --no-self-update
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: clippy-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: clippy-${{ runner.os }}-
+      - run: cargo +stable clippy --workspace --all-targets --all-features --locked -- -D warnings
+      # The feature-gated code (testkit, fault-injection) compiles away
+      # without its features; lint that configuration too.
+      - run: cargo +stable clippy -p agent-effects --lib --locked -- -D warnings
+
+  test:
+    name: Test (${{ matrix.os }})
+    # macOS runners bill at 10x Linux. Pull requests test on Linux; pushes to
+    # main, manual runs and releases add macOS.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-latest"]' || '["ubuntu-latest", "macos-latest"]') }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal --no-self-update
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: test-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: test-${{ runner.os }}-
+      # Includes the crash suites (in-process and with real process death),
+      # the model-based property test and the multi-process SQLite test.
+      - run: cargo +stable test --workspace --all-features --locked
+      - name: Examples
+        run: |
+          cargo +stable run --locked --example payment
+          cargo +stable run --locked --example agent_tool
+
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Keep in sync with `rust-version` in Cargo.toml and
+      # crates/agent-effects-sqlite/Cargo.toml (sqlx 0.9 needs 1.94).
+      - run: rustup toolchain install 1.90 1.94 --profile minimal --no-self-update
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: msrv-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: msrv-${{ runner.os }}-
+      - name: Rust 1.90 (all crates but SQLite)
+        run: cargo +1.90 test --workspace --exclude agent-effects-sqlite --all-features --locked
+      - name: Rust 1.94 (agent-effects-sqlite)
+        run: cargo +1.94 test -p agent-effects-sqlite --locked
+
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal --no-self-update
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: docs-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: docs-${{ runner.os }}-
+      # docs.rs builds with all features; users without them see the rest.
+      - run: cargo +stable doc --workspace --no-deps --all-features --locked
+      - run: cargo +stable doc -p agent-effects --no-deps --locked
+
+  package:
+    name: Package (publish dry run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal --no-self-update
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: package-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: package-${{ runner.os }}-
+      # Packages every publishable crate in dependency order and builds each
+      # one from its package, exactly as crates.io will receive it.
+      - run: cargo +stable publish --workspace --dry-run --locked
+
+  # The single required status check: green only if every job above is.
+  ci-pass:
+    name: CI pass
+    if: always()
+    needs: [fmt, clippy, test, msrv, docs, package]
+    runs-on: ubuntu-latest
+    steps:
+      - name: All jobs succeeded
+        run: |
+          results='${{ toJSON(needs.*.result) }}'
+          echo "$results"
+          if [ "$(echo "$results" | jq '[.[] | select(. != "success")] | length')" != 0 ]; then
+            echo "::error::a required job did not succeed"
+            exit 1
+          fi
