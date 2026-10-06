@@ -413,6 +413,46 @@ and a scripted provider, and adds operator approve/deny steps. It checks
 that every attempt follows an approval and that a denied effect never ran;
 skipping approval fails it.
 
+### Risk policy
+
+Implemented in `policy.rs`. Every effect has a `RiskLevel` (`Low` by
+default, `.risk(..)` or `EffectHandler::risk`). The runtime's `RiskPolicy`
+(`RuntimeBuilder::risk_policy`), built with spec §25's `PolicyBuilder`
+chain, adds requirements by risk level, effect kind, or both:
+
+```rust
+PolicyBuilder::new()
+    .for_risk(RiskLevel::Low).auto_execute()
+    .for_risk(RiskLevel::Medium).require_verification()
+    .for_risk(RiskLevel::High).require_approval()
+    .for_risk(RiskLevel::Critical).require_approval().disable_automatic_retry()
+    .for_kind(EffectKind::IrreversibleWrite).require_verification()
+    .build()
+```
+
+**Precedence: requirements only accumulate.** An effect gets its own
+settings plus the requirements of *every* rule that matches it, so the
+strictest one always wins. No rule, and no rule order, can loosen another
+rule or the effect's own settings. `auto_execute()` adds nothing; it
+documents intent and cannot lift a requirement. Tests check that reversing
+the rules changes nothing and that adding a rule never loosens.
+
+| Requirement | Effect |
+|---|---|
+| `require_approval` | The effect waits in `AwaitingApproval` before its first attempt ([Approval](#approval)), and the request shows the risk. |
+| `require_verification` | An effect without verification is refused with `RuntimeError::PolicyViolation` before anything is recorded. |
+| `disable_automatic_retry` | The runtime never runs the effect again on its own. A transient failure ends `Failed` (or escalates if an earlier attempt may have applied). An unknown outcome is verified if it can be, else escalated, even for idempotent effects. A trusted "not applied" ends `Failed`. Verification checks and compensation retries are unaffected; an operator's `Resolution::Retry` still runs it. |
+
+The policy is applied in `execute`, so closure effects, `submit` and
+recovery of registered handlers all get it. The tracing span carries
+`effect.risk_level`.
+
+Tests: `tests/policy.rs` covers the requirements, refusal before recording,
+an operator retry under no-retry, permissive rules not loosening, and a
+handler's risk driving approval and retry. The model test randomly makes
+effects `Critical` under a no-retry policy and checks that such an effect is
+attempted at most once, through any mix of failures, crashes and recovery.
+
 ### Durable handlers
 
 Implemented in `handler.rs`. Closure effects can only be finished by a
@@ -771,6 +811,7 @@ Crates are added when their milestone starts, not as empty placeholders.
 | D31 | 2026-10-06 | Metrics through an `EffectObserver` trait in core; `agent-effects-otel` implements it | User decision: core stays dependency-free; any metrics backend can plug in |
 | D32 | 2026-10-06 | Compensation: `Committed → Compensating → Compensated / CompensationFailed`, idempotent attempts retried with no `Unknown` state, a separate compensation idempotency key, `CompensableEffect` + closure API, recovery resumes compensable handlers; `Committed` is no longer terminal | Spec §16: compensation is a durable operation with attempts, timestamps, errors and an idempotency id, never "try once, ignore the error" |
 | D33 | 2026-10-06 | Approval: `Pending → AwaitingApproval` after the precondition, before the first attempt; `ApprovalProvider` (`Approved`/`Denied`/`Deferred`) asked per call; operator `approve`/`deny`; `approved` persisted so it is asked once; precondition re-checked after approval; recovery never decides | Spec §24: approval survives restarts; a decision that took hours must not act on stale state |
+| D34 | 2026-10-07 | Risk policy (spec §25): `RiskLevel` per effect; `RiskPolicy` rules select by risk, kind or both; requirements are the union of all matching rules plus the effect's own (monotonic, order-free); unmet `require_verification` refuses before recording; `disable_automatic_retry` gates every self-initiated re-run but not operator retries | "Defined precedence" that cannot surprise: no combination of rules can make an effect less guarded than any single rule says |
 
 ## Open questions
 

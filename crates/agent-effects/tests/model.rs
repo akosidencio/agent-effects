@@ -20,8 +20,8 @@ use agent_effects::store::EffectStore;
 use agent_effects::testkit::{Behavior, FakeRemote};
 use agent_effects::{
     ApprovalDecision, ApprovalProvider, EffectContext, EffectFailure, EffectKey, EffectKind,
-    EffectName, EffectStatus, FailureClass, LogicalKey, Runtime, TokioClock, Transition,
-    Verification, WorkerId,
+    EffectName, EffectStatus, FailureClass, LogicalKey, PolicyBuilder, RiskLevel, Runtime,
+    TokioClock, Transition, Verification, WorkerId,
 };
 use agent_effects_memory::MemoryStore;
 use proptest::prelude::*;
@@ -85,6 +85,8 @@ struct Case {
     /// `Some`: the effect requires approval, and the provider answers with
     /// these decisions in order (then defers).
     approval: Option<Vec<Decision>>,
+    /// The effect is `Critical` under a policy that forbids automatic retry.
+    critical: bool,
     script: Vec<Behavior>,
     steps: Vec<Step>,
 }
@@ -150,15 +152,17 @@ fn case() -> impl Strategy<Value = Case> {
             select(vec![Decision::Approve, Decision::Deny, Decision::Defer]),
             0..4,
         )),
+        any::<bool>(),
         prop::collection::vec(behavior(), 0..8),
         prop::collection::vec(step(), 1..8),
     )
         .prop_map(
-            |(kind, remote_idempotency, verify, approval, script, steps)| Case {
+            |(kind, remote_idempotency, verify, approval, critical, script, steps)| Case {
                 kind,
                 remote_idempotency,
                 verify,
                 approval,
+                critical,
                 script,
                 steps,
             },
@@ -227,6 +231,14 @@ async fn call(
     if let Some(approvals) = approvals {
         builder = builder.approval_provider(approvals.clone());
     }
+    if case.critical {
+        builder = builder.risk_policy(
+            PolicyBuilder::new()
+                .for_risk(RiskLevel::Critical)
+                .disable_automatic_retry()
+                .build(),
+        );
+    }
     let rt = builder.build();
     let send_key = case.remote_idempotency;
     let action = {
@@ -243,6 +255,9 @@ async fn call(
         .remote_idempotency(case.remote_idempotency);
     if case.approval.is_some() {
         effect = effect.require_approval();
+    }
+    if case.critical {
+        effect = effect.risk(RiskLevel::Critical);
     }
     let result = if case.verify {
         let lookup = remote.clone();
@@ -407,6 +422,18 @@ async fn check(case: Case) -> Result<(), TestCaseError> {
     }
     prop_assert_eq!(status, record.status, "trail ends at the record's status");
     prop_assert_eq!(record.version, events.len() as u64);
+
+    if case.critical {
+        let attempts = events
+            .iter()
+            .filter(|e| e.transition == Transition::StartAttempt)
+            .count();
+        prop_assert!(
+            attempts <= 1,
+            "automatic retry under a no-retry policy: {:?}",
+            events
+        );
+    }
 
     if case.approval.is_some() {
         // Every attempt follows an approval; a denied effect never ran.

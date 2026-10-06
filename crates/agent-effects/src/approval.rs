@@ -29,6 +29,7 @@ use serde_json::Value;
 
 use crate::id::{EffectId, EffectKey};
 use crate::kind::EffectKind;
+use crate::policy::RiskLevel;
 
 /// What an approver is asked to decide.
 #[derive(Clone, Debug, PartialEq)]
@@ -40,6 +41,8 @@ pub struct ApprovalRequest {
     pub key: EffectKey,
     /// How reversible it is.
     pub kind: EffectKind,
+    /// How much damage it could do.
+    pub risk: RiskLevel,
     /// The stored input.
     pub input: Option<Value>,
     /// Who asked for the effect, e.g. `agent:refund-agent`.
@@ -48,7 +51,11 @@ pub struct ApprovalRequest {
 
 impl fmt::Display for ApprovalRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "  effect: {} ({:?})", self.key, self.kind)?;
+        writeln!(
+            f,
+            "  effect: {} ({:?}, {} risk)",
+            self.key, self.kind, self.risk
+        )?;
         writeln!(f, "  id:     {}", self.effect_id)?;
         if let Some(by) = &self.requested_by {
             writeln!(f, "  by:     {by}")?;

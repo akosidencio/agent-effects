@@ -13,7 +13,7 @@ Design reference: [design.md](design.md). Status as of 2026-10-05.
 | N1 | Durable **handler registry** (`EffectHandler`, `VerifiableEffect`, `submit`); recovery finishes registered effects with no caller | **done** |
 | N2 | Compensation as a durable sub-lifecycle from `Committed` (`CompensableEffect`) | **done** |
 | N3 | `ApprovalProvider` + CLI provider; `AwaitingApproval` survives restarts | **done** |
-| N4 | Risk policy: `RiskLevel` × `EffectKind`, defined precedence | |
+| N4 | Risk policy: `RiskLevel` × `EffectKind`, defined precedence | **done** |
 | N5 | `agent-effects-postgres`: database-side `now()`, `FOR UPDATE SKIP LOCKED` scans | |
 | N6 | Redaction hook for audit payloads and outputs | |
 | N7 | `EffectObserver` metrics in core; `agent-effects-otel` | |

@@ -52,6 +52,16 @@ pub enum RuntimeError {
         source: serde_json::Error,
     },
 
+    /// The runtime's risk policy requires something the effect lacks, so
+    /// it was refused before anything was recorded.
+    #[error("effect `{key}` violates the risk policy: it requires {requirement}")]
+    PolicyViolation {
+        /// The effect's `name:key`.
+        key: String,
+        /// What the policy requires, e.g. `verification`.
+        requirement: &'static str,
+    },
+
     /// No effect has this name and key.
     #[error("no effect `{key}` exists")]
     NoSuchEffect {

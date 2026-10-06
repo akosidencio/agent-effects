@@ -79,7 +79,7 @@ pub use error::RuntimeError;
 pub use handler::{
     CompensableEffect, CompensationSubmission, EffectHandler, Handler, Submission, VerifiableEffect,
 };
-pub use policy::{Capabilities, UnknownPlan};
+pub use policy::{Capabilities, PolicyBuilder, Requirements, RiskLevel, RiskPolicy, UnknownPlan};
 pub use recovery::{RecoveryReport, Resolution};
 pub use retry::RetryPolicy;
 pub use runtime::{Runtime, RuntimeBuilder};

@@ -77,7 +77,7 @@ use crate::error::RuntimeError;
 use crate::fingerprint::fingerprint;
 use crate::id::{EffectKey, EffectName, LogicalKey};
 use crate::kind::EffectKind;
-use crate::policy::Capabilities;
+use crate::policy::{Capabilities, RiskLevel};
 use crate::retry::RetryPolicy;
 use crate::runtime::Runtime;
 use crate::state::EffectStatus;
@@ -123,6 +123,12 @@ pub trait EffectHandler: Send + Sync + 'static {
     /// How long to wait for one attempt; `None` waits indefinitely.
     fn attempt_timeout(&self) -> Option<Duration> {
         None
+    }
+
+    /// How much damage the effect could do; see
+    /// [`RiskPolicy`](crate::RiskPolicy). Defaults to [`RiskLevel::Low`].
+    fn risk(&self) -> RiskLevel {
+        RiskLevel::Low
     }
 
     /// Whether a human must approve the effect before its first attempt;
@@ -450,6 +456,8 @@ async fn run<S: EffectStore, H: EffectHandler>(
         attempt_timeout: effect.attempt_timeout(),
         precondition: Some(precondition),
         require_approval: effect.requires_approval(),
+        risk: effect.risk(),
+        automatic_retry: true,
     };
     let action = {
         let (effect, input) = (Arc::clone(&effect), Arc::clone(&input));

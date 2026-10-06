@@ -82,6 +82,9 @@ Also available:
 - **Durable handlers.** Implement `EffectHandler`, `register` it, and
   `runtime.submit::<H>(key, input)`. Recovery then finishes the effect from
   its stored input even if the caller never comes back.
+- **Risk policy.** `.risk(RiskLevel::High)` plus a runtime `RiskPolicy`
+  can require approval, verification, or no automatic retries. Rules only
+  ever add requirements.
 - **Approval.** `.require_approval()` waits durably for a human:
   an `ApprovalProvider` (a CLI prompt is included) or `runtime.approve` /
   `runtime.deny`.

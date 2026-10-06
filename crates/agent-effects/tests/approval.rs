@@ -405,6 +405,7 @@ async fn the_cli_provider_reads_a_decision() {
         effect_id: agent_effects::EffectId::new(),
         key: key("cluster.delete", "prod-eu"),
         kind: agent_effects::EffectKind::IrreversibleWrite,
+        risk: agent_effects::RiskLevel::Critical,
         input: Some(json!({ "cluster": "prod-eu" })),
         requested_by: Some("agent:ops".into()),
     };
@@ -430,6 +431,7 @@ async fn the_cli_provider_reads_a_decision() {
         );
         let shown = String::from_utf8(prompt.0.lock().unwrap().clone()).unwrap();
         assert!(shown.contains("cluster.delete:prod-eu"), "{shown}");
+        assert!(shown.contains("critical risk"), "{shown}");
         assert!(shown.contains(r#"{"cluster":"prod-eu"}"#), "{shown}");
         assert!(shown.ends_with("Approve? [y/N]: "), "{shown}");
     }

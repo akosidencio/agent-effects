@@ -31,7 +31,7 @@ use crate::handler::{
 };
 use crate::id::{EffectId, WorkerId};
 use crate::kind::EffectKind;
-use crate::policy::UnknownPlan;
+use crate::policy::{RiskPolicy, UnknownPlan};
 use crate::retry::RetryPolicy;
 use crate::state::{EffectStatus, Transition};
 use crate::store::{
@@ -56,6 +56,7 @@ struct Inner<S> {
     retry: RetryPolicy,
     handlers: Registry<S>,
     approval: Option<Arc<dyn ErasedApproval>>,
+    policy: RiskPolicy,
     #[cfg(feature = "fault-injection")]
     faults: Option<Arc<FaultInjector>>,
 }
@@ -78,11 +79,20 @@ pub struct RuntimeBuilder<S> {
     retry: RetryPolicy,
     handlers: Registry<S>,
     approval: Option<Arc<dyn ErasedApproval>>,
+    policy: RiskPolicy,
     #[cfg(feature = "fault-injection")]
     faults: Option<Arc<FaultInjector>>,
 }
 
 impl<S: EffectStore> RuntimeBuilder<S> {
+    /// Adds requirements by risk level and effect kind to every effect; see
+    /// [`RiskPolicy`]. Requirements only accumulate on top of each effect's
+    /// own settings.
+    pub fn risk_policy(mut self, policy: RiskPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
     /// Asks `provider` to decide on effects that require approval; see
     /// [`approval`](crate::approval). Without one, such effects wait for an
     /// operator's [`Runtime::approve`] or [`Runtime::deny`].
@@ -160,6 +170,7 @@ impl<S: EffectStore> RuntimeBuilder<S> {
                 retry: self.retry,
                 handlers: self.handlers,
                 approval: self.approval,
+                policy: self.policy,
                 #[cfg(feature = "fault-injection")]
                 faults: self.faults,
             }),
@@ -199,6 +210,7 @@ impl<S: EffectStore> Runtime<S> {
             retry: RetryPolicy::default(),
             handlers: Registry::new(),
             approval: None,
+            policy: RiskPolicy::default(),
             #[cfg(feature = "fault-injection")]
             faults: None,
         }
@@ -359,7 +371,7 @@ impl<S: EffectStore> Runtime<S> {
 
     pub(crate) async fn execute<T, F, Fut, V>(
         &self,
-        spec: EffectSpec,
+        mut spec: EffectSpec,
         action: F,
         verifier: V,
     ) -> Result<EffectOutcome<T>, RuntimeError>
@@ -369,11 +381,26 @@ impl<S: EffectStore> Runtime<S> {
         Fut: Future<Output = Result<T, EffectFailure>> + Send + 'static,
         V: Verifier<T>,
     {
+        // The risk policy only adds requirements; see `RiskPolicy`.
+        let required = self
+            .inner
+            .policy
+            .requirements(spec.risk, spec.capabilities.kind);
+        if required.verification && spec.capabilities.verification == VerificationMode::None {
+            return Err(RuntimeError::PolicyViolation {
+                key: spec.key.to_string(),
+                requirement: "verification",
+            });
+        }
+        spec.require_approval |= required.approval;
+        spec.automatic_retry &= !required.no_automatic_retry;
+
         let span = info_span!(
             "agent_effect.execute",
             effect.name = %spec.key.name,
             effect.logical_key = %spec.key.key,
             effect.kind = spec.capabilities.kind.as_str(),
+            effect.risk_level = %spec.risk,
             effect.id = field::Empty,
             effect.status = field::Empty,
             effect.attempt = field::Empty,
@@ -602,7 +629,7 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
                     // Still unknown after every check this call may make;
                     // a later call or recovery tries again.
                     UnknownPlan::Verify => break,
-                    UnknownPlan::Reexecute if self.retry().allows_another(record.attempt_count) => {
+                    UnknownPlan::Reexecute if self.may_retry(record.attempt_count) => {
                         record = self
                             .schedule_retry(&record, FailureClass::Ambiguous, None)
                             .await?;
@@ -673,7 +700,7 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
                 let class = failure.class();
                 let error = failure.to_record();
                 let record = match class.disposition() {
-                    Disposition::Retry if self.retry().allows_another(record.attempt_count) => {
+                    Disposition::Retry if self.may_retry(record.attempt_count) => {
                         self.schedule_retry(&record, class, Some(error)).await?
                     }
                     // This attempt definitely failed, but an earlier one may
@@ -800,7 +827,7 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
                                 class: None,
                                 message: "verification found that the effect did not apply".into(),
                             };
-                            record = if self.retry().allows_another(record.attempt_count) {
+                            record = if self.may_retry(record.attempt_count) {
                                 self.schedule_retry(&record, FailureClass::Transient, Some(error))
                                     .await?
                             } else {
@@ -917,6 +944,7 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
             effect_id: record.id,
             key: record.key.clone(),
             kind: record.kind,
+            risk: self.spec.risk,
             input: record.input.clone(),
             requested_by: record.created_by.clone(),
         };
@@ -962,6 +990,12 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
 
     fn retry(&self) -> &RetryPolicy {
         &self.spec.retry
+    }
+
+    /// Whether the runtime may run the effect again on its own after
+    /// `attempts`: within budget, and not forbidden by the risk policy.
+    fn may_retry(&self, attempts: u32) -> bool {
+        self.spec.automatic_retry && self.retry().allows_another(attempts)
     }
 }
 

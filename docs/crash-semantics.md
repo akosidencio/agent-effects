@@ -85,6 +85,9 @@ From `Unknown`, a later call with the same key does one of these:
 - **Give operators `resolve`.**
   `runtime.resolve(id, Resolution::{Applied, NotApplied, Retry}, actor, note)`
   records a person's decision and the reason in the audit trail.
+- **Set a risk policy.** `RuntimeBuilder::risk_policy` can demand approval,
+  verification, or no automatic retries by risk level and effect kind.
+  Requirements only add up: no rule can loosen another.
 - **Prefer idempotency keys.** Forward `ctx.idempotency_key()`. It is stable
   across attempts, workers and restarts. Then declare
   `.remote_idempotency(true)`.

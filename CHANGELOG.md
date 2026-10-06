@@ -18,6 +18,11 @@ First release.
   separate capability) is registered via `RuntimeBuilder::register` and run
   with `runtime.submit::<H>(key, input)`. Inputs are stored, so `recover()`
   finishes registered effects after a crash with no caller.
+- **Risk policy.** `RiskLevel` per effect, plus `RiskPolicy` /
+  `PolicyBuilder` (`for_risk`, `for_kind`, `require_approval`,
+  `require_verification`, `disable_automatic_retry`). Requirements only
+  accumulate. An unmet verification requirement fails with
+  `RuntimeError::PolicyViolation` before anything is recorded.
 - **Approval.** `.require_approval()` / `EffectHandler::requires_approval`
   hold an effect in `AwaitingApproval` before its first attempt, durably.
   Decisions come from an `ApprovalProvider` (`CliApproval` included) or an

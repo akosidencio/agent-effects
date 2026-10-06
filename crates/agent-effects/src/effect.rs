@@ -16,7 +16,7 @@ use crate::failure::FailureClass;
 use crate::fingerprint::fingerprint;
 use crate::id::{EffectId, EffectKey, IdempotencyKey};
 use crate::kind::EffectKind;
-use crate::policy::Capabilities;
+use crate::policy::{Capabilities, RiskLevel};
 use crate::retry::RetryPolicy;
 use crate::runtime::Runtime;
 use crate::store::{EffectStore, ErrorRecord};
@@ -252,6 +252,7 @@ pub struct EffectBuilder<S, V = NoVerification> {
     attempt_timeout: Option<Duration>,
     precondition: Option<PreconditionFn>,
     require_approval: bool,
+    risk: RiskLevel,
     verification: VerificationMode,
     verifier: V,
 }
@@ -271,6 +272,7 @@ impl<S: EffectStore> EffectBuilder<S> {
             attempt_timeout: None,
             precondition: None,
             require_approval: false,
+            risk: RiskLevel::Low,
             verification: VerificationMode::None,
             verifier: NoVerification,
         }
@@ -323,6 +325,7 @@ impl<S: EffectStore> EffectBuilder<S> {
             attempt_timeout: self.attempt_timeout,
             precondition: self.precondition,
             require_approval: self.require_approval,
+            risk: self.risk,
             verification: mode,
             verifier,
         }
@@ -397,6 +400,14 @@ impl<S: EffectStore, V> EffectBuilder<S, V> {
         self
     }
 
+    /// How much damage the effect could do; the runtime's
+    /// [`RiskPolicy`](crate::RiskPolicy) adds requirements by risk. Defaults
+    /// to [`RiskLevel::Low`].
+    pub fn risk(mut self, risk: RiskLevel) -> Self {
+        self.risk = risk;
+        self
+    }
+
     /// Requires a human decision before the first attempt; see
     /// [`approval`](crate::approval). The effect waits in
     /// `AwaitingApproval`, durably, until the runtime's approval provider or
@@ -444,6 +455,8 @@ impl<S: EffectStore, V> EffectBuilder<S, V> {
             attempt_timeout: self.attempt_timeout,
             precondition: self.precondition,
             require_approval: self.require_approval,
+            risk: self.risk,
+            automatic_retry: true,
         };
         self.runtime.execute(spec, action, self.verifier).await
     }
@@ -460,4 +473,8 @@ pub(crate) struct EffectSpec {
     pub(crate) attempt_timeout: Option<Duration>,
     pub(crate) precondition: Option<PreconditionFn>,
     pub(crate) require_approval: bool,
+    pub(crate) risk: RiskLevel,
+    /// Whether the runtime may retry or re-run on its own; a risk policy
+    /// can turn it off.
+    pub(crate) automatic_retry: bool,
 }

@@ -7,3 +7,4 @@
 cc e84bb99241b1ab6cd547efc4720cce990b04fc3f5ff4da89ffd8f8471273bdd4 # shrinks to case = Case { kind: ReversibleWrite, remote_idempotency: false, verify: false, script: [CommitThenDrop], steps: [Call] }
 cc 99e69f3184385687394eaed944d62afdd9dcd5cbea78b50d47b7503464bcf299 # shrinks to case = Case { kind: ReversibleWrite, remote_idempotency: false, verify: false, script: [CommitThenDrop], steps: [Call] }
 cc 0065c1a045c1c65df979b26cd66d93dd520f3e48b1bbf0a007e47bcff1169852 # found in CI: ReversibleWrite, remote idempotency, script [Unreachable, Unreachable, CommitThenDrop, Unreachable, Unreachable] -> Failed although applied
+cc 1e5bdbf163af6f951e5a097275f34e66c41d36c90e700fde95bd69fe4f3b6cce # shrinks to case = Case { kind: Read, remote_idempotency: false, verify: false, approval: None, critical: true, script: [Unreachable], steps: [Call] }
