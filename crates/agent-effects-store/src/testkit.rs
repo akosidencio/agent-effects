@@ -55,6 +55,7 @@ where
     listing_filters_and_pages(make_store().await).await;
     doubt_is_persisted_and_guards_failure(make_store().await).await;
     compensation_is_persisted(make_store().await).await;
+    approval_is_persisted(make_store().await).await;
 }
 
 const TTL: Duration = Duration::from_secs(30);
@@ -722,4 +723,30 @@ async fn compensation_is_persisted<S: EffectStore>(store: S) {
         .await
         .unwrap();
     assert_eq!(listed, [record]);
+}
+
+async fn approval_is_persisted<S: EffectStore>(store: S) {
+    let record = insert(&store, 1).await;
+    assert!(!record.approved);
+    let record = drive(&store, record, None, &[Transition::RequestApproval], t(1)).await;
+    assert_eq!(record.status, EffectStatus::AwaitingApproval);
+    let mut approve = TransitionRequest::new(&record, None, Transition::Approve, t(2));
+    approve.actor = Some("operator:dennis".into());
+    let record = store.transition(approve).await.unwrap();
+    let stored = reload(&store, record.id).await;
+    assert_eq!(stored, record, "transition must return the stored record");
+    assert_eq!(stored.status, EffectStatus::Pending);
+    assert!(stored.approved, "the store must persist approval");
+
+    let other = insert(&store, 2).await;
+    let other = drive(
+        &store,
+        other,
+        None,
+        &[Transition::RequestApproval, Transition::Deny],
+        t(3),
+    )
+    .await;
+    assert_eq!(other.status, EffectStatus::Rejected);
+    assert!(!reload(&store, other.id).await.approved);
 }

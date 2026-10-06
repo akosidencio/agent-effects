@@ -82,6 +82,9 @@ Also available:
 - **Durable handlers.** Implement `EffectHandler`, `register` it, and
   `runtime.submit::<H>(key, input)`. Recovery then finishes the effect from
   its stored input even if the caller never comes back.
+- **Approval.** `.require_approval()` waits durably for a human:
+  an `ApprovalProvider` (a CLI prompt is included) or `runtime.approve` /
+  `runtime.deny`.
 - **Compensation.** `runtime.compensation(name, key).run(...)` or
   `runtime.compensate::<H>(key)` undoes a committed effect durably, with
   retries and its own idempotency key.

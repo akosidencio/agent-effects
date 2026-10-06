@@ -147,7 +147,9 @@ impl<S: EffectStore> Runtime<S> {
                 let not_due = record.next_attempt_at.is_some_and(|at| at > self.now());
                 let operator = matches!(
                     record.status,
-                    EffectStatus::NeedsIntervention | EffectStatus::CompensationFailed
+                    EffectStatus::NeedsIntervention
+                        | EffectStatus::CompensationFailed
+                        | EffectStatus::AwaitingApproval
                 );
                 if operator || not_due {
                     continue;
@@ -209,8 +211,8 @@ impl<S: EffectStore> Runtime<S> {
     /// These are the effects that are unsettled with nobody working on
     /// them: `Pending` (for example a worker died during a backoff wait),
     /// `Executing` or `Verifying` with an expired lease (not yet recovered),
-    /// `Unknown`, `NeedsIntervention`, an interrupted `Compensating`, and
-    /// `CompensationFailed`.
+    /// `Unknown`, `NeedsIntervention`, `AwaitingApproval`, an interrupted
+    /// `Compensating`, and `CompensationFailed`.
     ///
     /// # Errors
     ///
@@ -222,6 +224,7 @@ impl<S: EffectStore> Runtime<S> {
     ) -> Result<Vec<EffectRecord>, RuntimeError> {
         let mut query = ListQuery::statuses([
             EffectStatus::Pending,
+            EffectStatus::AwaitingApproval,
             EffectStatus::Executing,
             EffectStatus::Verifying,
             EffectStatus::Unknown,
@@ -282,6 +285,66 @@ impl<S: EffectStore> Runtime<S> {
         }
         let record = self.store().transition(request).await?;
         info!(effect.id = %id, %transition, "effect resolved by an operator");
+        Ok(record)
+    }
+
+    /// Approves an effect waiting in `AwaitingApproval`. It becomes
+    /// `Pending`: a caller's next call runs it, and so does recovery for a
+    /// registered handler. `actor` is recorded as the approver.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::resolve`]; `InvalidTransition` if it is not awaiting
+    /// approval.
+    pub async fn approve(
+        &self,
+        id: EffectId,
+        actor: impl Into<String>,
+        note: impl Into<String>,
+    ) -> Result<EffectRecord, RuntimeError> {
+        self.decide(id, Transition::Approve, actor.into(), note.into())
+            .await
+    }
+
+    /// Denies an effect waiting in `AwaitingApproval`. It ends `Rejected`,
+    /// with `reason` as its error.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::approve`].
+    pub async fn deny(
+        &self,
+        id: EffectId,
+        actor: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Result<EffectRecord, RuntimeError> {
+        self.decide(id, Transition::Deny, actor.into(), reason.into())
+            .await
+    }
+
+    async fn decide(
+        &self,
+        id: EffectId,
+        transition: Transition,
+        actor: String,
+        note: String,
+    ) -> Result<EffectRecord, RuntimeError> {
+        let record = self
+            .store()
+            .get(id)
+            .await?
+            .ok_or(StoreError::NotFound(id))?;
+        let mut request = TransitionRequest::new(&record, None, transition, self.now());
+        request.actor = Some(actor);
+        if transition == Transition::Deny {
+            request.error = Some(ErrorRecord {
+                class: None,
+                message: note.clone(),
+            });
+        }
+        request.payload = Some(json!({ "note": note }));
+        let record = self.store().transition(request).await?;
+        info!(effect.id = %id, %transition, "approval decided by an operator");
         Ok(record)
     }
 

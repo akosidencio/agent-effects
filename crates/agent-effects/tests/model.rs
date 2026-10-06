@@ -19,8 +19,9 @@ use agent_effects::fault::{FaultInjector, FaultPoint};
 use agent_effects::store::EffectStore;
 use agent_effects::testkit::{Behavior, FakeRemote};
 use agent_effects::{
-    EffectContext, EffectFailure, EffectKey, EffectKind, EffectName, EffectStatus, FailureClass,
-    LogicalKey, Runtime, TokioClock, Verification, WorkerId,
+    ApprovalDecision, ApprovalProvider, EffectContext, EffectFailure, EffectKey, EffectKind,
+    EffectName, EffectStatus, FailureClass, LogicalKey, Runtime, TokioClock, Transition,
+    Verification, WorkerId,
 };
 use agent_effects_memory::MemoryStore;
 use proptest::prelude::*;
@@ -55,7 +56,7 @@ const POINTS: [FaultPoint; 6] = [
     FaultPoint::AfterVerificationStarted,
 ];
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Step {
     /// A caller runs the effect on a fresh worker.
     Call,
@@ -70,6 +71,10 @@ enum Step {
     /// A caller undoes it on a worker that crashes once the attempt is
     /// recorded.
     CompensateAndCrash,
+    /// An operator approves it, if it is awaiting approval.
+    OperatorApprove,
+    /// An operator denies it, if it is awaiting approval.
+    OperatorDeny,
 }
 
 #[derive(Clone, Debug)]
@@ -77,8 +82,40 @@ struct Case {
     kind: EffectKind,
     remote_idempotency: bool,
     verify: bool,
+    /// `Some`: the effect requires approval, and the provider answers with
+    /// these decisions in order (then defers).
+    approval: Option<Vec<Decision>>,
     script: Vec<Behavior>,
     steps: Vec<Step>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Decision {
+    Approve,
+    Deny,
+    Defer,
+}
+
+/// An approval provider answering from the case's script.
+#[derive(Clone)]
+struct ModelApprovals(Arc<std::sync::Mutex<std::collections::VecDeque<Decision>>>);
+
+impl ApprovalProvider for ModelApprovals {
+    fn request(
+        &self,
+        _: agent_effects::ApprovalRequest,
+    ) -> impl std::future::Future<Output = ApprovalDecision> + Send {
+        std::future::ready(match self.0.lock().unwrap().pop_front() {
+            Some(Decision::Approve) => ApprovalDecision::Approved {
+                by: "provider".into(),
+            },
+            Some(Decision::Deny) => ApprovalDecision::Denied {
+                by: "provider".into(),
+                reason: "no".into(),
+            },
+            Some(Decision::Defer) | None => ApprovalDecision::Deferred,
+        })
+    }
 }
 
 fn behavior() -> impl Strategy<Value = Behavior> {
@@ -99,6 +136,8 @@ fn step() -> impl Strategy<Value = Step> {
         2 => Just(Step::Expire),
         2 => Just(Step::Compensate),
         1 => Just(Step::CompensateAndCrash),
+        1 => Just(Step::OperatorApprove),
+        1 => Just(Step::OperatorDeny),
     ]
 }
 
@@ -107,16 +146,23 @@ fn case() -> impl Strategy<Value = Case> {
         select(KINDS.to_vec()),
         any::<bool>(),
         any::<bool>(),
+        prop::option::of(prop::collection::vec(
+            select(vec![Decision::Approve, Decision::Deny, Decision::Defer]),
+            0..4,
+        )),
         prop::collection::vec(behavior(), 0..8),
         prop::collection::vec(step(), 1..8),
     )
-        .prop_map(|(kind, remote_idempotency, verify, script, steps)| Case {
-            kind,
-            remote_idempotency,
-            verify,
-            script,
-            steps,
-        })
+        .prop_map(
+            |(kind, remote_idempotency, verify, approval, script, steps)| Case {
+                kind,
+                remote_idempotency,
+                verify,
+                approval,
+                script,
+                steps,
+            },
+        )
 }
 
 fn quiet_crashes() {
@@ -169,6 +215,7 @@ async fn call(
     remote: &FakeRemote,
     worker: String,
     faults: Option<Arc<FaultInjector>>,
+    approvals: Option<&ModelApprovals>,
 ) -> Result<(), String> {
     let mut builder = Runtime::builder(store.clone())
         .clock(clock)
@@ -176,6 +223,9 @@ async fn call(
         .lease_ttl(TTL);
     if let Some(faults) = faults {
         builder = builder.fault_injector(faults);
+    }
+    if let Some(approvals) = approvals {
+        builder = builder.approval_provider(approvals.clone());
     }
     let rt = builder.build();
     let send_key = case.remote_idempotency;
@@ -187,10 +237,13 @@ async fn call(
             async move { remote.create(RES, key).await }
         }
     };
-    let effect = rt
+    let mut effect = rt
         .effect("model", "effect")
         .kind(case.kind)
         .remote_idempotency(case.remote_idempotency);
+    if case.approval.is_some() {
+        effect = effect.require_approval();
+    }
     let result = if case.verify {
         let lookup = remote.clone();
         effect
@@ -217,13 +270,14 @@ async fn run_step(
     store: &MemoryStore,
     clock: TokioClock,
     remote: &FakeRemote,
+    approvals: Option<&ModelApprovals>,
     i: usize,
     step: Step,
 ) -> Result<(), TestCaseError> {
     let worker = format!("worker-{i}");
     match step {
         Step::Call => {
-            let result = call(case, store, clock, remote, worker, None).await;
+            let result = call(case, store, clock, remote, worker, None, approvals).await;
             prop_assert!(result.is_ok(), "step {i}: {result:?}");
         }
         Step::CrashAt(point) => {
@@ -235,6 +289,7 @@ async fn run_step(
                 remote,
                 worker,
                 Some(Arc::clone(&injector)),
+                approvals,
             )
             .await;
             if injector.reached().contains(&point) {
@@ -275,6 +330,36 @@ async fn run_step(
                 prop_assert!(result.is_ok(), "step {i}: {result:?}");
             }
         }
+        Step::OperatorApprove | Step::OperatorDeny => {
+            let key = EffectKey::new(
+                EffectName::new("model").unwrap(),
+                LogicalKey::new("effect").unwrap(),
+            );
+            let waiting = store
+                .get_by_key(&key)
+                .await
+                .unwrap()
+                .filter(|r| r.status == EffectStatus::AwaitingApproval);
+            if let Some(record) = waiting {
+                let rt = Runtime::builder(store.clone()).clock(clock).build();
+                let decided = if step == Step::OperatorApprove {
+                    rt.approve(record.id, "operator", "ok").await
+                } else {
+                    rt.deny(record.id, "operator", "no").await
+                };
+                // A caller may hold it right now; then the operator waits.
+                prop_assert!(
+                    decided.is_ok()
+                        || matches!(
+                            decided,
+                            Err(agent_effects::RuntimeError::Store(
+                                agent_effects::StoreError::LeaseHeld { .. }
+                            ))
+                        ),
+                    "step {i}: {decided:?}"
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -283,9 +368,14 @@ async fn check(case: Case) -> Result<(), TestCaseError> {
     let store = MemoryStore::new();
     let clock = TokioClock::new();
     let remote = FakeRemote::new(clock).script(case.script.clone());
+    let approvals = case.approval.as_ref().map(|decisions| {
+        ModelApprovals(Arc::new(std::sync::Mutex::new(
+            decisions.iter().copied().collect(),
+        )))
+    });
 
     for (i, step) in case.steps.iter().enumerate() {
-        run_step(&case, &store, clock, &remote, i, *step).await?;
+        run_step(&case, &store, clock, &remote, approvals.as_ref(), i, *step).await?;
     }
 
     let key = EffectKey::new(
@@ -317,6 +407,26 @@ async fn check(case: Case) -> Result<(), TestCaseError> {
     }
     prop_assert_eq!(status, record.status, "trail ends at the record's status");
     prop_assert_eq!(record.version, events.len() as u64);
+
+    if case.approval.is_some() {
+        // Every attempt follows an approval; a denied effect never ran.
+        let first_approval = events
+            .iter()
+            .position(|e| e.transition == Transition::Approve);
+        let first_attempt = events
+            .iter()
+            .position(|e| e.transition == Transition::StartAttempt);
+        if let Some(attempt) = first_attempt {
+            prop_assert!(
+                first_approval.is_some_and(|approval| approval < attempt),
+                "attempted without approval: {:?}",
+                events
+            );
+        }
+        if events.iter().any(|e| e.transition == Transition::Deny) {
+            prop_assert_eq!(created, 0, "denied, yet created");
+        }
+    }
 
     if !case.kind.is_naturally_idempotent() {
         prop_assert!(created <= 1, "created {} times: {:?}", created, events);

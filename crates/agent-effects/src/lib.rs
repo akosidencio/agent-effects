@@ -46,6 +46,7 @@
 //! (identity, kinds, the state machine) and the [`EffectStore`] contract come
 //! from [`agent-effects-store`](store) and are re-exported here.
 
+pub mod approval;
 pub mod clock;
 pub mod compensation;
 pub mod effect;
@@ -70,6 +71,7 @@ pub use agent_effects_store::{
     EffectStore, ErrorRecord, FailureClass, IdempotencyKey, IdentityError, InvalidTransition,
     Lease, LogicalKey, StoreError, Transition, WorkerId,
 };
+pub use approval::{ApprovalDecision, ApprovalProvider, ApprovalRequest, CliApproval};
 pub use clock::{Clock, ManualClock, SystemClock, TokioClock};
 pub use compensation::{CompensationBuilder, CompensationContext, CompensationOutcome};
 pub use effect::{EffectBuilder, EffectContext, EffectFailure, EffectOutcome, Precondition};

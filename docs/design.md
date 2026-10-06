@@ -378,6 +378,41 @@ and crashes mid-compensation into its random histories. Its invariants: a
 cancelled resource implies compensation started, and `Compensated` implies
 the resource is gone.
 
+### Approval
+
+Implemented in `approval.rs`. An effect that requires approval
+(`.require_approval()`, or `EffectHandler::requires_approval`) goes
+`Pending → AwaitingApproval` before its first attempt, after its
+precondition passes:
+
+- **Providers.** The runtime's `ApprovalProvider` (`RuntimeBuilder::approval_provider`)
+  is asked on its own task, under the lease. It answers `Approved { by }`,
+  `Denied { by, reason }`, or `Deferred`. A deferred effect stays
+  `AwaitingApproval`: callers get `EffectOutcome::AwaitingApproval`, and
+  each later call asks again. The request carries the effect id, so a
+  provider can deduplicate. `CliApproval` prompts on a terminal; end of
+  input defers.
+- **Operators.** `runtime.approve(id, actor, note)` and
+  `runtime.deny(id, actor, reason)` decide without a provider, and are
+  refused while someone holds the effect. Approval makes the effect
+  `Pending`: a caller's next call runs it, and so does recovery for a
+  registered handler. Recovery itself never decides an approval.
+- **Asked once.** `Approve` sets the record's `approved`, so retries and
+  restarts never ask again.
+- **Re-checked after approval.** The precondition runs again after
+  approval: a decision that sat in a queue may have gone stale.
+- **Durable.** The record is durable, so a pending approval survives
+  restarts (crash point `AfterApprovalRequested`). The approver and the
+  denier are the audit events' actors.
+
+Tests: `tests/approval.rs` covers approval, denial, operator decisions with
+no provider, deferral, asking only once across retries, a stale decision
+caught by the re-checked precondition, a crash while awaiting approval, and
+the CLI provider. The model test gives random cases an approval requirement
+and a scripted provider, and adds operator approve/deny steps. It checks
+that every attempt follows an approval and that a denied effect never ran;
+skipping approval fails it.
+
 ### Durable handlers
 
 Implemented in `handler.rs`. Closure effects can only be finished by a
@@ -489,13 +524,14 @@ backend therefore enforces identical semantics:
   cross-host clock skew.)*
 
 Every backend must pass `agent_effects_store::testkit::conformance` (the
-`testkit` feature). It runs 15 cases: read-back of all fields, key
+`testkit` feature). It runs 16 cases: read-back of all fields, key
 idempotency, 16-way concurrent inserts, missing records, lease exclusivity,
 takeover fencing, strict renewal, release, a full transition history with its
 events, rejected transitions leaving no trace, lease-less operator
 resolution, terminal finality, listing/paging, and persisting
 `may_have_applied` while refusing `FailedDefinitively` under it, and the
-compensation lifecycle (attempt counter, retry schedule, operator retry). Its sensitivity was checked
+compensation lifecycle (attempt counter, retry schedule, operator retry), and
+approval (`approved` persisted; denial rejects). Its sensitivity was checked
 by breaking `MemoryStore` on purpose: ignoring the unique key, or persisting
 the event without the record. The suite caught both.
 
@@ -545,6 +581,7 @@ CREATE TABLE effects (
     attempt_count      INTEGER NOT NULL,
     may_have_applied   INTEGER NOT NULL,  -- 0 or 1
     compensation_attempts INTEGER NOT NULL,
+    approved           INTEGER NOT NULL,  -- 0 or 1
     next_attempt_at    INTEGER,
     attempt_started_at INTEGER,
     lease_owner        TEXT,
@@ -615,6 +652,7 @@ wire.
 |---|---|---|---|---|
 | `BeforeInsert` | nothing | the next call starts fresh | created once | created once |
 | `AfterInsert` | `Pending`, no lease | the next call runs it; nothing was sent | created once | created once |
+| `AfterApprovalRequested` | `AwaitingApproval` | waits for a decision, durably; the next call asks the provider again; an operator can `approve`/`deny`; once approved, a call or (for a handler) recovery runs it | created once, after approval | created once, after approval |
 | `AfterAttemptPersisted` (before the request is sent) | `Executing` | lease expiry → `recover()` → `Unknown` → unknown plan; the runtime cannot prove nothing was sent | created once | operator, created 0 times |
 | `AfterActionStarted` (request in flight) | `Executing` | same | created once | operator, created ≤ 1 times |
 | `AfterActionReturned` (after the remote commit, before persisting the result; this also covers "before the response") | `Executing` | same | created once | operator, created once |
@@ -732,6 +770,7 @@ Crates are added when their milestone starts, not as empty placeholders.
 | D30 | 2026-10-06 | The roadmap's v0.2 items ship in 0.1.0 | User decision: nothing was published yet, so the schema can still change in place |
 | D31 | 2026-10-06 | Metrics through an `EffectObserver` trait in core; `agent-effects-otel` implements it | User decision: core stays dependency-free; any metrics backend can plug in |
 | D32 | 2026-10-06 | Compensation: `Committed → Compensating → Compensated / CompensationFailed`, idempotent attempts retried with no `Unknown` state, a separate compensation idempotency key, `CompensableEffect` + closure API, recovery resumes compensable handlers; `Committed` is no longer terminal | Spec §16: compensation is a durable operation with attempts, timestamps, errors and an idempotency id, never "try once, ignore the error" |
+| D33 | 2026-10-06 | Approval: `Pending → AwaitingApproval` after the precondition, before the first attempt; `ApprovalProvider` (`Approved`/`Denied`/`Deferred`) asked per call; operator `approve`/`deny`; `approved` persisted so it is asked once; precondition re-checked after approval; recovery never decides | Spec §24: approval survives restarts; a decision that took hours must not act on stale state |
 
 ## Open questions
 

@@ -42,6 +42,9 @@ pub struct EffectRecord {
     pub may_have_applied: bool,
     /// Compensation attempts started or scheduled so far.
     pub compensation_attempts: u32,
+    /// The effect was approved, so it is not asked again, even after a
+    /// restart.
+    pub approved: bool,
     /// When a scheduled retry may start.
     pub next_attempt_at: Option<SystemTime>,
     /// When the latest attempt started. Settle delays count from here.
@@ -78,6 +81,7 @@ impl EffectRecord {
             attempt_count: 0,
             may_have_applied: false,
             compensation_attempts: 0,
+            approved: false,
             next_attempt_at: None,
             attempt_started_at: None,
             lease_owner: None,
@@ -232,6 +236,7 @@ impl EffectRecord {
             Transition::ScheduleRetry | Transition::ResolvedRetry => {
                 self.next_attempt_at = Some(request.next_attempt_at.unwrap_or(now));
             }
+            Transition::Approve => self.approved = true,
             Transition::StartCompensation => {
                 self.compensation_attempts = 1;
                 self.next_attempt_at = None;

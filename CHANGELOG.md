@@ -18,6 +18,11 @@ First release.
   separate capability) is registered via `RuntimeBuilder::register` and run
   with `runtime.submit::<H>(key, input)`. Inputs are stored, so `recover()`
   finishes registered effects after a crash with no caller.
+- **Approval.** `.require_approval()` / `EffectHandler::requires_approval`
+  hold an effect in `AwaitingApproval` before its first attempt, durably.
+  Decisions come from an `ApprovalProvider` (`CliApproval` included) or an
+  operator (`runtime.approve` / `runtime.deny`). Approval is asked once, and
+  the precondition is re-checked afterwards.
 - **Compensation.** `Committed → Compensating → Compensated /
   CompensationFailed`, durable and retried. Use `runtime.compensation(name,
   key).run(...)` for closure effects and `runtime.compensate::<H>(key)` for a

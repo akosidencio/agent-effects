@@ -179,6 +179,13 @@ pub enum EffectOutcome<T> {
         /// The effect.
         id: EffectId,
     },
+    /// The effect waits for a human decision. Call again later, or have an
+    /// operator use [`Runtime::approve`](crate::Runtime::approve) /
+    /// [`Runtime::deny`](crate::Runtime::deny).
+    AwaitingApproval {
+        /// The effect.
+        id: EffectId,
+    },
     /// The effect applied and was later undone by compensation.
     Compensated {
         /// The effect.
@@ -244,6 +251,7 @@ pub struct EffectBuilder<S, V = NoVerification> {
     retry: RetryPolicy,
     attempt_timeout: Option<Duration>,
     precondition: Option<PreconditionFn>,
+    require_approval: bool,
     verification: VerificationMode,
     verifier: V,
 }
@@ -262,6 +270,7 @@ impl<S: EffectStore> EffectBuilder<S> {
             retry,
             attempt_timeout: None,
             precondition: None,
+            require_approval: false,
             verification: VerificationMode::None,
             verifier: NoVerification,
         }
@@ -313,6 +322,7 @@ impl<S: EffectStore> EffectBuilder<S> {
             retry: self.retry,
             attempt_timeout: self.attempt_timeout,
             precondition: self.precondition,
+            require_approval: self.require_approval,
             verification: mode,
             verifier,
         }
@@ -387,6 +397,15 @@ impl<S: EffectStore, V> EffectBuilder<S, V> {
         self
     }
 
+    /// Requires a human decision before the first attempt; see
+    /// [`approval`](crate::approval). The effect waits in
+    /// `AwaitingApproval`, durably, until the runtime's approval provider or
+    /// an operator decides.
+    pub fn require_approval(mut self) -> Self {
+        self.require_approval = true;
+        self
+    }
+
     /// Runs the effect, or attaches to an earlier run with the same key.
     ///
     /// The action may be called more than once over the effect's life (for
@@ -424,6 +443,7 @@ impl<S: EffectStore, V> EffectBuilder<S, V> {
             retry: self.retry,
             attempt_timeout: self.attempt_timeout,
             precondition: self.precondition,
+            require_approval: self.require_approval,
         };
         self.runtime.execute(spec, action, self.verifier).await
     }
@@ -439,4 +459,5 @@ pub(crate) struct EffectSpec {
     pub(crate) retry: RetryPolicy,
     pub(crate) attempt_timeout: Option<Duration>,
     pub(crate) precondition: Option<PreconditionFn>,
+    pub(crate) require_approval: bool,
 }

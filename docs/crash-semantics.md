@@ -43,6 +43,7 @@ uncertain outcome goes to a person.
 | `Unknown { id }` | It may or may not have happened | **Do not treat as failed.** Call again later with the same key (the runtime verifies or re-runs if safe), or leave it to recovery and an operator. |
 | `NeedsIntervention { id }` | The runtime cannot resolve it safely | **Do not retry.** A person checks the remote system and calls `runtime.resolve`. |
 | `InProgress { id }` | Someone else is running it right now | `runtime.wait(id, timeout)`, or call again later. |
+| `AwaitingApproval { id }` | A human decision is needed first; nothing ran | Call again later, or have an operator `approve`/`deny` it. |
 | `Compensated { id }` | It happened and was later undone | Nothing; it stays undone. |
 | `Err(RuntimeError)` | The runtime itself failed (store, bad input, mismatched key) | Fix the cause. If the store failed after the action ran, the effect is in doubt and recovery will mark it `Unknown`. |
 
@@ -56,6 +57,7 @@ example does this.
 |---|---|---|
 | before the record is inserted | absent | The next call starts fresh. |
 | after insert, before an attempt starts | `Pending`, unleased | The next call runs it. Nothing was sent. |
+| while awaiting approval | `AwaitingApproval` | Nothing ran. The approval stays pending across restarts; the next call asks the provider again, or an operator decides. |
 | after the attempt is recorded, before the request is sent | `Executing`, leased | After the lease expires, it becomes `Unknown`. The runtime cannot know nothing was sent. |
 | while the request is in flight | `Executing` | Same. The request may still land. |
 | after the remote applied it, before the result is recorded | `Executing` | Same. Verification finds it; an idempotency key deduplicates the re-send. |

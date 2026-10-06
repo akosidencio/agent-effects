@@ -27,6 +27,9 @@ pub enum FaultPoint {
     BeforeInsert,
     /// The record exists (`Pending`); no lease is held yet.
     AfterInsert,
+    /// `RequestApproval` is persisted (`AwaitingApproval`); the approval
+    /// provider was not asked.
+    AfterApprovalRequested,
     /// `StartAttempt` is persisted (`Executing`); the action was not called.
     AfterAttemptPersisted,
     /// The action is running: its request may or may not reach the remote

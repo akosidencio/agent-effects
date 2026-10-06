@@ -125,6 +125,12 @@ pub trait EffectHandler: Send + Sync + 'static {
         None
     }
 
+    /// Whether a human must approve the effect before its first attempt;
+    /// see [`approval`](crate::approval).
+    fn requires_approval(&self) -> bool {
+        false
+    }
+
     /// Checked before the first attempt; see
     /// [`EffectBuilder::precondition`](crate::EffectBuilder::precondition).
     fn precondition(
@@ -443,6 +449,7 @@ async fn run<S: EffectStore, H: EffectHandler>(
             .unwrap_or_else(|| runtime.default_retry()),
         attempt_timeout: effect.attempt_timeout(),
         precondition: Some(precondition),
+        require_approval: effect.requires_approval(),
     };
     let action = {
         let (effect, input) = (Arc::clone(&effect), Arc::clone(&input));

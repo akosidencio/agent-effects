@@ -16,6 +16,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tracing::{Instrument, Span, debug, field, info_span, warn};
 
+use crate::approval::{ApprovalDecision, ApprovalProvider, ApprovalRequest, ErasedApproval};
 use crate::clock::{Clock, SystemClock};
 use crate::effect::{
     EffectBuilder, EffectContext, EffectFailure, EffectOutcome, EffectSpec, Precondition,
@@ -54,6 +55,7 @@ struct Inner<S> {
     lease_ttl: Duration,
     retry: RetryPolicy,
     handlers: Registry<S>,
+    approval: Option<Arc<dyn ErasedApproval>>,
     #[cfg(feature = "fault-injection")]
     faults: Option<Arc<FaultInjector>>,
 }
@@ -75,11 +77,20 @@ pub struct RuntimeBuilder<S> {
     lease_ttl: Duration,
     retry: RetryPolicy,
     handlers: Registry<S>,
+    approval: Option<Arc<dyn ErasedApproval>>,
     #[cfg(feature = "fault-injection")]
     faults: Option<Arc<FaultInjector>>,
 }
 
 impl<S: EffectStore> RuntimeBuilder<S> {
+    /// Asks `provider` to decide on effects that require approval; see
+    /// [`approval`](crate::approval). Without one, such effects wait for an
+    /// operator's [`Runtime::approve`] or [`Runtime::deny`].
+    pub fn approval_provider(mut self, provider: impl ApprovalProvider) -> Self {
+        self.approval = Some(Arc::new(provider));
+        self
+    }
+
     /// Registers a durable handler under its [`EffectHandler::NAME`], so
     /// [`Runtime::submit`] can run it and [`Runtime::recover`] can finish
     /// its effects without a caller.
@@ -148,6 +159,7 @@ impl<S: EffectStore> RuntimeBuilder<S> {
                 lease_ttl: self.lease_ttl,
                 retry: self.retry,
                 handlers: self.handlers,
+                approval: self.approval,
                 #[cfg(feature = "fault-injection")]
                 faults: self.faults,
             }),
@@ -186,6 +198,7 @@ impl<S: EffectStore> Runtime<S> {
             lease_ttl: Duration::from_secs(30),
             retry: RetryPolicy::default(),
             handlers: Registry::new(),
+            approval: None,
             #[cfg(feature = "fault-injection")]
             faults: None,
         }
@@ -477,6 +490,7 @@ impl<S: EffectStore> Runtime<S> {
         match record.status {
             status if settled(status) => report(record, None).map(Some),
             EffectStatus::Pending
+            | EffectStatus::AwaitingApproval
             | EffectStatus::Executing
             | EffectStatus::Verifying
             | EffectStatus::Unknown
@@ -530,6 +544,13 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
                             .await?;
                         continue;
                     }
+                    if record.attempt_count == 0 && self.spec.require_approval && !record.approved {
+                        record = self
+                            .transition(&record, Transition::RequestApproval, |_| {})
+                            .await?;
+                        self.rt.checkpoint(FaultPoint::AfterApprovalRequested);
+                        continue;
+                    }
                     record = self
                         .transition(&record, Transition::StartAttempt, |r| {
                             r.payload = Some(json!({ "worker": self.rt.worker_id() }));
@@ -550,6 +571,27 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
                         .transition(&record, Transition::LeaseExpired, |_| {})
                         .await?;
                 }
+                // Ask the provider; an approval loops back to `Pending`, where
+                // the precondition is checked again before the attempt.
+                EffectStatus::AwaitingApproval => match self.ask_approval(&record).await? {
+                    ApprovalDecision::Approved { by } => {
+                        record = self
+                            .transition(&record, Transition::Approve, |r| r.actor = Some(by))
+                            .await?;
+                    }
+                    ApprovalDecision::Denied { by, reason } => {
+                        record = self
+                            .transition(&record, Transition::Deny, |r| {
+                                r.actor = Some(by);
+                                r.error = Some(ErrorRecord {
+                                    class: None,
+                                    message: reason,
+                                });
+                            })
+                            .await?;
+                    }
+                    ApprovalDecision::Deferred => break,
+                },
                 EffectStatus::Unknown => match self.spec.capabilities.unknown_plan() {
                     UnknownPlan::Verify if !verification_exhausted => {
                         let (next, verified, exhausted) = self.verify(record, None).await?;
@@ -865,6 +907,26 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
         .await
     }
 
+    /// Asks the runtime's approval provider, on its own task and under the
+    /// lease. No provider, or a provider that panics, defers.
+    async fn ask_approval(&self, record: &EffectRecord) -> Result<ApprovalDecision, Interrupt> {
+        let Some(provider) = self.rt.inner.approval.clone() else {
+            return Ok(ApprovalDecision::Deferred);
+        };
+        let request = ApprovalRequest {
+            effect_id: record.id,
+            key: record.key.clone(),
+            kind: record.kind,
+            input: record.input.clone(),
+            requested_by: record.created_by.clone(),
+        };
+        let task = tokio::spawn(async move { provider.request_boxed(request).await });
+        Ok(self.leased(task).await?.unwrap_or_else(|e| {
+            warn!(error = %e, "approval provider failed; deferring");
+            ApprovalDecision::Deferred
+        }))
+    }
+
     async fn sleep_until(&self, at: SystemTime) -> Result<(), Interrupt> {
         let wait = at.duration_since(self.rt.now()).unwrap_or_default();
         self.sleep(wait).await
@@ -980,6 +1042,7 @@ fn report<T: DeserializeOwned>(
         }
         EffectStatus::Unknown => EffectOutcome::Unknown { id },
         EffectStatus::Compensated => EffectOutcome::Compensated { id },
+        EffectStatus::AwaitingApproval => EffectOutcome::AwaitingApproval { id },
         _ => EffectOutcome::InProgress { id },
     })
 }
