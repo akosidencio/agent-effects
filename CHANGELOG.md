@@ -18,6 +18,12 @@ First release.
   separate capability) is registered via `RuntimeBuilder::register` and run
   with `runtime.submit::<H>(key, input)`. Inputs are stored, so `recover()`
   finishes registered effects after a crash with no caller.
+- **Compensation.** `Committed → Compensating → Compensated /
+  CompensationFailed`, durable and retried. Use `runtime.compensation(name,
+  key).run(...)` for closure effects and `runtime.compensate::<H>(key)` for a
+  `CompensableEffect`. Each compensation gets its own idempotency key;
+  recovery resumes interrupted compensations; operators can retry or record
+  a manual undo.
 - **Closure API.** `runtime.effect(name, key)…run(action)` returns an
   `EffectOutcome`: `Committed`, `Failed`, `Rejected`, `Unknown`,
   `NeedsIntervention` or `InProgress`. `RuntimeError` is reserved for

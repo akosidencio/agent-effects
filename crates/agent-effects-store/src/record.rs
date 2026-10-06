@@ -40,6 +40,8 @@ pub struct EffectRecord {
     /// a trusted verification or an operator. While it is set, the effect
     /// cannot become `Failed` through a failed attempt (see [`Self::apply`]).
     pub may_have_applied: bool,
+    /// Compensation attempts started or scheduled so far.
+    pub compensation_attempts: u32,
     /// When a scheduled retry may start.
     pub next_attempt_at: Option<SystemTime>,
     /// When the latest attempt started. Settle delays count from here.
@@ -75,6 +77,7 @@ impl EffectRecord {
             created_by: new.created_by,
             attempt_count: 0,
             may_have_applied: false,
+            compensation_attempts: 0,
             next_attempt_at: None,
             attempt_started_at: None,
             lease_owner: None,
@@ -168,6 +171,9 @@ impl EffectRecord {
     ///
     /// - [`Transition::StartAttempt`] increments the attempt count, stamps
     ///   `attempt_started_at` and clears `next_attempt_at`;
+    /// - [`Transition::StartCompensation`] sets `compensation_attempts` to 1;
+    ///   [`Transition::ScheduleCompensationRetry`] increments it and sets
+    ///   `next_attempt_at`;
     /// - a retry transition sets `next_attempt_at` (default `now`);
     /// - reaching `Committed` stamps `committed_at`;
     /// - reaching `Unknown` sets `may_have_applied`; evidence that the effect
@@ -224,6 +230,14 @@ impl EffectRecord {
                 self.next_attempt_at = None;
             }
             Transition::ScheduleRetry | Transition::ResolvedRetry => {
+                self.next_attempt_at = Some(request.next_attempt_at.unwrap_or(now));
+            }
+            Transition::StartCompensation => {
+                self.compensation_attempts = 1;
+                self.next_attempt_at = None;
+            }
+            Transition::ScheduleCompensationRetry => {
+                self.compensation_attempts = self.compensation_attempts.saturating_add(1);
                 self.next_attempt_at = Some(request.next_attempt_at.unwrap_or(now));
             }
             _ => {}

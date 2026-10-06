@@ -62,8 +62,14 @@ Stores never change a status except through it.
 | Unknown / NeedsIntervention | `ResolvedApplied` | **Committed** |
 | Unknown / NeedsIntervention | `ResolvedNotApplied` | **Failed** |
 | Unknown / NeedsIntervention | `ResolvedRetry` | Pending |
+| Committed | `StartCompensation` | Compensating |
+| Compensating | `ScheduleCompensationRetry` | Compensating |
+| Compensating | `CompensationSucceeded` | **Compensated** |
+| Compensating | `CompensationFailed` | CompensationFailed |
+| CompensationFailed | `ResolvedCompensated` | **Compensated** |
+| CompensationFailed | `ResolvedRetry` | Compensating |
 
-**Bold** = terminal. Every transition is also an audit event
+**Bold** = terminal (`Committed` is not: compensation is its one exit). Every transition is also an audit event
 (`Transition::as_str`, e.g. `effect.attempt_started`). Retries between attempts
 sit in `Pending` with a `next_attempt_at`, and the attempt counter lives on the
 record, not in the status.
@@ -79,11 +85,15 @@ Invariants, all checked by tests:
   decision (`ScheduleRetry`, `ResolvedRetry`);
 - `Committed` requires evidence: a success, a confirmed verification, or an
   operator;
-- a lost lease leads to `Unknown`, never to `Failed`.
+- a lost lease leads to `Unknown`, never to `Failed`;
+- `Failed` is refused while an earlier attempt may have applied the effect
+  (`may_have_applied`, D28);
+- compensation starts only from `Committed` (or an operator's retry of a
+  failed compensation), and `Compensated` requires a successful compensation
+  or an operator.
 
-Compensation (`Committed → Compensating → Compensated | CompensationFailed`)
-arrives in v0.2. It starts from **Committed**, because a Failed effect changed
-nothing. The enum is `#[non_exhaustive]` for this reason.
+Compensation starts from **Committed**, because a `Failed` effect changed
+nothing; see [Compensation](#compensation).
 
 ## 4. Failure classification
 
@@ -311,6 +321,63 @@ In every case *a*'s late write is fenced off and its call reports the
 outcome *b* recorded. Mutation checks confirm the first two depend on
 verification and on the stable idempotency key respectively.
 
+### Compensation
+
+Implemented in `compensation.rs`. Undoing a committed effect is a durable
+lifecycle of its own:
+
+```text
+Committed ─StartCompensation→ Compensating ─CompensationSucceeded→ Compensated
+                                  │  ↺ ScheduleCompensationRetry
+                                  └─CompensationFailed→ CompensationFailed ─ResolvedCompensated→ Compensated
+                                                                     └─ResolvedRetry→ Compensating
+```
+
+```rust
+// Closure effects: the compensation receives the effect's stored output.
+runtime.compensation("inventory.reserve", &order.id)
+    .reason("order cancelled")
+    .run(|ctx, reservation: Option<Reservation>| async move {
+        inventory.release(&reservation, ctx.idempotency_key()).await.map_err(classify)
+    })
+    .await?;                                   // -> CompensationOutcome
+
+// Handlers: implement CompensableEffect, register with .compensable().
+runtime.compensate::<ReserveInventory>(&order.id).reason("order cancelled").await?;
+```
+
+- **Compensations must be idempotent.** An attempt that crashed or failed
+  ambiguously is simply run again, so compensation has no `Unknown` state.
+  `CompensationContext::idempotency_key()` is stable across attempts, and
+  distinct from the effect's own key, so a remote never mistakes the undo
+  for a replay.
+- **Recorded before it runs.** `StartCompensation` is persisted before the
+  first attempt. Each retry is a `ScheduleCompensationRetry`: the attempt
+  counter is `compensation_attempts`, the error is `last_error`, and the
+  reason goes in the event payload.
+- **Retries.** Transient and ambiguous failures retry with backoff within
+  the retry budget. A permanent failure, or a spent budget, ends
+  `CompensationFailed`. An operator then calls
+  `resolve(id, Resolution::Retry | Resolution::Compensated, …)`.
+- **Refusals.** An effect that never committed returns
+  `CompensationOutcome::NotCommitted { status }`. A `Failed` effect has
+  nothing to undo; an `Unknown` one must be resolved first. Calling again
+  after `Compensated` sends nothing.
+- **What callers see.** Running the effect again after compensation returns
+  `EffectOutcome::Compensated { id }`. During a failed compensation it
+  returns `NeedsIntervention { id }`.
+- **Crashes.** A crash mid-compensation leaves `Compensating`. Recovery
+  resumes it for a compensable handler; a closure compensation is reported
+  `unhandled` until its caller runs it again.
+
+Tests: `tests/compensation.rs` covers success, refusals, retries with an
+ambiguous cancel deduplicated by the key, permanent failure with operator
+retry, a manual undo, handler compensation, and an interrupted compensation
+finished by recovery or by a caller. The model test also mixes compensation
+and crashes mid-compensation into its random histories. Its invariants: a
+cancelled resource implies compensation started, and `Compensated` implies
+the resource is gone.
+
 ### Durable handlers
 
 Implemented in `handler.rs`. Closure effects can only be finished by a
@@ -422,12 +489,13 @@ backend therefore enforces identical semantics:
   cross-host clock skew.)*
 
 Every backend must pass `agent_effects_store::testkit::conformance` (the
-`testkit` feature). It runs 14 cases: read-back of all fields, key
+`testkit` feature). It runs 15 cases: read-back of all fields, key
 idempotency, 16-way concurrent inserts, missing records, lease exclusivity,
 takeover fencing, strict renewal, release, a full transition history with its
 events, rejected transitions leaving no trace, lease-less operator
 resolution, terminal finality, listing/paging, and persisting
-`may_have_applied` while refusing `FailedDefinitively` under it. Its sensitivity was checked
+`may_have_applied` while refusing `FailedDefinitively` under it, and the
+compensation lifecycle (attempt counter, retry schedule, operator retry). Its sensitivity was checked
 by breaking `MemoryStore` on purpose: ignoring the unique key, or persisting
 the event without the record. The suite caught both.
 
@@ -476,6 +544,7 @@ CREATE TABLE effects (
     created_by         TEXT,
     attempt_count      INTEGER NOT NULL,
     may_have_applied   INTEGER NOT NULL,  -- 0 or 1
+    compensation_attempts INTEGER NOT NULL,
     next_attempt_at    INTEGER,
     attempt_started_at INTEGER,
     lease_owner        TEXT,
@@ -550,7 +619,7 @@ wire.
 | `AfterActionStarted` (request in flight) | `Executing` | same | created once | operator, created ≤ 1 times |
 | `AfterActionReturned` (after the remote commit, before persisting the result; this also covers "before the response") | `Executing` | same | created once | operator, created once |
 | `AfterVerificationStarted` | `Verifying` | lease expiry → `Unknown` → verify again | created once | not on this path |
-| during compensation | — | v0.2 | | |
+| `AfterCompensationStarted` (during compensation) | `Compensating` | lease expiry → the next call, or `recover()` for a compensable handler, runs the attempt again (compensations are idempotent) | undone once | undone once |
 
 "verified" means irreversible with an authoritative lookup. "idempotent"
 means irreversible with a remote that deduplicates on the key.
@@ -662,6 +731,7 @@ Crates are added when their milestone starts, not as empty placeholders.
 | D29 | 2026-10-06 | Durable handlers per spec §9: `EffectHandler` + separate `VerifiableEffect`; the `Handler` builder gates capabilities by trait bounds. `submit::<H>` runs one; `recover()` resumes registered effects from stored input, reusing the stored fingerprint | Durability without a caller, with no second execution path: handlers ride the closure machinery and its tested guarantees |
 | D30 | 2026-10-06 | The roadmap's v0.2 items ship in 0.1.0 | User decision: nothing was published yet, so the schema can still change in place |
 | D31 | 2026-10-06 | Metrics through an `EffectObserver` trait in core; `agent-effects-otel` implements it | User decision: core stays dependency-free; any metrics backend can plug in |
+| D32 | 2026-10-06 | Compensation: `Committed → Compensating → Compensated / CompensationFailed`, idempotent attempts retried with no `Unknown` state, a separate compensation idempotency key, `CompensableEffect` + closure API, recovery resumes compensable handlers; `Committed` is no longer terminal | Spec §16: compensation is a durable operation with attempts, timestamps, errors and an idempotency id, never "try once, ignore the error" |
 
 ## Open questions
 

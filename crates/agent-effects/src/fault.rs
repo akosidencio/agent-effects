@@ -36,6 +36,9 @@ pub enum FaultPoint {
     AfterActionReturned,
     /// `StartVerification` is persisted (`Verifying`); no check has run.
     AfterVerificationStarted,
+    /// A compensation attempt is recorded (`Compensating`); the compensation
+    /// was not called.
+    AfterCompensationStarted,
 }
 
 #[cfg(feature = "fault-injection")]

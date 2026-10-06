@@ -43,6 +43,7 @@ uncertain outcome goes to a person.
 | `Unknown { id }` | It may or may not have happened | **Do not treat as failed.** Call again later with the same key (the runtime verifies or re-runs if safe), or leave it to recovery and an operator. |
 | `NeedsIntervention { id }` | The runtime cannot resolve it safely | **Do not retry.** A person checks the remote system and calls `runtime.resolve`. |
 | `InProgress { id }` | Someone else is running it right now | `runtime.wait(id, timeout)`, or call again later. |
+| `Compensated { id }` | It happened and was later undone | Nothing; it stays undone. |
 | `Err(RuntimeError)` | The runtime itself failed (store, bad input, mismatched key) | Fix the cause. If the store failed after the action ran, the effect is in doubt and recovery will mark it `Unknown`. |
 
 For an agent tool, say "unknown" out loud: tell the model the status is
@@ -60,6 +61,7 @@ example does this.
 | after the remote applied it, before the result is recorded | `Executing` | Same. Verification finds it; an idempotency key deduplicates the re-send. |
 | during verification | `Verifying` | After the lease expires, `Unknown`, then verified again. |
 | while waiting to retry | `Pending` with `next_attempt_at` | The next call waits out the schedule, then runs it. Nothing is in flight. |
+| while undoing it (compensation) | `Compensating` | The next `compensation(..)` call, or recovery for a compensable handler, runs the compensation again. That is safe because compensations must be idempotent. |
 
 From `Unknown`, a later call with the same key does one of these:
 

@@ -65,6 +65,11 @@ enum Step {
     Recover,
     /// Time passes beyond a lease.
     Expire,
+    /// A caller undoes the effect (cancelling the resource idempotently).
+    Compensate,
+    /// A caller undoes it on a worker that crashes once the attempt is
+    /// recorded.
+    CompensateAndCrash,
 }
 
 #[derive(Clone, Debug)]
@@ -92,6 +97,8 @@ fn step() -> impl Strategy<Value = Step> {
         2 => select(POINTS.to_vec()).prop_map(Step::CrashAt),
         1 => Just(Step::Recover),
         2 => Just(Step::Expire),
+        2 => Just(Step::Compensate),
+        1 => Just(Step::CompensateAndCrash),
     ]
 }
 
@@ -122,6 +129,37 @@ fn quiet_crashes() {
             }
         }));
     });
+}
+
+async fn compensate(
+    store: &MemoryStore,
+    clock: TokioClock,
+    remote: &FakeRemote,
+    worker: String,
+    faults: Option<Arc<FaultInjector>>,
+) -> Result<(), String> {
+    let mut builder = Runtime::builder(store.clone())
+        .clock(clock)
+        .worker_id(WorkerId::new(worker))
+        .lease_ttl(TTL);
+    if let Some(faults) = faults {
+        builder = builder.fault_injector(faults);
+    }
+    let remote = remote.clone();
+    builder
+        .build()
+        .compensation("model", "effect")
+        .run(move |ctx, _: Option<serde_json::Value>| {
+            let remote = remote.clone();
+            async move { remote.cancel(RES, Some(ctx.idempotency_key())).await }
+        })
+        .await
+        .map(|_| ())
+        .or_else(|e| match e {
+            // Compensating before the effect exists is refused; fine.
+            agent_effects::RuntimeError::NoSuchEffect { .. } => Ok(()),
+            e => Err(e.to_string()),
+        })
 }
 
 async fn call(
@@ -173,50 +211,81 @@ async fn call(
     result.map(|_| ()).map_err(|e| e.to_string())
 }
 
+/// Runs one step of `case`, asserting what the step itself must satisfy.
+async fn run_step(
+    case: &Case,
+    store: &MemoryStore,
+    clock: TokioClock,
+    remote: &FakeRemote,
+    i: usize,
+    step: Step,
+) -> Result<(), TestCaseError> {
+    let worker = format!("worker-{i}");
+    match step {
+        Step::Call => {
+            let result = call(case, store, clock, remote, worker, None).await;
+            prop_assert!(result.is_ok(), "step {i}: {result:?}");
+        }
+        Step::CrashAt(point) => {
+            let injector = Arc::new(FaultInjector::new().at(point).crash());
+            let result = call(
+                case,
+                store,
+                clock,
+                remote,
+                worker,
+                Some(Arc::clone(&injector)),
+            )
+            .await;
+            if injector.reached().contains(&point) {
+                prop_assert!(
+                    result.as_ref().is_err_and(|e| e.contains("fault injected")),
+                    "step {i}: {result:?}"
+                );
+            } else {
+                prop_assert!(result.is_ok(), "step {i}: {result:?}");
+            }
+            // Let a request that was on the wire land.
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        Step::Recover => {
+            let rt = Runtime::builder(store.clone())
+                .clock(clock)
+                .worker_id(WorkerId::new(worker))
+                .lease_ttl(TTL)
+                .build();
+            prop_assert!(rt.recover().await.is_ok());
+        }
+        Step::Expire => tokio::time::sleep(TTL).await,
+        Step::Compensate => {
+            let result = compensate(store, clock, remote, worker, None).await;
+            prop_assert!(result.is_ok(), "step {i}: {result:?}");
+        }
+        Step::CompensateAndCrash => {
+            let point = FaultPoint::AfterCompensationStarted;
+            let injector = Arc::new(FaultInjector::new().at(point).crash());
+            let result =
+                compensate(store, clock, remote, worker, Some(Arc::clone(&injector))).await;
+            if injector.reached().contains(&point) {
+                prop_assert!(
+                    result.as_ref().is_err_and(|e| e.contains("fault injected")),
+                    "step {i}: {result:?}"
+                );
+            } else {
+                prop_assert!(result.is_ok(), "step {i}: {result:?}");
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn check(case: Case) -> Result<(), TestCaseError> {
     let store = MemoryStore::new();
     let clock = TokioClock::new();
     let remote = FakeRemote::new(clock).script(case.script.clone());
 
     for (i, step) in case.steps.iter().enumerate() {
-        let worker = format!("worker-{i}");
-        match *step {
-            Step::Call => {
-                let result = call(&case, &store, clock, &remote, worker, None).await;
-                prop_assert!(result.is_ok(), "step {i}: {result:?}");
-            }
-            Step::CrashAt(point) => {
-                let injector = Arc::new(FaultInjector::new().at(point).crash());
-                let result = call(
-                    &case,
-                    &store,
-                    clock,
-                    &remote,
-                    worker,
-                    Some(Arc::clone(&injector)),
-                )
-                .await;
-                if injector.reached().contains(&point) {
-                    prop_assert!(
-                        result.as_ref().is_err_and(|e| e.contains("fault injected")),
-                        "step {i}: {result:?}"
-                    );
-                } else {
-                    prop_assert!(result.is_ok(), "step {i}: {result:?}");
-                }
-                // Let a request that was on the wire land.
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-            Step::Recover => {
-                let rt = Runtime::builder(store.clone())
-                    .clock(clock)
-                    .worker_id(WorkerId::new(worker))
-                    .lease_ttl(TTL)
-                    .build();
-                prop_assert!(rt.recover().await.is_ok());
-            }
-            Step::Expire => tokio::time::sleep(TTL).await,
-        }
+        run_step(&case, &store, clock, &remote, i, *step).await?;
     }
 
     let key = EffectKey::new(
@@ -257,6 +326,19 @@ async fn check(case: Case) -> Result<(), TestCaseError> {
     }
     if record.status == EffectStatus::Committed {
         prop_assert!(created >= 1, "committed without being created");
+    }
+    let cancelled = remote.cancellations(RES);
+    let compensation_started = matches!(
+        record.status,
+        EffectStatus::Compensating | EffectStatus::Compensated | EffectStatus::CompensationFailed
+    );
+    prop_assert!(
+        cancelled == 0 || compensation_started,
+        "cancelled an effect that never started compensating: {:?}",
+        record.status
+    );
+    if record.status == EffectStatus::Compensated {
+        prop_assert!(!remote.exists(RES), "compensated, yet the resource exists");
     }
     Ok(())
 }

@@ -52,6 +52,21 @@ pub enum RuntimeError {
         source: serde_json::Error,
     },
 
+    /// No effect has this name and key.
+    #[error("no effect `{key}` exists")]
+    NoSuchEffect {
+        /// The effect's `name:key`.
+        key: String,
+    },
+
+    /// The handler is registered without `.compensable()`, so its effects
+    /// cannot be compensated.
+    #[error("the handler for effect `{name}` is not registered as compensable")]
+    NotCompensable {
+        /// The effect name.
+        name: &'static str,
+    },
+
     /// No handler of the submitted type is registered under its name.
     #[error("no handler registered for effect `{name}`")]
     NotRegistered {

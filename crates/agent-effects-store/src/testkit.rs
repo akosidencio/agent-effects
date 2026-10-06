@@ -54,6 +54,7 @@ where
     terminal_records_are_final(make_store().await).await;
     listing_filters_and_pages(make_store().await).await;
     doubt_is_persisted_and_guards_failure(make_store().await).await;
+    compensation_is_persisted(make_store().await).await;
 }
 
 const TTL: Duration = Duration::from_secs(30);
@@ -482,7 +483,11 @@ async fn terminal_records_are_final<S: EffectStore>(store: S) {
     .await;
     store.release_lease(&lease).await.unwrap();
     let record = reload(&store, record.id).await;
-    for transition in ALL_TRANSITIONS {
+    // Committed has one exit, compensation; nothing else may leave it.
+    for transition in ALL_TRANSITIONS
+        .into_iter()
+        .filter(|t| *t != Transition::StartCompensation)
+    {
         let request = TransitionRequest::new(&record, None, transition, t(2));
         assert!(
             matches!(
@@ -493,6 +498,29 @@ async fn terminal_records_are_final<S: EffectStore>(store: S) {
         );
     }
     assert_eq!(reload(&store, record.id).await, record);
+
+    // Compensated is terminal.
+    let record = drive(
+        &store,
+        record,
+        None,
+        &[
+            Transition::StartCompensation,
+            Transition::CompensationSucceeded,
+        ],
+        t(3),
+    )
+    .await;
+    for transition in ALL_TRANSITIONS {
+        let request = TransitionRequest::new(&record, None, transition, t(4));
+        assert!(
+            matches!(
+                store.transition(request).await,
+                Err(StoreError::InvalidTransition(_))
+            ),
+            "{transition} left a compensated record"
+        );
+    }
 }
 
 async fn listing_filters_and_pages<S: EffectStore>(store: S) {
@@ -633,4 +661,65 @@ async fn doubt_is_persisted_and_guards_failure<S: EffectStore>(store: S) {
         "a failed attempt must not fail an effect that may have applied"
     );
     assert_eq!(reload(&store, record.id).await, record);
+}
+
+async fn compensation_is_persisted<S: EffectStore>(store: S) {
+    let record = insert(&store, 1).await;
+    let lease = store
+        .acquire_lease(record.id, &worker("a"), t(0), TTL)
+        .await
+        .unwrap();
+    let record = drive(
+        &store,
+        record,
+        Some(&lease),
+        &[
+            Transition::StartAttempt,
+            Transition::Succeeded,
+            Transition::StartCompensation,
+        ],
+        t(1),
+    )
+    .await;
+    let mut retry = TransitionRequest::new(
+        &record,
+        Some(&lease),
+        Transition::ScheduleCompensationRetry,
+        t(2),
+    );
+    retry.next_attempt_at = Some(t(5));
+    let record = store.transition(retry).await.unwrap();
+    let stored = reload(&store, record.id).await;
+    assert_eq!(stored, record, "transition must return the stored record");
+    assert_eq!(stored.status, EffectStatus::Compensating);
+    assert_eq!(stored.compensation_attempts, 2);
+    assert_eq!(stored.next_attempt_at, Some(t(5)));
+
+    let record = drive(
+        &store,
+        record,
+        Some(&lease),
+        &[Transition::CompensationFailed],
+        t(6),
+    )
+    .await;
+    store.release_lease(&lease).await.unwrap();
+    let record = drive(
+        &store,
+        reload(&store, record.id).await,
+        None,
+        &[Transition::ResolvedRetry],
+        t(7),
+    )
+    .await;
+    assert_eq!(
+        record.status,
+        EffectStatus::Compensating,
+        "an operator can retry it"
+    );
+    let listed = store
+        .list(ListQuery::statuses([EffectStatus::Compensating]))
+        .await
+        .unwrap();
+    assert_eq!(listed, [record]);
 }

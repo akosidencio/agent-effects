@@ -69,6 +69,9 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
+use crate::compensation::{
+    CompensationContext, CompensationOutcome, CompensationSpec, Compensator,
+};
 use crate::effect::{EffectContext, EffectFailure, EffectOutcome, EffectSpec, Precondition};
 use crate::error::RuntimeError;
 use crate::fingerprint::fingerprint;
@@ -162,6 +165,23 @@ pub trait VerifiableEffect: EffectHandler {
     ) -> impl Future<Output = Result<Verification<Self::Output>, Self::Error>> + Send;
 }
 
+/// A handler whose effect can be undone.
+///
+/// Register it with [`Handler::compensable`]; undo an effect with
+/// [`Runtime::compensate`](crate::Runtime::compensate). The compensation must
+/// be idempotent: a crashed or ambiguous attempt is run again. Send
+/// [`CompensationContext::idempotency_key`] to the remote system.
+pub trait CompensableEffect: EffectHandler {
+    /// Undoes the effect. `output` is what `execute` returned, if it was
+    /// stored.
+    fn compensate(
+        &self,
+        ctx: &CompensationContext,
+        input: &Self::Input,
+        output: Option<&Self::Output>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+}
+
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
 type VerifyFn<H> = Arc<
@@ -177,15 +197,17 @@ type VerifyFn<H> = Arc<
 /// A handler and the capabilities it is registered with. Pass it to
 /// [`RuntimeBuilder::register`](crate::RuntimeBuilder::register).
 pub struct Handler<H: EffectHandler> {
-    handler: Arc<H>,
+    effect: Arc<H>,
     verify: Option<(VerificationMode, VerifyFn<H>)>,
+    compensate: Option<Compensator>,
 }
 
 impl<H: EffectHandler> Clone for Handler<H> {
     fn clone(&self) -> Self {
         Self {
-            handler: Arc::clone(&self.handler),
+            effect: Arc::clone(&self.effect),
             verify: self.verify.clone(),
+            compensate: self.compensate.clone(),
         }
     }
 }
@@ -194,9 +216,41 @@ impl<H: EffectHandler> Handler<H> {
     /// Registers `handler` with no optional capabilities.
     pub fn new(handler: H) -> Self {
         Self {
-            handler: Arc::new(handler),
+            effect: Arc::new(handler),
             verify: None,
+            compensate: None,
         }
+    }
+}
+
+impl<H: CompensableEffect> Handler<H> {
+    /// Lets the effect be undone with
+    /// [`Runtime::compensate`](crate::Runtime::compensate), using
+    /// [`CompensableEffect::compensate`], and lets recovery finish an
+    /// interrupted compensation.
+    #[must_use]
+    pub fn compensable(mut self) -> Self {
+        let handler = Arc::clone(&self.effect);
+        self.compensate = Some(Arc::new(move |ctx, input, output| {
+            let handler = Arc::clone(&handler);
+            Box::pin(async move {
+                let input: H::Input = serde_json::from_value(input.unwrap_or(Value::Null))
+                    .map_err(|e| {
+                        EffectFailure::permanent(format!("stored input does not match: {e}"))
+                    })?;
+                let output: Option<H::Output> = output
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .map_err(|e| {
+                        EffectFailure::permanent(format!("stored output does not match: {e}"))
+                    })?;
+                handler
+                    .compensate(&ctx, &input, output.as_ref())
+                    .await
+                    .map_err(Into::into)
+            })
+        }));
+        self
     }
 }
 
@@ -205,7 +259,7 @@ impl<H: VerifiableEffect> Handler<H> {
     /// outcomes, using [`VerifiableEffect::verify`].
     #[must_use]
     pub fn verifiable(mut self) -> Self {
-        let mode = self.handler.verification_mode();
+        let mode = self.effect.verification_mode();
         let verify: VerifyFn<H> = Arc::new(|handler, ctx, input| {
             Box::pin(async move { handler.verify(&ctx, &input).await.map_err(Into::into) })
         });
@@ -293,13 +347,34 @@ impl<'a, S: EffectStore, H: EffectHandler> IntoFuture for Submission<'a, S, H> {
     }
 }
 
-/// Finishes an effect of `handler` from its record, with no caller.
+/// Finishes an effect of `handler` from its record, with no caller: its
+/// compensation if one is under way, else the effect itself.
 async fn resume<S: EffectStore, H: EffectHandler>(
     runtime: &Runtime<S>,
     handler: &Handler<H>,
     record: EffectRecord,
 ) -> Result<EffectStatus, RuntimeError> {
     let id = record.id;
+    if record.status == EffectStatus::Compensating {
+        let compensate = handler
+            .compensate
+            .clone()
+            .ok_or(RuntimeError::NotCompensable { name: H::NAME })?;
+        let spec = CompensationSpec {
+            key: record.key.clone(),
+            reason: None,
+            actor: Some(format!("recovery:{}", runtime.worker_id())),
+            retry: handler.effect.retry_policy(),
+            attempt_timeout: handler.effect.attempt_timeout(),
+        };
+        runtime.compensate_effect(spec, compensate).await?;
+        let settled = runtime
+            .store()
+            .get(id)
+            .await?
+            .ok_or(StoreError::NotFound(id))?;
+        return Ok(settled.status);
+    }
     let json = record.input.clone().unwrap_or(Value::Null);
     let input: H::Input = serde_json::from_value(json.clone())
         .map_err(|source| RuntimeError::StoredInput { id, source })?;
@@ -342,7 +417,7 @@ async fn run<S: EffectStore, H: EffectHandler>(
     input: Arc<H::Input>,
     stored: Stored,
 ) -> Result<EffectOutcome<H::Output>, RuntimeError> {
-    let effect = Arc::clone(&handler.handler);
+    let effect = Arc::clone(&handler.effect);
     let precondition = {
         let (effect, input) = (Arc::clone(&effect), Arc::clone(&input));
         Arc::new(move |ctx: EffectContext| -> BoxFuture<Precondition> {
@@ -384,5 +459,66 @@ async fn run<S: EffectStore, H: EffectHandler>(
             runtime.execute(spec, action, checker).await
         }
         None => runtime.execute(spec, action, NoVerification).await,
+    }
+}
+
+/// A request to undo a registered handler's effect. Await it. Created by
+/// [`Runtime::compensate`](crate::Runtime::compensate).
+#[must_use = "a compensation does nothing until it is awaited"]
+pub struct CompensationSubmission<'a, S, H: EffectHandler> {
+    runtime: &'a Runtime<S>,
+    key: String,
+    reason: Option<String>,
+    actor: Option<String>,
+    _handler: std::marker::PhantomData<fn() -> H>,
+}
+
+impl<'a, S, H: EffectHandler> CompensationSubmission<'a, S, H> {
+    pub(crate) fn new(runtime: &'a Runtime<S>, key: impl Display) -> Self {
+        Self {
+            runtime,
+            key: key.to_string(),
+            reason: None,
+            actor: None,
+            _handler: std::marker::PhantomData,
+        }
+    }
+
+    /// Why the effect is being undone; recorded in the audit trail.
+    pub fn reason(mut self, reason: impl Into<String>) -> Self {
+        self.reason = Some(reason.into());
+        self
+    }
+
+    /// Who is undoing it.
+    pub fn actor(mut self, actor: impl Into<String>) -> Self {
+        self.actor = Some(actor.into());
+        self
+    }
+}
+
+impl<'a, S: EffectStore, H: EffectHandler> IntoFuture for CompensationSubmission<'a, S, H> {
+    type Output = Result<CompensationOutcome, RuntimeError>;
+    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            let handler = self
+                .runtime
+                .handler::<H>()
+                .ok_or(RuntimeError::NotRegistered { name: H::NAME })?;
+            let compensate = handler
+                .compensate
+                .clone()
+                .ok_or(RuntimeError::NotCompensable { name: H::NAME })?;
+            let spec = CompensationSpec {
+                key: EffectKey::new(EffectName::new(H::NAME)?, LogicalKey::new(self.key)?),
+                reason: self.reason,
+                actor: self.actor,
+                retry: handler.effect.retry_policy(),
+                attempt_timeout: handler.effect.attempt_timeout(),
+            };
+            self.runtime.compensate_effect(spec, compensate).await
+        })
     }
 }

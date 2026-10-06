@@ -62,8 +62,12 @@ pub enum Resolution {
     /// as its error.
     NotApplied,
     /// Running the effect again is safe. The next call runs it, even if its
-    /// retry budget is spent, since this is an explicit decision.
+    /// retry budget is spent, since this is an explicit decision. On a
+    /// failed compensation: try the compensation again.
     Retry,
+    /// For a failed compensation: the operator undid the effect by hand. It
+    /// ends `Compensated`.
+    Compensated,
 }
 
 impl Resolution {
@@ -141,7 +145,11 @@ impl<S: EffectStore> Runtime<S> {
             for record in page {
                 let id = record.id;
                 let not_due = record.next_attempt_at.is_some_and(|at| at > self.now());
-                if record.status == EffectStatus::NeedsIntervention || not_due {
+                let operator = matches!(
+                    record.status,
+                    EffectStatus::NeedsIntervention | EffectStatus::CompensationFailed
+                );
+                if operator || not_due {
                     continue;
                 }
                 let Some(resume) = self.resumer(record.key.name.as_str()) else {
@@ -201,7 +209,8 @@ impl<S: EffectStore> Runtime<S> {
     /// These are the effects that are unsettled with nobody working on
     /// them: `Pending` (for example a worker died during a backoff wait),
     /// `Executing` or `Verifying` with an expired lease (not yet recovered),
-    /// `Unknown` and `NeedsIntervention`.
+    /// `Unknown`, `NeedsIntervention`, an interrupted `Compensating`, and
+    /// `CompensationFailed`.
     ///
     /// # Errors
     ///
@@ -217,6 +226,8 @@ impl<S: EffectStore> Runtime<S> {
             EffectStatus::Verifying,
             EffectStatus::Unknown,
             EffectStatus::NeedsIntervention,
+            EffectStatus::Compensating,
+            EffectStatus::CompensationFailed,
         ])
         .limit(limit);
         query.lease_expired_at = Some(self.now());
@@ -254,6 +265,7 @@ impl<S: EffectStore> Runtime<S> {
             Resolution::Applied { .. } => Transition::ResolvedApplied,
             Resolution::NotApplied => Transition::ResolvedNotApplied,
             Resolution::Retry => Transition::ResolvedRetry,
+            Resolution::Compensated => Transition::ResolvedCompensated,
         };
         let mut request = TransitionRequest::new(&record, None, transition, self.now());
         request.actor = Some(actor.into());
@@ -266,7 +278,7 @@ impl<S: EffectStore> Runtime<S> {
                     message: note,
                 });
             }
-            Resolution::Retry => {}
+            Resolution::Retry | Resolution::Compensated => {}
         }
         let record = self.store().transition(request).await?;
         info!(effect.id = %id, %transition, "effect resolved by an operator");

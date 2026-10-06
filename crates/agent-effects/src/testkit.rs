@@ -57,6 +57,8 @@ struct State {
     created: HashMap<String, (String, SystemTime)>,
     applications: HashMap<String, u32>,
     by_idempotency_key: HashMap<IdempotencyKey, String>,
+    cancellations: HashMap<String, u32>,
+    cancelled_keys: HashMap<IdempotencyKey, String>,
 }
 
 impl FakeRemote {
@@ -146,6 +148,75 @@ impl FakeRemote {
     /// How often `resource` was really created. More than 1 is a duplicate.
     pub fn applications(&self, resource: &str) -> u32 {
         self.lock().applications.get(resource).copied().unwrap_or(0)
+    }
+
+    /// Undoes `resource`, deduplicating on `idempotency_key` if given. Each
+    /// request consumes the next scripted [`Behavior`], like `create`:
+    /// `CommitThenDrop` cancels and then reports an ambiguous failure.
+    /// Cancelling a resource that does not exist succeeds and changes
+    /// nothing, as idempotent deletes do.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the script says.
+    pub async fn cancel(
+        &self,
+        resource: &str,
+        idempotency_key: Option<IdempotencyKey>,
+    ) -> Result<(), EffectFailure> {
+        let behavior = {
+            let mut state = self.lock();
+            state.requests += 1;
+            state.script.pop_front().unwrap_or(Behavior::Succeed)
+        };
+        match behavior {
+            Behavior::Succeed => {
+                self.apply_cancel(resource, idempotency_key);
+                Ok(())
+            }
+            Behavior::Fail(class) => Err(EffectFailure::new(class, "remote refused the cancel")),
+            Behavior::Unreachable => {
+                Err(EffectFailure::ambiguous("connection refused").request_sent(false))
+            }
+            Behavior::CommitThenDrop => {
+                self.apply_cancel(resource, idempotency_key);
+                Err(EffectFailure::ambiguous(
+                    "connection reset before the response",
+                ))
+            }
+            Behavior::LoseRequest => {
+                Err(EffectFailure::ambiguous("timed out waiting for a response"))
+            }
+            Behavior::Hang => std::future::pending().await,
+        }
+    }
+
+    /// How often `resource` was really cancelled. More than 1 means an undo
+    /// ran twice.
+    pub fn cancellations(&self, resource: &str) -> u32 {
+        self.lock()
+            .cancellations
+            .get(resource)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Whether `resource` exists: created and not cancelled.
+    pub fn exists(&self, resource: &str) -> bool {
+        self.lock().created.contains_key(resource)
+    }
+
+    fn apply_cancel(&self, resource: &str, idempotency_key: Option<IdempotencyKey>) {
+        let mut state = self.lock();
+        if idempotency_key.is_some_and(|k| state.cancelled_keys.contains_key(&k)) {
+            return;
+        }
+        if state.created.remove(resource).is_some() {
+            *state.cancellations.entry(resource.to_owned()).or_default() += 1;
+        }
+        if let Some(key) = idempotency_key {
+            state.cancelled_keys.insert(key, resource.to_owned());
+        }
     }
 
     /// How many create requests arrived.

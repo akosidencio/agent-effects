@@ -82,6 +82,9 @@ Also available:
 - **Durable handlers.** Implement `EffectHandler`, `register` it, and
   `runtime.submit::<H>(key, input)`. Recovery then finishes the effect from
   its stored input even if the caller never comes back.
+- **Compensation.** `runtime.compensation(name, key).run(...)` or
+  `runtime.compensate::<H>(key)` undoes a committed effect durably, with
+  retries and its own idempotency key.
 - `.retry(policy)`: lifetime attempt budget, backoff with jitter, honours
   `retry_after`.
 - `.attempt_timeout(d)`.

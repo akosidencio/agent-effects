@@ -208,6 +208,20 @@ impl EffectKey {
         let material = format!("{}:{}:{}", self.name.0.len(), self.name.0, self.key.0);
         IdempotencyKey(Uuid::new_v5(&IDEMPOTENCY_NAMESPACE, material.as_bytes()))
     }
+
+    /// The idempotency key for undoing the effect, distinct from
+    /// [`Self::idempotency_key`] so a remote system never confuses the undo
+    /// with a replay of the original request. Stable across compensation
+    /// attempts, which is what makes re-running a compensation safe.
+    pub fn compensation_idempotency_key(&self) -> IdempotencyKey {
+        let material = format!(
+            "compensate:{}:{}:{}",
+            self.name.0.len(),
+            self.name.0,
+            self.key.0
+        );
+        IdempotencyKey(Uuid::new_v5(&IDEMPOTENCY_NAMESPACE, material.as_bytes()))
+    }
 }
 
 impl fmt::Display for EffectKey {
@@ -282,6 +296,20 @@ mod tests {
                 .idempotency_key()
                 .to_string(),
             "ab211c89-566b-5012-bd33-3a7f81351a08"
+        );
+    }
+
+    #[test]
+    fn compensation_key_is_stable_and_distinct() {
+        let effect = key("payment.charge", "order_5824");
+        // Pinned, like the effect key.
+        assert_eq!(
+            effect.compensation_idempotency_key().to_string(),
+            "46877ef3-8997-5e94-a1ac-4be0bd2782b4"
+        );
+        assert_ne!(
+            effect.compensation_idempotency_key(),
+            effect.idempotency_key()
         );
     }
 

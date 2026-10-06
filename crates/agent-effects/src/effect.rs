@@ -179,6 +179,11 @@ pub enum EffectOutcome<T> {
         /// The effect.
         id: EffectId,
     },
+    /// The effect applied and was later undone by compensation.
+    Compensated {
+        /// The effect.
+        id: EffectId,
+    },
 }
 
 /// Whether an effect may still run, checked before its first attempt.

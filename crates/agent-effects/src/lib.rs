@@ -47,6 +47,7 @@
 //! from [`agent-effects-store`](store) and are re-exported here.
 
 pub mod clock;
+pub mod compensation;
 pub mod effect;
 pub mod error;
 pub mod fault;
@@ -70,9 +71,12 @@ pub use agent_effects_store::{
     Lease, LogicalKey, StoreError, Transition, WorkerId,
 };
 pub use clock::{Clock, ManualClock, SystemClock, TokioClock};
+pub use compensation::{CompensationBuilder, CompensationContext, CompensationOutcome};
 pub use effect::{EffectBuilder, EffectContext, EffectFailure, EffectOutcome, Precondition};
 pub use error::RuntimeError;
-pub use handler::{EffectHandler, Handler, Submission, VerifiableEffect};
+pub use handler::{
+    CompensableEffect, CompensationSubmission, EffectHandler, Handler, Submission, VerifiableEffect,
+};
 pub use policy::{Capabilities, UnknownPlan};
 pub use recovery::{RecoveryReport, Resolution};
 pub use retry::RetryPolicy;

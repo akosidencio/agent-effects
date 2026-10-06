@@ -25,7 +25,7 @@ pub enum EffectStatus {
     Unknown,
     /// Checking the remote system for the effect's outcome.
     Verifying,
-    /// The effect applied. Terminal.
+    /// The effect applied. Final, unless it is later compensated.
     Committed,
     /// The effect definitely did not apply and will not be retried. Terminal.
     Failed,
@@ -34,10 +34,18 @@ pub enum EffectStatus {
     Rejected,
     /// The runtime cannot resolve the outcome on its own; an operator must.
     NeedsIntervention,
+    /// A committed effect is being undone. Attempts are retried; the
+    /// compensation must be idempotent.
+    Compensating,
+    /// The effect was undone. Terminal.
+    Compensated,
+    /// Undoing the effect failed for good; an operator must finish it or
+    /// order a retry.
+    CompensationFailed,
 }
 
 /// Every status, for exhaustive tests and store migrations.
-pub const ALL_STATUSES: [EffectStatus; 9] = [
+pub const ALL_STATUSES: [EffectStatus; 12] = [
     EffectStatus::Pending,
     EffectStatus::AwaitingApproval,
     EffectStatus::Executing,
@@ -47,12 +55,17 @@ pub const ALL_STATUSES: [EffectStatus; 9] = [
     EffectStatus::Failed,
     EffectStatus::Rejected,
     EffectStatus::NeedsIntervention,
+    EffectStatus::Compensating,
+    EffectStatus::Compensated,
+    EffectStatus::CompensationFailed,
 ];
 
 impl EffectStatus {
     /// Whether no further transition is possible.
+    ///
+    /// `Committed` is not terminal: compensation can start from it.
     pub const fn is_terminal(self) -> bool {
-        matches!(self, Self::Committed | Self::Failed | Self::Rejected)
+        matches!(self, Self::Failed | Self::Rejected | Self::Compensated)
     }
 
     /// Whether the effect may have changed the outside world without the
@@ -76,6 +89,9 @@ impl EffectStatus {
             Self::Failed => "failed",
             Self::Rejected => "rejected",
             Self::NeedsIntervention => "needs_intervention",
+            Self::Compensating => "compensating",
+            Self::Compensated => "compensated",
+            Self::CompensationFailed => "compensation_failed",
         }
     }
 
@@ -118,6 +134,13 @@ impl EffectStatus {
             (S::Unknown, T::Escalate) | (S::Verifying, T::VerificationConflict) => {
                 S::NeedsIntervention
             }
+
+            (S::Committed, T::StartCompensation)
+            | (S::Compensating, T::ScheduleCompensationRetry)
+            | (S::CompensationFailed, T::ResolvedRetry) => S::Compensating,
+            (S::Compensating, T::CompensationSucceeded)
+            | (S::CompensationFailed, T::ResolvedCompensated) => S::Compensated,
+            (S::Compensating, T::CompensationFailed) => S::CompensationFailed,
 
             _ => {
                 return Err(InvalidTransition { from: self, event });
@@ -177,12 +200,25 @@ pub enum Transition {
     ResolvedApplied,
     /// An operator confirmed the effect did not apply.
     ResolvedNotApplied,
-    /// An operator asserted it is safe to run the effect again.
+    /// An operator asserted it is safe to run the effect again, or to try
+    /// its failed compensation again.
     ResolvedRetry,
+    /// Undoing a committed effect begins. Persisted before the first
+    /// compensation attempt.
+    StartCompensation,
+    /// Another compensation attempt is scheduled, after a failure or to
+    /// resume one a crash interrupted.
+    ScheduleCompensationRetry,
+    /// The compensation succeeded.
+    CompensationSucceeded,
+    /// The compensation failed for good.
+    CompensationFailed,
+    /// An operator undid the effect by hand.
+    ResolvedCompensated,
 }
 
 /// Every transition, for exhaustive tests.
-pub const ALL_TRANSITIONS: [Transition; 18] = [
+pub const ALL_TRANSITIONS: [Transition; 23] = [
     Transition::RequestApproval,
     Transition::Approve,
     Transition::Deny,
@@ -201,6 +237,11 @@ pub const ALL_TRANSITIONS: [Transition; 18] = [
     Transition::ResolvedApplied,
     Transition::ResolvedNotApplied,
     Transition::ResolvedRetry,
+    Transition::StartCompensation,
+    Transition::ScheduleCompensationRetry,
+    Transition::CompensationSucceeded,
+    Transition::CompensationFailed,
+    Transition::ResolvedCompensated,
 ];
 
 impl Transition {
@@ -230,6 +271,11 @@ impl Transition {
             Self::ResolvedApplied => "effect.resolved_applied",
             Self::ResolvedNotApplied => "effect.resolved_not_applied",
             Self::ResolvedRetry => "effect.resolved_retry",
+            Self::StartCompensation => "effect.compensation_started",
+            Self::ScheduleCompensationRetry => "effect.compensation_retry_scheduled",
+            Self::CompensationSucceeded => "effect.compensated",
+            Self::CompensationFailed => "effect.compensation_failed",
+            Self::ResolvedCompensated => "effect.resolved_compensated",
         }
     }
 }
@@ -283,6 +329,46 @@ mod tests {
             .flat_map(|s| ALL_TRANSITIONS.into_iter().map(move |t| (s, t)))
             .filter(|(s, t)| s.apply(*t) == Ok(target))
             .collect()
+    }
+
+    #[test]
+    fn compensation_starts_only_from_committed() {
+        let sources = sources_of(EffectStatus::Compensating);
+        let starts: HashSet<_> = sources
+            .iter()
+            .filter(|(from, _)| *from != EffectStatus::Compensating)
+            .copied()
+            .collect();
+        assert_eq!(
+            starts,
+            HashSet::from([
+                (EffectStatus::Committed, Transition::StartCompensation),
+                (EffectStatus::CompensationFailed, Transition::ResolvedRetry),
+            ])
+        );
+        let exits_of_committed: HashSet<_> = ALL_TRANSITIONS
+            .into_iter()
+            .filter(|t| EffectStatus::Committed.apply(*t).is_ok())
+            .collect();
+        assert_eq!(
+            exits_of_committed,
+            HashSet::from([Transition::StartCompensation])
+        );
+    }
+
+    #[test]
+    fn compensated_requires_evidence() {
+        let events: HashSet<Transition> = sources_of(EffectStatus::Compensated)
+            .into_iter()
+            .map(|(_, t)| t)
+            .collect();
+        assert_eq!(
+            events,
+            HashSet::from([
+                Transition::CompensationSucceeded,
+                Transition::ResolvedCompensated
+            ])
+        );
     }
 
     #[test]

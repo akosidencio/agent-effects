@@ -17,6 +17,7 @@ CREATE TABLE effects (
     created_by         TEXT,
     attempt_count      INTEGER NOT NULL,
     may_have_applied   INTEGER NOT NULL,  -- 0 or 1
+    compensation_attempts INTEGER NOT NULL,
     next_attempt_at    INTEGER,
     attempt_started_at INTEGER,
     lease_owner        TEXT,

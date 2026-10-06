@@ -53,7 +53,8 @@ use uuid::Uuid;
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 const COLUMNS: &str = "id, effect_name, logical_key, kind, status, input, input_fingerprint, \
-     output, last_error, created_by, attempt_count, may_have_applied, next_attempt_at, \
+     output, last_error, created_by, attempt_count, may_have_applied, \
+     compensation_attempts, next_attempt_at, \
      attempt_started_at, \
      lease_owner, lease_epoch, lease_expires_at, version, created_at, updated_at, committed_at";
 
@@ -144,7 +145,7 @@ impl EffectStore for SqliteStore {
         let inserted = bind_record(
             sqlx::query(AssertSqlSafe(format!(
                 "INSERT INTO effects ({COLUMNS}) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
                  ON CONFLICT (effect_name, logical_key) DO NOTHING"
             ))),
             &record,
@@ -330,7 +331,7 @@ async fn save(
 ) -> Result<(), StoreError> {
     let updated = sqlx::query(
         "UPDATE effects SET status = ?, output = ?, last_error = ?, attempt_count = ?, \
-         may_have_applied = ?, next_attempt_at = ?, attempt_started_at = ?, lease_owner = ?, lease_epoch = ?, \
+         may_have_applied = ?, compensation_attempts = ?, next_attempt_at = ?, attempt_started_at = ?, lease_owner = ?, lease_epoch = ?, \
          lease_expires_at = ?, version = ?, updated_at = ?, committed_at = ? \
          WHERE id = ? AND version = ?",
     )
@@ -339,6 +340,7 @@ async fn save(
     .bind(json(record.last_error.as_ref())?)
     .bind(i64::from(record.attempt_count))
     .bind(record.may_have_applied)
+    .bind(i64::from(record.compensation_attempts))
     .bind(record.next_attempt_at.map(to_ms))
     .bind(record.attempt_started_at.map(to_ms))
     .bind(record.lease_owner.as_ref().map(WorkerId::as_str))
@@ -380,6 +382,7 @@ fn bind_record<'q>(query: Query<'q>, r: &EffectRecord) -> Result<Query<'q>, Stor
         .bind(r.created_by.clone())
         .bind(i64::from(r.attempt_count))
         .bind(r.may_have_applied)
+        .bind(i64::from(r.compensation_attempts))
         .bind(r.next_attempt_at.map(to_ms))
         .bind(r.attempt_started_at.map(to_ms))
         .bind(r.lease_owner.as_ref().map(|w| w.as_str().to_owned()))
@@ -411,6 +414,8 @@ fn decode_record(row: &SqliteRow) -> Result<EffectRecord, StoreError> {
         attempt_count: u32::try_from(get::<i64>(row, "attempt_count")?)
             .map_err(StoreError::backend)?,
         may_have_applied: get(row, "may_have_applied")?,
+        compensation_attempts: u32::try_from(get::<i64>(row, "compensation_attempts")?)
+            .map_err(StoreError::backend)?,
         next_attempt_at: get::<Option<i64>>(row, "next_attempt_at")?.map(from_ms),
         attempt_started_at: get::<Option<i64>>(row, "attempt_started_at")?.map(from_ms),
         lease_owner: get::<Option<String>>(row, "lease_owner")?.map(WorkerId::new),

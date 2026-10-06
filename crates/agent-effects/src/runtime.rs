@@ -25,7 +25,9 @@ use crate::failure::{Disposition, FailureClass};
 #[cfg(feature = "fault-injection")]
 use crate::fault::FaultInjector;
 use crate::fault::FaultPoint;
-use crate::handler::{EffectHandler, Handler, Registered, Registry, Resume, Submission};
+use crate::handler::{
+    CompensationSubmission, EffectHandler, Handler, Registered, Registry, Resume, Submission,
+};
 use crate::id::{EffectId, WorkerId};
 use crate::kind::EffectKind;
 use crate::policy::UnknownPlan;
@@ -154,7 +156,7 @@ impl<S: EffectStore> RuntimeBuilder<S> {
 }
 
 /// Why moving an effect forward stopped early.
-enum Interrupt {
+pub(crate) enum Interrupt {
     /// Our lease expired or was taken over; re-read the record.
     LeaseLost,
     Error(RuntimeError),
@@ -208,6 +210,16 @@ impl<S: EffectStore> Runtime<S> {
         input: H::Input,
     ) -> Submission<'_, S, H> {
         Submission::new(self, key, input)
+    }
+
+    /// Undoes a registered, [compensable](Handler::compensable) handler's
+    /// effect. Await the returned submission. See
+    /// [`compensation`](crate::compensation).
+    pub fn compensate<H: EffectHandler>(
+        &self,
+        key: impl Display,
+    ) -> CompensationSubmission<'_, S, H> {
+        CompensationSubmission::new(self, key)
     }
 
     pub(crate) fn handler<H: EffectHandler>(&self) -> Option<Handler<H>> {
@@ -280,10 +292,50 @@ impl<S: EffectStore> Runtime<S> {
         self.inner.lease_ttl
     }
 
+    /// Awaits `future`, renewing `lease` every third of its TTL. Stops with
+    /// [`Interrupt::LeaseLost`] if the lease is lost meanwhile.
+    pub(crate) async fn with_lease<Fut: Future>(
+        &self,
+        lease: &Lease,
+        future: Fut,
+    ) -> Result<Fut::Output, Interrupt> {
+        let ttl = self.inner.lease_ttl;
+        tokio::pin!(future);
+        loop {
+            tokio::select! {
+                output = &mut future => return Ok(output),
+                () = tokio::time::sleep(ttl / 3) => {
+                    match self.store().renew_lease(lease, self.now(), ttl).await {
+                        Ok(_) => {}
+                        Err(StoreError::LeaseLost) => return Err(Interrupt::LeaseLost),
+                        Err(e) => warn!(error = %e, "lease renewal failed; will retry"),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Applies `transition` under `lease`, attributing it to `actor`.
+    pub(crate) async fn transition_leased(
+        &self,
+        record: &EffectRecord,
+        lease: &Lease,
+        actor: Option<&str>,
+        transition: Transition,
+        customize: impl FnOnce(&mut TransitionRequest),
+    ) -> Result<EffectRecord, Interrupt> {
+        let mut request = TransitionRequest::new(record, Some(lease), transition, self.now());
+        request.actor = actor.map(str::to_owned);
+        customize(&mut request);
+        let record = self.store().transition(request).await?;
+        debug!(%transition, status = %record.status, "effect transition");
+        Ok(record)
+    }
+
     /// A point where a crash can be injected; a no-op without the
     /// `fault-injection` feature.
     #[cfg_attr(not(feature = "fault-injection"), allow(clippy::unused_self))]
-    fn checkpoint(&self, point: FaultPoint) {
+    pub(crate) fn checkpoint(&self, point: FaultPoint) {
         #[cfg(feature = "fault-injection")]
         if let Some(faults) = &self.inner.faults {
             faults.reach(point);
@@ -825,23 +877,8 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
         self.leased(tokio::time::sleep(duration)).await
     }
 
-    /// Awaits `future`, renewing the lease every third of its TTL. Stops
-    /// with [`Interrupt::LeaseLost`] if the lease is lost meanwhile.
     async fn leased<Fut: Future>(&self, future: Fut) -> Result<Fut::Output, Interrupt> {
-        let ttl = self.rt.inner.lease_ttl;
-        tokio::pin!(future);
-        loop {
-            tokio::select! {
-                output = &mut future => return Ok(output),
-                () = tokio::time::sleep(ttl / 3) => {
-                    match self.rt.store().renew_lease(self.lease, self.rt.now(), ttl).await {
-                        Ok(_) => {}
-                        Err(StoreError::LeaseLost) => return Err(Interrupt::LeaseLost),
-                        Err(e) => warn!(error = %e, "lease renewal failed; will retry"),
-                    }
-                }
-            }
-        }
+        self.rt.with_lease(self.lease, future).await
     }
 
     async fn transition(
@@ -850,13 +887,15 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
         transition: Transition,
         customize: impl FnOnce(&mut TransitionRequest),
     ) -> Result<EffectRecord, Interrupt> {
-        let mut request =
-            TransitionRequest::new(record, Some(self.lease), transition, self.rt.now());
-        request.actor.clone_from(&self.spec.actor);
-        customize(&mut request);
-        let record = self.rt.store().transition(request).await?;
-        debug!(%transition, status = %record.status, "effect transition");
-        Ok(record)
+        self.rt
+            .transition_leased(
+                record,
+                self.lease,
+                self.spec.actor.as_deref(),
+                transition,
+                customize,
+            )
+            .await
     }
 
     fn retry(&self) -> &RetryPolicy {
@@ -884,7 +923,7 @@ fn output_json<T: Serialize>(value: &T) -> (Option<Value>, Option<Value>) {
 
 /// A uniform sample in `[0, 1)` for jitter, from the standard library's
 /// per-instance random hash keys.
-fn jitter_sample() -> f64 {
+pub(crate) fn jitter_sample() -> f64 {
     let bits = RandomState::new().hash_one(0_u8) >> 11;
     #[allow(clippy::cast_precision_loss)]
     let sample = bits as f64 / (1_u64 << 53) as f64;
@@ -899,6 +938,8 @@ fn settled(status: EffectStatus) -> bool {
             | EffectStatus::Failed
             | EffectStatus::Rejected
             | EffectStatus::NeedsIntervention
+            | EffectStatus::Compensated
+            | EffectStatus::CompensationFailed
     )
 }
 
@@ -933,13 +974,17 @@ fn report<T: DeserializeOwned>(
         },
         EffectStatus::Failed => EffectOutcome::Failed(last_error(record)),
         EffectStatus::Rejected => EffectOutcome::Rejected(last_error(record)),
-        EffectStatus::NeedsIntervention => EffectOutcome::NeedsIntervention { id },
+        // A failed compensation also waits for an operator.
+        EffectStatus::NeedsIntervention | EffectStatus::CompensationFailed => {
+            EffectOutcome::NeedsIntervention { id }
+        }
         EffectStatus::Unknown => EffectOutcome::Unknown { id },
+        EffectStatus::Compensated => EffectOutcome::Compensated { id },
         _ => EffectOutcome::InProgress { id },
     })
 }
 
-fn last_error(record: &EffectRecord) -> ErrorRecord {
+pub(crate) fn last_error(record: &EffectRecord) -> ErrorRecord {
     record.last_error.clone().unwrap_or_else(|| ErrorRecord {
         class: None,
         message: "no error was recorded".into(),
