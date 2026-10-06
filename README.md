@@ -79,6 +79,9 @@ Pick the protection your remote system allows:
 
 Also available:
 
+- **Durable handlers.** Implement `EffectHandler`, `register` it, and
+  `runtime.submit::<H>(key, input)`. Recovery then finishes the effect from
+  its stored input even if the caller never comes back.
 - `.retry(policy)`: lifetime attempt budget, backoff with jitter, honours
   `retry_after`.
 - `.attempt_timeout(d)`.

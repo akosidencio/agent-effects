@@ -1,12 +1,11 @@
 //! Recovery and the operator API.
 //!
-//! Closures are not durable, so recovery cannot finish an effect on its own
-//! (that needs the v0.2 handler registry). What it can do safely:
-//!
-//! - [`Runtime::recover`] marks attempts whose worker died as unknown, so
-//!   their state is visible and honest;
-//! - [`Runtime::pending`] lists the effects waiting for a caller to re-run
-//!   them or an operator to decide;
+//! - [`Runtime::recover`] marks attempts whose worker died as unknown, then
+//!   finishes every unsettled effect that has a registered
+//!   [handler](crate::handler) from its stored input. Closure effects are
+//!   not durable, so they wait for a caller to re-run them;
+//! - [`Runtime::pending`] lists the effects waiting for a caller or an
+//!   operator;
 //! - [`Runtime::resolve`] records an operator's decision.
 
 use std::time::Duration;
@@ -29,6 +28,7 @@ const PAGE: usize = 100;
 
 /// What one [`Runtime::recover`] pass did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RecoveryReport {
     /// Effects whose worker's lease expired mid-attempt or mid-verification,
     /// now marked unknown.
@@ -36,6 +36,17 @@ pub struct RecoveryReport {
     /// Effects that matched the scan but were taken by another caller or
     /// worker before this pass reached them.
     pub skipped: Vec<EffectId>,
+    /// Effects with a registered handler that this pass moved forward, and
+    /// the status each ended in. `Committed`, `Failed` and `Rejected` are
+    /// settled; `NeedsIntervention` waits for an operator; anything else is
+    /// still in progress or still unknown.
+    pub resumed: Vec<(EffectId, EffectStatus)>,
+    /// Unsettled effects with no registered handler (closure effects). They
+    /// need a caller to run them again with the same key.
+    pub unhandled: Vec<EffectId>,
+    /// Effects whose handler could not be run, with the reason, e.g. a
+    /// stored input that no longer deserializes.
+    pub resume_errors: Vec<(EffectId, String)>,
 }
 
 /// An operator's decision about an effect the runtime could not resolve.
@@ -69,24 +80,36 @@ impl Resolution {
 }
 
 impl<S: EffectStore> Runtime<S> {
-    /// Marks every effect whose worker's lease expired mid-attempt or
-    /// mid-verification as `Unknown`.
+    /// One recovery pass, in two steps.
     ///
-    /// Such an effect may have changed the outside world, so it becomes
-    /// `Unknown`, never `Failed`. A later call with the same key then
-    /// verifies it, re-runs it if that is safe, or escalates it. Effects
-    /// that are pending, already unknown or settled are left alone, as is
-    /// anything another worker holds.
+    /// 1. Every effect whose worker's lease expired mid-attempt or
+    ///    mid-verification becomes `Unknown`, never `Failed`: it may have
+    ///    changed the outside world.
+    /// 2. Every unsettled effect nobody holds (see [`Self::pending`]) whose
+    ///    name has a registered [handler](crate::handler) is finished from its
+    ///    stored input, exactly as if its caller had called again: verified,
+    ///    re-run if that is safe, or escalated. This includes effects left
+    ///    `Pending` by a crash. Effects waiting for an operator, and retries
+    ///    scheduled for later, are left alone. Unsettled closure effects are
+    ///    reported as `unhandled`: only a caller can re-run them.
     ///
-    /// Safe to run from several workers at once: each effect is taken under
-    /// a lease before it is changed.
+    /// Effects are resumed one at a time, so a pass lasts as long as their
+    /// retries and verifications take. Safe to run from several workers at
+    /// once: every change happens under a lease.
     ///
     /// # Errors
     ///
-    /// [`RuntimeError::Store`] if the store fails. Effects marked before the
-    /// failure stay marked.
+    /// [`RuntimeError::Store`] if the store fails. Progress made before the
+    /// failure is kept. A handler that cannot run is reported in
+    /// `resume_errors` instead.
     pub async fn recover(&self) -> Result<RecoveryReport, RuntimeError> {
         let mut report = RecoveryReport::default();
+        self.mark_abandoned(&mut report).await?;
+        self.resume_pending(&mut report).await?;
+        Ok(report)
+    }
+
+    async fn mark_abandoned(&self, report: &mut RecoveryReport) -> Result<(), RuntimeError> {
         let mut after = None;
         loop {
             let mut query = ListQuery::expired_leases(self.now()).limit(PAGE);
@@ -104,7 +127,40 @@ impl<S: EffectStore> Runtime<S> {
                 }
             }
             if !full {
-                return Ok(report);
+                return Ok(());
+            }
+        }
+    }
+
+    async fn resume_pending(&self, report: &mut RecoveryReport) -> Result<(), RuntimeError> {
+        let mut after = None;
+        loop {
+            let page = self.pending(after, PAGE).await?;
+            let full = page.len() == PAGE;
+            after = page.last().map(|record| record.id);
+            for record in page {
+                let id = record.id;
+                let not_due = record.next_attempt_at.is_some_and(|at| at > self.now());
+                if record.status == EffectStatus::NeedsIntervention || not_due {
+                    continue;
+                }
+                let Some(resume) = self.resumer(record.key.name.as_str()) else {
+                    report.unhandled.push(id);
+                    continue;
+                };
+                match resume(self.clone(), record).await {
+                    Ok(status) => {
+                        info!(effect.id = %id, %status, "recovery resumed effect");
+                        report.resumed.push((id, status));
+                    }
+                    Err(e) => {
+                        warn!(effect.id = %id, error = %e, "recovery could not resume effect");
+                        report.resume_errors.push((id, e.to_string()));
+                    }
+                }
+            }
+            if !full {
+                return Ok(());
             }
         }
     }
@@ -125,10 +181,12 @@ impl<S: EffectStore> Runtime<S> {
         loop {
             ticker.tick().await;
             match self.recover().await {
-                Ok(report) if !report.marked_unknown.is_empty() => {
+                Ok(report) if !report.marked_unknown.is_empty() || !report.resumed.is_empty() => {
                     info!(
-                        count = report.marked_unknown.len(),
-                        "recovery marked effects unknown"
+                        marked_unknown = report.marked_unknown.len(),
+                        resumed = report.resumed.len(),
+                        unhandled = report.unhandled.len(),
+                        "recovery pass"
                     );
                 }
                 Ok(_) => {}

@@ -14,6 +14,10 @@ First release.
 
 ### `agent-effects`
 
+- **Durable handlers.** `EffectHandler` (with `VerifiableEffect` as a
+  separate capability) is registered via `RuntimeBuilder::register` and run
+  with `runtime.submit::<H>(key, input)`. Inputs are stored, so `recover()`
+  finishes registered effects after a crash with no caller.
 - **Closure API.** `runtime.effect(name, key)…run(action)` returns an
   `EffectOutcome`: `Committed`, `Failed`, `Rejected`, `Unknown`,
   `NeedsIntervention` or `InProgress`. `RuntimeError` is reserved for

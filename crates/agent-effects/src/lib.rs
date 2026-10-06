@@ -50,6 +50,7 @@ pub mod clock;
 pub mod effect;
 pub mod error;
 pub mod fault;
+pub mod handler;
 pub mod policy;
 pub mod recovery;
 pub mod retry;
@@ -71,6 +72,7 @@ pub use agent_effects_store::{
 pub use clock::{Clock, ManualClock, SystemClock, TokioClock};
 pub use effect::{EffectBuilder, EffectContext, EffectFailure, EffectOutcome, Precondition};
 pub use error::RuntimeError;
+pub use handler::{EffectHandler, Handler, Submission, VerifiableEffect};
 pub use policy::{Capabilities, UnknownPlan};
 pub use recovery::{RecoveryReport, Resolution};
 pub use retry::RetryPolicy;

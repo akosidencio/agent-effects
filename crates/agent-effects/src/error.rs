@@ -52,6 +52,24 @@ pub enum RuntimeError {
         source: serde_json::Error,
     },
 
+    /// No handler of the submitted type is registered under its name.
+    #[error("no handler registered for effect `{name}`")]
+    NotRegistered {
+        /// The effect name.
+        name: &'static str,
+    },
+
+    /// A stored input no longer deserializes into the handler's input type,
+    /// e.g. because the type changed since the effect was recorded.
+    #[error("effect {id}'s stored input does not match its handler's input type: {source}")]
+    StoredInput {
+        /// The effect.
+        id: EffectId,
+        /// The deserialization error.
+        #[source]
+        source: serde_json::Error,
+    },
+
     /// The store failed. If this happens after the action ran, the effect
     /// stays in doubt and recovery will treat its outcome as unknown.
     #[error(transparent)]

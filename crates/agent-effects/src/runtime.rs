@@ -25,6 +25,7 @@ use crate::failure::{Disposition, FailureClass};
 #[cfg(feature = "fault-injection")]
 use crate::fault::FaultInjector;
 use crate::fault::FaultPoint;
+use crate::handler::{EffectHandler, Handler, Registered, Registry, Resume, Submission};
 use crate::id::{EffectId, WorkerId};
 use crate::kind::EffectKind;
 use crate::policy::UnknownPlan;
@@ -50,6 +51,7 @@ struct Inner<S> {
     worker: WorkerId,
     lease_ttl: Duration,
     retry: RetryPolicy,
+    handlers: Registry<S>,
     #[cfg(feature = "fault-injection")]
     faults: Option<Arc<FaultInjector>>,
 }
@@ -70,11 +72,29 @@ pub struct RuntimeBuilder<S> {
     worker: Option<WorkerId>,
     lease_ttl: Duration,
     retry: RetryPolicy,
+    handlers: Registry<S>,
     #[cfg(feature = "fault-injection")]
     faults: Option<Arc<FaultInjector>>,
 }
 
 impl<S: EffectStore> RuntimeBuilder<S> {
+    /// Registers a durable handler under its [`EffectHandler::NAME`], so
+    /// [`Runtime::submit`] can run it and [`Runtime::recover`] can finish
+    /// its effects without a caller.
+    ///
+    /// # Panics
+    ///
+    /// If a handler is already registered under the same name.
+    pub fn register<H: EffectHandler>(mut self, handler: Handler<H>) -> Self {
+        assert!(
+            !self.handlers.contains_key(H::NAME),
+            "a handler is already registered for effect `{}`",
+            H::NAME
+        );
+        self.handlers.insert(H::NAME, Registered::new(handler));
+        self
+    }
+
     /// The time source for leases and schedules. Defaults to the system
     /// clock. Tests with paused Tokio time want
     /// [`TokioClock`](crate::clock::TokioClock).
@@ -125,6 +145,7 @@ impl<S: EffectStore> RuntimeBuilder<S> {
                 worker: self.worker.unwrap_or_else(WorkerId::random),
                 lease_ttl: self.lease_ttl,
                 retry: self.retry,
+                handlers: self.handlers,
                 #[cfg(feature = "fault-injection")]
                 faults: self.faults,
             }),
@@ -162,6 +183,7 @@ impl<S: EffectStore> Runtime<S> {
             worker: None,
             lease_ttl: Duration::from_secs(30),
             retry: RetryPolicy::default(),
+            handlers: Registry::new(),
             #[cfg(feature = "fault-injection")]
             faults: None,
         }
@@ -172,6 +194,28 @@ impl<S: EffectStore> Runtime<S> {
     /// the same name and key refers to the same effect.
     pub fn effect(&self, name: impl Into<String>, key: impl Display) -> EffectBuilder<S> {
         EffectBuilder::new(self.clone(), name.into(), key.to_string())
+    }
+
+    /// Runs a registered handler's effect with `input`, or attaches to an
+    /// earlier run with the same `key`. Await the returned [`Submission`].
+    ///
+    /// Behaves like [`EffectBuilder::run`], with the handler's properties.
+    /// The input is stored in full, so recovery can finish the effect if
+    /// this process dies.
+    pub fn submit<H: EffectHandler>(
+        &self,
+        key: impl Display,
+        input: H::Input,
+    ) -> Submission<'_, S, H> {
+        Submission::new(self, key, input)
+    }
+
+    pub(crate) fn handler<H: EffectHandler>(&self) -> Option<Handler<H>> {
+        self.inner.handlers.get(H::NAME)?.typed::<H>()
+    }
+
+    pub(crate) fn resumer(&self, name: &str) -> Option<Resume<S>> {
+        self.inner.handlers.get(name).map(|r| Arc::clone(&r.resume))
     }
 
     /// The underlying store.

@@ -6,20 +6,20 @@ Design reference: [design.md](design.md). Status as of 2026-10-05.
 
 - done
 
-## v0.2: durability without a caller, and policy
+## Next: durability without a caller, and policy (ships in 0.1.0)
 
-- Durable **handler registry**, so the recovery worker can finish effects with
-  no caller present.
-- Compensation as a durable sub-lifecycle, starting from Committed.
-- `ApprovalProvider` + CLI provider; `AwaitingApproval` survives restarts.
-- Risk policy: `RiskLevel` × `EffectKind` with defined precedence.
-- `agent-effects-postgres`: database-side `now()` for leases, and
-  `FOR UPDATE SKIP LOCKED` for recovery scans.
-- Redaction hook for audit payloads and outputs.
-- Metrics; `agent-effects-otel`.
-- `agent-effects-http` (reqwest): maps connect errors, timeouts and statuses
-  to `FailureClass`; sends the `Idempotency-Key` header.
-- Retention / pruning of settled records.
+| # | Milestone | Status |
+|---|---|---|
+| N1 | Durable **handler registry** (`EffectHandler`, `VerifiableEffect`, `submit`); recovery finishes registered effects with no caller | **done** |
+| N2 | Compensation as a durable sub-lifecycle from `Committed` (`CompensableEffect`) | |
+| N3 | `ApprovalProvider` + CLI provider; `AwaitingApproval` survives restarts | |
+| N4 | Risk policy: `RiskLevel` × `EffectKind`, defined precedence | |
+| N5 | `agent-effects-postgres`: database-side `now()`, `FOR UPDATE SKIP LOCKED` scans | |
+| N6 | Redaction hook for audit payloads and outputs | |
+| N7 | `EffectObserver` metrics in core; `agent-effects-otel` | |
+| N8 | `agent-effects-http` (reqwest): failure classification, `Idempotency-Key` | |
+| N9 | Retention / pruning of settled records | |
+| N10 | Model test and crash suite cover the new features; docs | |
 
 ## v0.3: adapters
 

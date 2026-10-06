@@ -134,7 +134,7 @@ jitter", so there is always some wait). A rate limit's `retry_after` is a
 floor and may exceed the cap. The arithmetic is pure and takes the random
 sample as an argument.
 
-## 7. API (v0.1: closures)
+## 7. API: closures and handlers
 
 Built in M3 and M4.
 
@@ -270,10 +270,16 @@ Implemented in `recovery.rs`:
   lease expired (`ListQuery::expired_leases`, paged 100 at a time). It takes
   each one under its own lease, re-checks the status, applies `LeaseExpired`
   (→ `Unknown`, actor `recovery:<worker>`) and releases. Effects that another
-  worker grabs first are reported as `skipped`. It changes nothing else:
-  `Pending`, `Unknown` and settled effects are left alone, because only a
-  caller holding the closures can move them further. It is safe to run on
-  several workers at once, and running it twice in a row is a no-op.
+  worker grabs first are reported as `skipped`. Then it **resumes every
+  unsettled effect nobody holds whose name has a registered handler**
+  (see [Durable handlers](#durable-handlers)), from its stored input:
+  - It skips `NeedsIntervention`, and retries scheduled for later.
+  - It reports `resumed` with the status each effect reached.
+  - It lists closure effects as `unhandled`: only a caller can re-run those.
+  - Inputs that no longer deserialize go into `resume_errors`.
+
+  It is safe to run on several workers at once; every change happens under
+  a lease.
 - **`runtime.run_recovery(interval)`** runs `recover` on a timer, forever.
   Spawn it. A failed pass is logged and retried at the next tick.
 - **`runtime.pending(after, limit)`** lists unsettled effects that nobody
@@ -305,9 +311,64 @@ In every case *a*'s late write is fenced off and its call reports the
 outcome *b* recorded. Mutation checks confirm the first two depend on
 verification and on the stable idempotency key respectively.
 
-A durable handler registry, which would let the recovery worker finish
-effects with no caller, is planned for v0.2. The storage format already
-carries everything it needs.
+### Durable handlers
+
+Implemented in `handler.rs`. Closure effects can only be finished by a
+caller. A handler is registered under its effect name, and its input is
+stored in full with the record, so recovery can rebuild the call and finish
+the effect with nobody calling.
+
+```rust
+struct ChargeCustomer { stripe: Stripe }      // credentials live here, not in the input
+
+impl EffectHandler for ChargeCustomer {
+    const NAME: &'static str = "payment.charge";
+    type Input = Charge;                       // stored; must stay deserializable
+    type Output = Payment;
+    type Error = EffectFailure;                // any Into<EffectFailure>
+    fn kind(&self) -> EffectKind { EffectKind::IrreversibleWrite }
+    fn remote_idempotency(&self) -> bool { true }
+    async fn execute(&self, ctx: &EffectContext, charge: &Charge) -> Result<Payment, EffectFailure> { … }
+    // optional: retry_policy, attempt_timeout, precondition
+}
+
+impl VerifiableEffect for ChargeCustomer {     // optional capability, as in spec §9
+    async fn verify(&self, ctx: &EffectContext, charge: &Charge) -> Result<Verification<Payment>, EffectFailure> { … }
+}
+
+let runtime = Runtime::builder(store)
+    .register(Handler::new(ChargeCustomer { stripe }).verifiable())
+    .build();
+let outcome = runtime.submit::<ChargeCustomer>(&order.id, charge).actor("agent:billing").await?;
+```
+
+- **Separate capability traits.** Capabilities are separate traits
+  (`VerifiableEffect`; compensation is next). The `Handler` builder only
+  offers `.verifiable()` for handlers that implement it, so an effect never
+  claims a capability it lacks.
+- **Same machinery as closures.** Handlers run through the closure-effect
+  machinery: identity, fingerprints, retries, verification, leases and every
+  crash guarantee are shared, not re-implemented.
+- **Registration.** One handler per name; registering twice panics at
+  startup. `submit` for a type that isn't registered under its name returns
+  `RuntimeError::NotRegistered`.
+- **Resuming.** A resumed effect reuses the record's stored fingerprint
+  rather than recomputing it: it is the same effect by definition, and a
+  future change to canonicalization must not block old records.
+
+The exit test is in `tests/handlers.rs`. The submitting process crashes at
+each fault point; no caller ever returns; a fresh runtime with the handler
+registered runs `recover()`:
+
+- verified and remote-idempotent effects end `Committed`, created exactly
+  once;
+- unprotected effects end `NeedsIntervention` wherever the outcome is in
+  doubt, and are never re-run.
+
+Mutation checks:
+
+- Skipping the resume step breaks five tests.
+- Blind re-running breaks the unprotected test.
 
 ## 8. Store contract
 
@@ -590,7 +651,7 @@ Crates are added when their milestone starts, not as empty placeholders.
 | D18 | 2026-10-05 | Verification also runs after every success (postcondition); inconclusive checks leave the effect `Unknown`, not escalated | "200 OK" is not proof; an unreachable lookup is a reason to look again later, not to page an operator |
 | D19 | 2026-10-05 | `max_attempts` is a lifetime budget per effect; it also caps checks per call | Restarts and re-attaching calls cannot reset the budget; every loop is bounded |
 | D20 | 2026-10-05 | `TokioClock`, plus a `testkit` feature with `FakeRemote` | Paused-time tests run real backoff schedules instantly; a scripted provider makes duplicates countable |
-| D21 | 2026-10-05 | Recovery only marks expired attempts `Unknown`; it never verifies, re-runs or escalates | Without durable closures it has nothing safe to run; honest state plus `pending()` lets callers and operators act |
+| D21 | 2026-10-05 | ~~Recovery only marks expired attempts `Unknown`; it never verifies, re-runs or escalates~~ **Superseded by D29** for registered handlers | Without durable closures it has nothing safe to run; honest state plus `pending()` lets callers and operators act |
 | D22 | 2026-10-05 | `Resolution::Retry` grants an attempt beyond the budget | It is an explicit human decision; refusing it would force a workaround |
 | D23 | 2026-10-05 | SQLite runs with `synchronous = FULL` and `BEGIN IMMEDIATE` | Intent must be durable before the remote call; immediate locking avoids lock-upgrade failures between processes |
 | D24 | 2026-10-05 | `agent-effects-sqlite` has its own MSRV, 1.94 (sqlx 0.9); the other crates stay at 1.90 | Users without SQLite are not forced onto a newer compiler |
@@ -598,6 +659,9 @@ Crates are added when their milestone starts, not as empty placeholders.
 | D26 | 2026-10-05 | `FakeRemote` answers a replayed idempotency key with the original result even when scripted to fail | Real deduplicating providers check the key before evaluating; otherwise the model test reports duplicates that cannot happen |
 | D27 | 2026-10-06 | GitHub Actions: `ci.yml` (format, clippy, tests on Linux + macOS, MSRV 1.90/1.94, docs, publish dry run, one `ci-pass` check) and tag-driven `release.yml` (preflight → CI at the tag → publish crate by crate, skipping versions already on crates.io → GitHub release from the CHANGELOG) | Mirrors the TalaDB release flow; a failed release can be re-run safely |
 | D28 | 2026-10-06 | `EffectRecord.may_have_applied`: set on entering `Unknown`, cleared only by a trusted "not applied" (verification or operator); `FailedDefinitively` is refused while set (except `Read`). The runtime turns such a failure into `Unknown`, then verifies or escalates | Found by the model test in CI: a failed retry after an ambiguous attempt was recorded `Failed` although the earlier attempt applied. Enforced in the store, so no runtime path can make `Failed` lie |
+| D29 | 2026-10-06 | Durable handlers per spec §9: `EffectHandler` + separate `VerifiableEffect`; the `Handler` builder gates capabilities by trait bounds. `submit::<H>` runs one; `recover()` resumes registered effects from stored input, reusing the stored fingerprint | Durability without a caller, with no second execution path: handlers ride the closure machinery and its tested guarantees |
+| D30 | 2026-10-06 | The roadmap's v0.2 items ship in 0.1.0 | User decision: nothing was published yet, so the schema can still change in place |
+| D31 | 2026-10-06 | Metrics through an `EffectObserver` trait in core; `agent-effects-otel` implements it | User decision: core stays dependency-free; any metrics backend can plug in |
 
 ## Open questions
 

@@ -10,8 +10,8 @@ use agent_effects::store::{EffectStore, ErrorRecord, NewEffect, StoreError, Tran
 use agent_effects::testkit::FakeRemote;
 use agent_effects::{
     Clock, EffectFailure, EffectId, EffectKey, EffectKind, EffectName, EffectOutcome, EffectStatus,
-    LogicalKey, ManualClock, RecoveryReport, Resolution, RetryPolicy, Runtime, RuntimeError,
-    TokioClock, Transition, Verification, WorkerId,
+    LogicalKey, ManualClock, Resolution, RetryPolicy, Runtime, RuntimeError, TokioClock,
+    Transition, Verification, WorkerId,
 };
 use agent_effects_memory::MemoryStore;
 use tokio::sync::Notify;
@@ -107,12 +107,12 @@ async fn recovery_marks_only_abandoned_attempts_unknown() {
 
     let rt = runtime(&store, Arc::clone(&clock), "recovery");
     let report = rt.recover().await.unwrap();
+    assert_eq!(report.marked_unknown, [executing, verifying]);
+    assert!(report.skipped.is_empty() && report.resumed.is_empty());
     assert_eq!(
-        report,
-        RecoveryReport {
-            marked_unknown: vec![executing, verifying],
-            skipped: vec![],
-        }
+        report.unhandled,
+        [executing, verifying, waiting],
+        "closure effects need a caller; recovery only reports them"
     );
     for logical in ["executing", "verifying"] {
         let record = record(&store, logical).await;
@@ -132,11 +132,9 @@ async fn recovery_marks_only_abandoned_attempts_unknown() {
     );
     assert_eq!(record(&store, "live").await.status, EffectStatus::Executing);
 
-    assert_eq!(
-        rt.recover().await.unwrap(),
-        RecoveryReport::default(),
-        "idempotent"
-    );
+    let again = rt.recover().await.unwrap();
+    assert!(again.marked_unknown.is_empty(), "marking is idempotent");
+    assert_eq!(again.unhandled, report.unhandled);
 
     let pending: Vec<_> = rt
         .pending(None, 10)

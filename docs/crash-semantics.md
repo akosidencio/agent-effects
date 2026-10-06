@@ -70,12 +70,14 @@ From `Unknown`, a later call with the same key does one of these:
 ## Running it in production
 
 - **Run recovery.** Spawn `runtime.run_recovery(interval)` on at least one
-  worker. It marks effects whose worker died mid-attempt as `Unknown`, so
-  they show up honestly. It never re-runs anything: with the closure API,
-  only a caller has the code to do that.
-- **Re-drive at startup.** `runtime.pending(after, limit)` lists unsettled
-  effects nobody holds. Call each one again with its original key and input
-  to finish it.
+  worker. It marks effects whose worker died mid-attempt as `Unknown`, then
+  finishes every effect that has a registered handler from its stored input:
+  verified, re-run only if safe, or escalated.
+- **Prefer handlers for effects that must finish.** Implement
+  `EffectHandler` and register it, and an effect completes even if its
+  caller never returns. Closure effects cannot be resumed: recovery reports
+  them as `unhandled`. Use `runtime.pending(after, limit)` at startup to
+  call each one again with its original key and input.
 - **Give operators `resolve`.**
   `runtime.resolve(id, Resolution::{Applied, NotApplied, Retry}, actor, note)`
   records a person's decision and the reason in the audit trail.
@@ -114,10 +116,12 @@ From `Unknown`, a later call with the same key does one of these:
 - **A fenced worker's late success is not recorded.** If A's action
   succeeds after B took over, A's result is refused. The operator resolving
   the effect does not see it. This is an open design question.
-- **Closures need a caller.** Recovery can only mark effects `Unknown`.
-  Finishing them takes a call with the same key, or an operator. A durable
-  handler registry that lets recovery finish effects itself is planned for
-  v0.2.
+- **Closures need a caller.** Recovery can only mark closure effects
+  `Unknown`. Finishing them takes a call with the same key, or an operator.
+  Registered handlers do not have this limit.
+- **Stored inputs must stay readable.** A handler's input is stored so
+  recovery can rebuild the call. If the input type changes incompatibly, old
+  effects land in `RecoveryReport::resume_errors` instead of running.
 - **Outputs are replayed as stored.** If the output type changes between
   releases, replaying an old result fails with `RuntimeError::Output`
   instead of returning wrong data.
