@@ -40,6 +40,9 @@ First release.
   `.verify_eventually(settle, …)` for lagging ones.
 - **Unknown outcomes** are verified, re-run only when provably safe, or
   escalated.
+- **"Failed" never covers a possible application.** Once an attempt may have
+  applied the effect, later definitive failures leave it `Unknown` or
+  escalate it (`EffectRecord::may_have_applied`, enforced by the store).
 - **Cancellation and panics.** Execution runs on spawned tasks: dropping the
   caller does not abort an attempt, and a panicking action counts as an
   ambiguous failure.

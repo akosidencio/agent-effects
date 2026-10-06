@@ -361,11 +361,12 @@ backend therefore enforces identical semantics:
   cross-host clock skew.)*
 
 Every backend must pass `agent_effects_store::testkit::conformance` (the
-`testkit` feature). It runs 13 cases: read-back of all fields, key
+`testkit` feature). It runs 14 cases: read-back of all fields, key
 idempotency, 16-way concurrent inserts, missing records, lease exclusivity,
 takeover fencing, strict renewal, release, a full transition history with its
 events, rejected transitions leaving no trace, lease-less operator
-resolution, terminal finality, and listing/paging. Its sensitivity was checked
+resolution, terminal finality, listing/paging, and persisting
+`may_have_applied` while refusing `FailedDefinitively` under it. Its sensitivity was checked
 by breaking `MemoryStore` on purpose: ignoring the unique key, or persisting
 the event without the record. The suite caught both.
 
@@ -413,6 +414,7 @@ CREATE TABLE effects (
     last_error         TEXT,             -- JSON ErrorRecord
     created_by         TEXT,
     attempt_count      INTEGER NOT NULL,
+    may_have_applied   INTEGER NOT NULL,  -- 0 or 1
     next_attempt_at    INTEGER,
     attempt_started_at INTEGER,
     lease_owner        TEXT,
@@ -595,6 +597,7 @@ Crates are added when their milestone starts, not as empty placeholders.
 | D25 | 2026-10-05 | Simulated crashes: a panic in the runtime's task in-process, `process::abort()` in subprocesses | Both stop at the exact point with no cleanup, the way a real crash does; no special shutdown path in the runtime to keep honest |
 | D26 | 2026-10-05 | `FakeRemote` answers a replayed idempotency key with the original result even when scripted to fail | Real deduplicating providers check the key before evaluating; otherwise the model test reports duplicates that cannot happen |
 | D27 | 2026-10-06 | GitHub Actions: `ci.yml` (format, clippy, tests on Linux + macOS, MSRV 1.90/1.94, docs, publish dry run, one `ci-pass` check) and tag-driven `release.yml` (preflight → CI at the tag → publish crate by crate, skipping versions already on crates.io → GitHub release from the CHANGELOG) | Mirrors the TalaDB release flow; a failed release can be re-run safely |
+| D28 | 2026-10-06 | `EffectRecord.may_have_applied`: set on entering `Unknown`, cleared only by a trusted "not applied" (verification or operator); `FailedDefinitively` is refused while set (except `Read`). The runtime turns such a failure into `Unknown`, then verifies or escalates | Found by the model test in CI: a failed retry after an ambiguous attempt was recorded `Failed` although the earlier attempt applied. Enforced in the store, so no runtime path can make `Failed` lie |
 
 ## Open questions
 

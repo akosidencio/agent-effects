@@ -26,6 +26,7 @@ use crate::failure::{Disposition, FailureClass};
 use crate::fault::FaultInjector;
 use crate::fault::FaultPoint;
 use crate::id::{EffectId, WorkerId};
+use crate::kind::EffectKind;
 use crate::policy::UnknownPlan;
 use crate::retry::RetryPolicy;
 use crate::state::{EffectStatus, Transition};
@@ -536,6 +537,26 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
                 let record = match class.disposition() {
                     Disposition::Retry if self.retry().allows_another(record.attempt_count) => {
                         self.schedule_retry(&record, class, Some(error)).await?
+                    }
+                    // This attempt definitely failed, but an earlier one may
+                    // have applied the effect: that is not "Failed". Look
+                    // again if the effect can be verified, else escalate.
+                    Disposition::Retry | Disposition::Fail
+                        if record.may_have_applied && record.kind != EffectKind::Read =>
+                    {
+                        let unknown = self
+                            .transition(&record, Transition::OutcomeUnknown, |r| {
+                                r.error = Some(error);
+                                r.payload =
+                                    Some(json!({ "earlier_attempt_may_have_applied": true }));
+                            })
+                            .await?;
+                        if self.spec.capabilities.unknown_plan() == UnknownPlan::Verify {
+                            unknown
+                        } else {
+                            self.transition(&unknown, Transition::Escalate, |_| {})
+                                .await?
+                        }
                     }
                     Disposition::Retry | Disposition::Fail => {
                         self.transition(&record, Transition::FailedDefinitively, |r| {

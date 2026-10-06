@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use crate::id::{EffectId, EffectKey, WorkerId};
 use crate::kind::EffectKind;
-use crate::state::{EffectStatus, Transition};
+use crate::state::{EffectStatus, InvalidTransition, Transition};
 use crate::{EffectEvent, ErrorRecord, Lease, NewEffect, StoreError, TransitionRequest};
 
 /// The durable state of one effect.
@@ -35,6 +35,11 @@ pub struct EffectRecord {
     pub created_by: Option<String>,
     /// Attempts started so far.
     pub attempt_count: u32,
+    /// An attempt may have applied the effect, and no evidence has shown
+    /// otherwise since. Set when an outcome becomes unknown; cleared only by
+    /// a trusted verification or an operator. While it is set, the effect
+    /// cannot become `Failed` through a failed attempt (see [`Self::apply`]).
+    pub may_have_applied: bool,
     /// When a scheduled retry may start.
     pub next_attempt_at: Option<SystemTime>,
     /// When the latest attempt started. Settle delays count from here.
@@ -69,6 +74,7 @@ impl EffectRecord {
             last_error: None,
             created_by: new.created_by,
             attempt_count: 0,
+            may_have_applied: false,
             next_attempt_at: None,
             attempt_started_at: None,
             lease_owner: None,
@@ -164,7 +170,16 @@ impl EffectRecord {
     ///   `attempt_started_at` and clears `next_attempt_at`;
     /// - a retry transition sets `next_attempt_at` (default `now`);
     /// - reaching `Committed` stamps `committed_at`;
+    /// - reaching `Unknown` sets `may_have_applied`; evidence that the effect
+    ///   did not apply clears it (`VerificationNotApplied`,
+    ///   `ResolvedNotApplied`, or a `ScheduleRetry` out of `Verifying`, which
+    ///   the runtime issues only after a trusted "not applied");
     /// - `output` and `error`, when given, replace the stored ones.
+    ///
+    /// `Failed` must mean the effect did not apply. A failed attempt proves
+    /// that only for itself, so `FailedDefinitively` is refused while
+    /// `may_have_applied` is set (except for `Read` effects, which apply
+    /// nothing).
     ///
     /// # Errors
     ///
@@ -191,6 +206,16 @@ impl EffectRecord {
         }
         let from = self.status;
         let to = from.apply(request.transition)?;
+        if request.transition == Transition::FailedDefinitively
+            && self.may_have_applied
+            && self.kind != EffectKind::Read
+        {
+            return Err(InvalidTransition {
+                from,
+                event: request.transition,
+            }
+            .into());
+        }
 
         match request.transition {
             Transition::StartAttempt => {
@@ -205,6 +230,17 @@ impl EffectRecord {
         }
         if to == EffectStatus::Committed {
             self.committed_at = Some(now);
+        }
+        if to == EffectStatus::Unknown {
+            self.may_have_applied = true;
+        }
+        let shown_not_applied = matches!(
+            request.transition,
+            Transition::VerificationNotApplied | Transition::ResolvedNotApplied
+        ) || (from == EffectStatus::Verifying
+            && request.transition == Transition::ScheduleRetry);
+        if shown_not_applied {
+            self.may_have_applied = false;
         }
         if let Some(output) = request.output {
             self.output = Some(output);
@@ -322,6 +358,51 @@ mod tests {
             .unwrap();
         assert_eq!(lease.expires_at, t(0));
         assert_eq!(rec.live_lease_owner(t(0)), None);
+    }
+
+    #[test]
+    fn a_failed_attempt_cannot_fail_an_effect_that_may_have_applied() {
+        let mut rec = record();
+        let lease = rec.acquire_lease(&worker("a"), t(0), TTL).unwrap();
+        for transition in [
+            Transition::StartAttempt,
+            Transition::OutcomeUnknown,
+            Transition::ScheduleRetry,
+            Transition::StartAttempt,
+        ] {
+            rec.apply(TransitionRequest::new(&rec, Some(&lease), transition, t(1)))
+                .unwrap();
+        }
+        assert!(
+            rec.may_have_applied,
+            "the unknown outcome is remembered across retries"
+        );
+        let before = rec.clone();
+        let fail = TransitionRequest::new(&rec, Some(&lease), Transition::FailedDefinitively, t(2));
+        assert!(matches!(
+            rec.apply(fail),
+            Err(StoreError::InvalidTransition(_))
+        ));
+        assert_eq!(rec, before);
+
+        // A trusted verification clears it; then a failure is a failure.
+        for transition in [
+            Transition::StartVerification,
+            Transition::ScheduleRetry,
+            Transition::StartAttempt,
+        ] {
+            rec.apply(TransitionRequest::new(&rec, Some(&lease), transition, t(3)))
+                .unwrap();
+        }
+        assert!(!rec.may_have_applied);
+        rec.apply(TransitionRequest::new(
+            &rec,
+            Some(&lease),
+            Transition::FailedDefinitively,
+            t(4),
+        ))
+        .unwrap();
+        assert_eq!(rec.status, EffectStatus::Failed);
     }
 
     #[test]

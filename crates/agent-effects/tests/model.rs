@@ -262,7 +262,11 @@ async fn check(case: Case) -> Result<(), TestCaseError> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 512, ..ProptestConfig::default() })]
+    // 512 cases by default; PROPTEST_CASES=50000 for a longer local soak.
+    #![proptest_config(ProptestConfig {
+        cases: std::env::var("PROPTEST_CASES").ok().and_then(|n| n.parse().ok()).unwrap_or(512),
+        ..ProptestConfig::default()
+    })]
 
     #[test]
     fn histories_follow_the_state_machine_and_never_duplicate(case in case()) {

@@ -16,7 +16,12 @@ For an effect identified by `(name, key)`:
    committed result is replayed, never re-run.
 3. **"Failed" means it did not happen.** An effect is only `Failed` when it
    definitely did not apply. Anything that may have applied is `Unknown`,
-   and then resolved by evidence or by a person.
+   and then resolved by evidence or by a person. This holds across
+   attempts: once any attempt may have applied the effect, a later attempt
+   that definitely failed does not make it `Failed`, because it proves
+   nothing about the earlier one. The store enforces this (the record's
+   `may_have_applied` flag) until a verification or an operator shows the
+   effect did not apply.
 4. **No blind retries.** The runtime re-runs an effect whose last attempt may
    have applied only when that is provably harmless. That means one of:
    - the kind is `Read` or `IdempotentWrite`;

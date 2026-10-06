@@ -18,7 +18,7 @@ use crate::id::{EffectId, EffectKey, EffectName, LogicalKey, WorkerId};
 use crate::kind::EffectKind;
 use crate::state::{ALL_TRANSITIONS, EffectStatus, Transition};
 use crate::{
-    EffectRecord, EffectStore, ErrorRecord, Lease, ListQuery, NewEffect, StoreError,
+    EffectEvent, EffectRecord, EffectStore, ErrorRecord, Lease, ListQuery, NewEffect, StoreError,
     TransitionRequest,
 };
 
@@ -53,6 +53,7 @@ where
     unleased_transitions_for_operators(make_store().await).await;
     terminal_records_are_final(make_store().await).await;
     listing_filters_and_pages(make_store().await).await;
+    doubt_is_persisted_and_guards_failure(make_store().await).await;
 }
 
 const TTL: Duration = Duration::from_secs(30);
@@ -131,7 +132,10 @@ async fn insert_and_read_back<S: EffectStore>(store: S) {
         store.get_by_key(&record.key).await.unwrap(),
         Some(record.clone())
     );
-    assert!(store.events(record.id).await.unwrap().is_empty());
+    assert_eq!(
+        store.events(record.id).await.unwrap(),
+        Vec::<EffectEvent>::new()
+    );
 }
 
 async fn insert_is_idempotent_per_key<S: EffectStore>(store: S) {
@@ -430,7 +434,10 @@ async fn rejected_transitions_change_nothing<S: EffectStore>(store: S) {
     ));
 
     assert_eq!(reload(&store, record.id).await, record);
-    assert!(store.events(record.id).await.unwrap().is_empty());
+    assert_eq!(
+        store.events(record.id).await.unwrap(),
+        Vec::<EffectEvent>::new()
+    );
 }
 
 async fn unleased_transitions_for_operators<S: EffectStore>(store: S) {
@@ -591,4 +598,39 @@ async fn listing_filters_and_pages<S: EffectStore>(store: S) {
         [reload(&store, ids[4]).await],
         "listed records must be complete"
     );
+}
+
+async fn doubt_is_persisted_and_guards_failure<S: EffectStore>(store: S) {
+    let record = insert(&store, 1).await;
+    assert!(!record.may_have_applied);
+    let lease = store
+        .acquire_lease(record.id, &worker("a"), t(0), TTL)
+        .await
+        .unwrap();
+    let record = drive(
+        &store,
+        record,
+        Some(&lease),
+        &[
+            Transition::StartAttempt,
+            Transition::OutcomeUnknown,
+            Transition::ScheduleRetry,
+            Transition::StartAttempt,
+        ],
+        t(1),
+    )
+    .await;
+    assert!(
+        reload(&store, record.id).await.may_have_applied,
+        "the store must persist may_have_applied"
+    );
+    let fail = TransitionRequest::new(&record, Some(&lease), Transition::FailedDefinitively, t(2));
+    assert!(
+        matches!(
+            store.transition(fail).await,
+            Err(StoreError::InvalidTransition(_))
+        ),
+        "a failed attempt must not fail an effect that may have applied"
+    );
+    assert_eq!(reload(&store, record.id).await, record);
 }

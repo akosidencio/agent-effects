@@ -16,6 +16,7 @@ CREATE TABLE effects (
     last_error         TEXT,             -- JSON ErrorRecord
     created_by         TEXT,
     attempt_count      INTEGER NOT NULL,
+    may_have_applied   INTEGER NOT NULL,  -- 0 or 1
     next_attempt_at    INTEGER,
     attempt_started_at INTEGER,
     lease_owner        TEXT,

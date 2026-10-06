@@ -704,3 +704,52 @@ async fn a_concurrent_caller_can_wait_for_the_outcome() {
         EffectOutcome::Committed("done".into())
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_retry_does_not_fail_an_effect_an_earlier_attempt_may_have_applied() {
+    use Transition::{Escalate, OutcomeUnknown, ScheduleRetry, StartAttempt};
+
+    // Found by the model test in CI: attempt 3 charges and then loses the
+    // connection; the runtime re-sends under the idempotency key, but the
+    // provider stays unreachable until the budget runs out. "Failed" would
+    // claim nothing happened, yet the charge went through.
+    let (store, rt, clock) = setup();
+    let remote = FakeRemote::new(clock).script([
+        Behavior::Unreachable,
+        Behavior::Unreachable,
+        Behavior::CommitThenDrop,
+        Behavior::Unreachable,
+        Behavior::Unreachable,
+    ]);
+    let outcome = rt
+        .effect(NAME, "doubt")
+        .kind(EffectKind::ReversibleWrite)
+        .remote_idempotency(true)
+        .run(create(&remote, true))
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, EffectOutcome::NeedsIntervention { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(remote.applications(RES), 1);
+    let record = store.get_by_key(&key("doubt")).await.unwrap().unwrap();
+    assert!(record.may_have_applied);
+    assert_eq!(
+        transitions(&store, "doubt").await,
+        [
+            StartAttempt,
+            ScheduleRetry, // unreachable
+            StartAttempt,
+            ScheduleRetry, // unreachable
+            StartAttempt,
+            OutcomeUnknown,
+            ScheduleRetry, // charged, connection dropped
+            StartAttempt,
+            ScheduleRetry, // unreachable
+            StartAttempt,
+            OutcomeUnknown,
+            Escalate, // unreachable, budget spent
+        ]
+    );
+}
