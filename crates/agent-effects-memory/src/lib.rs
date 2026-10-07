@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime};
 
 use agent_effects_store::{
     EffectEvent, EffectId, EffectKey, EffectRecord, EffectStore, InsertOutcome, Lease, ListQuery,
-    NewEffect, StoreError, TransitionRequest, WorkerId,
+    NewEffect, PruneQuery, StoreError, TransitionRequest, WorkerId,
 };
 
 /// An in-process store for tests, examples and development.
@@ -151,6 +151,24 @@ impl EffectStore for MemoryStore {
             return Err(StoreError::NotFound(id));
         }
         Ok(inner.events.get(&id).cloned().unwrap_or_default())
+    }
+
+    async fn prune(&self, query: PruneQuery) -> Result<u64, StoreError> {
+        let mut inner = self.lock();
+        let doomed: Vec<EffectId> = inner
+            .records
+            .values()
+            .filter(|record| query.matches(record))
+            .take(query.limit)
+            .map(|record| record.id)
+            .collect();
+        for id in &doomed {
+            if let Some(record) = inner.records.remove(id) {
+                inner.by_key.remove(&record.key);
+            }
+            inner.events.remove(id);
+        }
+        Ok(doomed.len() as u64)
     }
 }
 

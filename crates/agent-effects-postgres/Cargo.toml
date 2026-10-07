@@ -1,7 +1,7 @@
 [package]
-name = "agent-effects-sqlite"
-description = "SQLite store for agent-effects"
-keywords = ["agents", "idempotency", "side-effects", "sqlite"]
+name = "agent-effects-postgres"
+description = "PostgreSQL store for agent-effects: database-clock leases, many workers on one database"
+keywords = ["agents", "idempotency", "side-effects", "postgres"]
 categories = ["asynchronous", "database"]
 readme = "../../README.md"
 version.workspace = true
@@ -15,13 +15,12 @@ authors.workspace = true
 agent-effects-store.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sqlx = { workspace = true, features = ["sqlite"] }
-uuid.workspace = true
+sqlx = { workspace = true, features = ["postgres", "time", "uuid", "json"] }
+time.workspace = true
 
 [dev-dependencies]
-agent-effects = { workspace = true, features = ["testkit", "fault-injection"] }
+agent-effects = { workspace = true, features = ["testkit"] }
 agent-effects-store = { workspace = true, features = ["testkit"] }
-tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 
 [lints]

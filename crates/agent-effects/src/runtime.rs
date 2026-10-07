@@ -26,12 +26,16 @@ use crate::failure::{Disposition, FailureClass};
 #[cfg(feature = "fault-injection")]
 use crate::fault::FaultInjector;
 use crate::fault::FaultPoint;
+use crate::fingerprint::fingerprint;
 use crate::handler::{
     CompensationSubmission, EffectHandler, Handler, Registered, Registry, Resume, Submission,
 };
-use crate::id::{EffectId, WorkerId};
+use crate::id::{EffectId, EffectName, WorkerId};
 use crate::kind::EffectKind;
+use crate::observer::{EffectObserver, Observation};
 use crate::policy::{RiskPolicy, UnknownPlan};
+use crate::redaction::{Field, Redactor};
+use crate::retention::RetentionPolicy;
 use crate::retry::RetryPolicy;
 use crate::state::{EffectStatus, Transition};
 use crate::store::{
@@ -57,6 +61,9 @@ struct Inner<S> {
     handlers: Registry<S>,
     approval: Option<Arc<dyn ErasedApproval>>,
     policy: RiskPolicy,
+    redactor: Option<Arc<dyn Redactor>>,
+    observers: Vec<Arc<dyn EffectObserver>>,
+    retention: RetentionPolicy,
     #[cfg(feature = "fault-injection")]
     faults: Option<Arc<FaultInjector>>,
 }
@@ -80,11 +87,37 @@ pub struct RuntimeBuilder<S> {
     handlers: Registry<S>,
     approval: Option<Arc<dyn ErasedApproval>>,
     policy: RiskPolicy,
+    redactor: Option<Arc<dyn Redactor>>,
+    observers: Vec<Arc<dyn EffectObserver>>,
+    retention: RetentionPolicy,
     #[cfg(feature = "fault-injection")]
     faults: Option<Arc<FaultInjector>>,
 }
 
 impl<S: EffectStore> RuntimeBuilder<S> {
+    /// How long settled records are kept before [`Runtime::prune`] (and
+    /// every round of [`Runtime::run_recovery`]) deletes them; see
+    /// [`retention`](crate::retention). Defaults to keeping them forever.
+    pub fn retention(mut self, policy: RetentionPolicy) -> Self {
+        self.retention = policy;
+        self
+    }
+
+    /// Tells `observer` about every effect recorded and every transition
+    /// stored, for metrics; see [`observer`](crate::observer). May be called
+    /// more than once.
+    pub fn observer(mut self, observer: impl EffectObserver) -> Self {
+        self.observers.push(Arc::new(observer));
+        self
+    }
+
+    /// Rewrites every input, output, audit payload and error message before
+    /// it is stored; see [`redaction`](crate::redaction).
+    pub fn redactor(mut self, redactor: impl Redactor) -> Self {
+        self.redactor = Some(Arc::new(redactor));
+        self
+    }
+
     /// Adds requirements by risk level and effect kind to every effect; see
     /// [`RiskPolicy`]. Requirements only accumulate on top of each effect's
     /// own settings.
@@ -171,6 +204,9 @@ impl<S: EffectStore> RuntimeBuilder<S> {
                 handlers: self.handlers,
                 approval: self.approval,
                 policy: self.policy,
+                redactor: self.redactor,
+                observers: self.observers,
+                retention: self.retention,
                 #[cfg(feature = "fault-injection")]
                 faults: self.faults,
             }),
@@ -211,6 +247,9 @@ impl<S: EffectStore> Runtime<S> {
             handlers: Registry::new(),
             approval: None,
             policy: RiskPolicy::default(),
+            redactor: None,
+            observers: Vec::new(),
+            retention: RetentionPolicy::KEEP_ALL,
             #[cfg(feature = "fault-injection")]
             faults: None,
         }
@@ -313,6 +352,10 @@ impl<S: EffectStore> Runtime<S> {
         self.inner.clock.now()
     }
 
+    pub(crate) fn retention(&self) -> RetentionPolicy {
+        self.inner.retention
+    }
+
     pub(crate) fn lease_ttl(&self) -> Duration {
         self.inner.lease_ttl
     }
@@ -352,9 +395,77 @@ impl<S: EffectStore> Runtime<S> {
         let mut request = TransitionRequest::new(record, Some(lease), transition, self.now());
         request.actor = actor.map(str::to_owned);
         customize(&mut request);
-        let record = self.store().transition(request).await?;
+        let record = self.commit_transition(record, request).await?;
         debug!(%transition, status = %record.status, "effect transition");
         Ok(record)
+    }
+
+    /// The one way a transition is written: redact, store, then tell the
+    /// observers. `before` is the record the request was built from.
+    pub(crate) async fn commit_transition(
+        &self,
+        before: &EffectRecord,
+        mut request: TransitionRequest,
+    ) -> Result<EffectRecord, StoreError> {
+        self.redact_request(&mut request, &before.key.name);
+        let transition = request.transition;
+        let after = self.store().transition(request).await?;
+        if !self.inner.observers.is_empty() {
+            let observation = Observation {
+                record: &after,
+                transition,
+                from: before.status,
+                to: after.status,
+                in_previous_status: after
+                    .updated_at
+                    .duration_since(before.updated_at)
+                    .unwrap_or_default(),
+                since_created: after
+                    .updated_at
+                    .duration_since(after.created_at)
+                    .unwrap_or_default(),
+            };
+            self.notify(|observer| observer.on_transition(&observation));
+        }
+        Ok(after)
+    }
+
+    /// Calls every observer, containing panics: the write already happened.
+    fn notify(&self, call: impl Fn(&dyn EffectObserver)) {
+        for observer in &self.inner.observers {
+            let observer: &dyn EffectObserver = observer.as_ref();
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| call(observer))).is_err() {
+                warn!("an effect observer panicked; ignoring it");
+            }
+        }
+    }
+
+    /// Applies the redactor, if any, to one value about to be stored.
+    pub(crate) fn redact(&self, field: Field, effect: &EffectName, value: &mut Value) {
+        if let Some(redactor) = &self.inner.redactor {
+            redactor.redact(field, effect, value);
+        }
+    }
+
+    /// Applies the redactor to everything a transition is about to store.
+    pub(crate) fn redact_request(&self, request: &mut TransitionRequest, effect: &EffectName) {
+        if self.inner.redactor.is_none() {
+            return;
+        }
+        if let Some(output) = request.output.as_mut() {
+            self.redact(Field::Output, effect, output);
+        }
+        if let Some(payload) = request.payload.as_mut() {
+            self.redact(Field::AuditPayload, effect, payload);
+        }
+        if let Some(error) = request.error.as_mut() {
+            let mut message = Value::String(std::mem::take(&mut error.message));
+            self.redact(Field::ErrorMessage, effect, &mut message);
+            error.message = match message {
+                Value::String(text) => text,
+                other => other.to_string(),
+            };
+        }
     }
 
     /// A point where a crash can be injected; a no-op without the
@@ -394,6 +505,16 @@ impl<S: EffectStore> Runtime<S> {
         }
         spec.require_approval |= required.approval;
         spec.automatic_retry &= !required.no_automatic_retry;
+
+        // Redact before fingerprinting: secrets are not part of an effect's
+        // identity, and never stored, not even hashed. A resumed effect
+        // brings its stored fingerprint, and its input is already redacted.
+        if !spec.input_stored
+            && let Some(input) = spec.input.as_mut()
+        {
+            self.redact(Field::Input, &spec.key.name, input);
+            spec.fingerprint = Some(fingerprint(input));
+        }
 
         let span = info_span!(
             "agent_effect.execute",
@@ -449,6 +570,9 @@ impl<S: EffectStore> Runtime<S> {
             })
             .await?;
         let mut record = inserted.record;
+        if inserted.inserted {
+            self.notify(|observer| observer.on_created(&record));
+        }
         Span::current().record("effect.id", field::display(record.id));
         self.checkpoint(FaultPoint::AfterInsert);
         if !inserted.inserted {

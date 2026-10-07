@@ -16,10 +16,10 @@ use serde_json::json;
 use crate::failure::FailureClass;
 use crate::id::{EffectId, EffectKey, EffectName, LogicalKey, WorkerId};
 use crate::kind::EffectKind;
-use crate::state::{ALL_TRANSITIONS, EffectStatus, Transition};
+use crate::state::{ALL_STATUSES, ALL_TRANSITIONS, EffectStatus, Transition};
 use crate::{
-    EffectEvent, EffectRecord, EffectStore, ErrorRecord, Lease, ListQuery, NewEffect, StoreError,
-    TransitionRequest,
+    EffectEvent, EffectRecord, EffectStore, ErrorRecord, Lease, ListQuery, NewEffect, PruneQuery,
+    StoreError, TransitionRequest,
 };
 
 /// Runs the store conformance suite against stores built by `make_store`.
@@ -56,6 +56,7 @@ where
     doubt_is_persisted_and_guards_failure(make_store().await).await;
     compensation_is_persisted(make_store().await).await;
     approval_is_persisted(make_store().await).await;
+    pruning_removes_only_settled_idle_old_records(make_store().await).await;
 }
 
 const TTL: Duration = Duration::from_secs(30);
@@ -749,4 +750,135 @@ async fn approval_is_persisted<S: EffectStore>(store: S) {
     .await;
     assert_eq!(other.status, EffectStatus::Rejected);
     assert!(!reload(&store, other.id).await.approved);
+}
+
+/// Runs effect `n` through `transitions` at time `at`, then releases its
+/// lease.
+async fn settle<S: EffectStore>(
+    store: &S,
+    n: u32,
+    transitions: &[Transition],
+    at: u64,
+) -> EffectId {
+    let record = insert(store, n).await;
+    let lease = store
+        .acquire_lease(record.id, &worker("a"), t(at), TTL)
+        .await
+        .unwrap();
+    drive(store, record, Some(&lease), transitions, t(at)).await;
+    store.release_lease(&lease).await.unwrap();
+    lease.effect_id
+}
+
+async fn pruning_removes_only_settled_idle_old_records<S: EffectStore>(store: S) {
+    let committed = [Transition::StartAttempt, Transition::Succeeded];
+    let old_a = settle(&store, 0, &committed, 10).await;
+    let failed = settle(
+        &store,
+        1,
+        &[Transition::StartAttempt, Transition::FailedDefinitively],
+        10,
+    )
+    .await;
+    let young = settle(&store, 2, &committed, 50).await;
+    let unknown = settle(
+        &store,
+        3,
+        &[Transition::StartAttempt, Transition::OutcomeUnknown],
+        10,
+    )
+    .await;
+    let escalated = settle(
+        &store,
+        6,
+        &[
+            Transition::StartAttempt,
+            Transition::OutcomeUnknown,
+            Transition::Escalate,
+        ],
+        10,
+    )
+    .await;
+    let leased = settle(&store, 4, &committed, 10).await;
+    let old_b = settle(&store, 5, &committed, 10).await;
+    // A compensation is about to start on `leased`: it holds a live lease.
+    store
+        .acquire_lease(leased, &worker("b"), t(95), TTL)
+        .await
+        .unwrap();
+
+    let now = t(100);
+    let minute = Duration::from_secs(60);
+    let prune = |status, older_than, limit| {
+        let store = &store;
+        async move {
+            store
+                .prune(PruneQuery::new(status, older_than, now).limit(limit))
+                .await
+                .unwrap()
+        }
+    };
+    let exists = |id| {
+        let store = &store;
+        async move { store.get(id).await.unwrap().is_some() }
+    };
+
+    assert_eq!(
+        prune(EffectStatus::Committed, minute, 1).await,
+        1,
+        "the limit caps a batch"
+    );
+    assert!(!exists(old_a).await, "lowest id first");
+    assert!(exists(old_b).await);
+    assert_eq!(
+        prune(EffectStatus::Committed, minute, 100).await,
+        1,
+        "only old_b is left to prune: young is too young, leased is leased"
+    );
+    assert!(!exists(old_b).await);
+    assert!(exists(young).await && exists(leased).await);
+    assert_eq!(prune(EffectStatus::Committed, minute, 100).await, 0);
+
+    // Spelled out, not `is_settled`, so the suite does not share the
+    // store's definition.
+    let settled = [
+        EffectStatus::Committed,
+        EffectStatus::Failed,
+        EffectStatus::Rejected,
+        EffectStatus::Compensated,
+    ];
+    for status in ALL_STATUSES.into_iter().filter(|s| !settled.contains(s)) {
+        assert_eq!(
+            prune(status, Duration::ZERO, 100).await,
+            0,
+            "{status} is not settled and is never pruned"
+        );
+    }
+    assert!(exists(unknown).await && exists(escalated).await);
+    assert_eq!(
+        prune(
+            EffectStatus::Failed,
+            Duration::from_secs(200_000_000_000),
+            100
+        )
+        .await,
+        0,
+        "an age older than any record prunes nothing"
+    );
+    assert_eq!(prune(EffectStatus::Failed, minute, 100).await, 1);
+    assert!(!exists(failed).await);
+
+    // The audit trail goes with the record; others keep theirs.
+    assert!(matches!(
+        store.events(old_a).await,
+        Err(StoreError::NotFound(id)) if id == old_a
+    ));
+    assert_eq!(store.events(young).await.unwrap().len(), 2);
+    // The key is free again: the next request is a new effect.
+    assert!(store.get_by_key(&key(0)).await.unwrap().is_none());
+    let again = store.insert_or_get(new_effect(0)).await.unwrap();
+    assert!(again.inserted);
+    assert_ne!(again.record.id, old_a);
+    assert_eq!(again.record.status, EffectStatus::Pending);
+    assert_eq!(store.events(again.record.id).await.unwrap(), Vec::new());
 }

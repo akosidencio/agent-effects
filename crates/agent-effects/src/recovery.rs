@@ -175,7 +175,9 @@ impl<S: EffectStore> Runtime<S> {
         }
     }
 
-    /// Runs [`Self::recover`] every `interval`, forever. Spawn it:
+    /// Runs [`Self::recover`] every `interval`, forever, followed by
+    /// [`Self::prune`] when the runtime has a
+    /// [retention policy](crate::RetentionPolicy). Spawn it:
     ///
     /// ```ignore
     /// tokio::spawn({
@@ -201,6 +203,13 @@ impl<S: EffectStore> Runtime<S> {
                 }
                 Ok(_) => {}
                 Err(e) => warn!(error = %e, "recovery pass failed"),
+            }
+            match self.prune().await {
+                Ok(report) if report.total() > 0 => {
+                    info!(pruned = report.total(), "pruned settled effects");
+                }
+                Ok(_) => {}
+                Err(e) => warn!(error = %e, "pruning failed"),
             }
         }
     }
@@ -283,7 +292,7 @@ impl<S: EffectStore> Runtime<S> {
             }
             Resolution::Retry | Resolution::Compensated => {}
         }
-        let record = self.store().transition(request).await?;
+        let record = self.commit_transition(&record, request).await?;
         info!(effect.id = %id, %transition, "effect resolved by an operator");
         Ok(record)
     }
@@ -343,7 +352,7 @@ impl<S: EffectStore> Runtime<S> {
             });
         }
         request.payload = Some(json!({ "note": note }));
-        let record = self.store().transition(request).await?;
+        let record = self.commit_transition(&record, request).await?;
         info!(effect.id = %id, %transition, "approval decided by an operator");
         Ok(record)
     }
@@ -371,7 +380,7 @@ impl<S: EffectStore> Runtime<S> {
             let mut request =
                 TransitionRequest::new(&record, Some(&lease), Transition::LeaseExpired, self.now());
             request.actor = Some(format!("recovery:{}", self.worker_id()));
-            store.transition(request).await?;
+            self.commit_transition(&record, request).await?;
             info!(
                 effect.id = %id,
                 effect.name = %record.key.name,

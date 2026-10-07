@@ -33,6 +33,8 @@ CREATE TABLE effects (
 
 -- Recovery and pending scans filter by status and lease expiry.
 CREATE INDEX effects_status_lease ON effects (status, lease_expires_at);
+-- Retention prunes settled records by status and age.
+CREATE INDEX effects_status_updated ON effects (status, updated_at);
 
 CREATE TABLE effect_events (
     effect_id   TEXT    NOT NULL REFERENCES effects (id),

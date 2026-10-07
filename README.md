@@ -82,6 +82,11 @@ Also available:
 - **Durable handlers.** Implement `EffectHandler`, `register` it, and
   `runtime.submit::<H>(key, input)`. Recovery then finishes the effect from
   its stored input even if the caller never comes back.
+- **Metrics.** `.observer(OtelObserver::global())` exports the lifecycle as
+  OpenTelemetry metrics; implement `EffectObserver` for anything else.
+- **Redaction.** `Secret<T>` fields are stored as `"[REDACTED]"`, and a
+  `Redactor` such as `RedactKeys` scrubs inputs, outputs, audit notes and
+  error messages before anything is written.
 - **Risk policy.** `.risk(RiskLevel::High)` plus a runtime `RiskPolicy`
   can require approval, verification, or no automatic retries. Rules only
   ever add requirements.
@@ -91,6 +96,12 @@ Also available:
 - **Compensation.** `runtime.compensation(name, key).run(...)` or
   `runtime.compensate::<H>(key)` undoes a committed effect durably, with
   retries and its own idempotency key.
+- **HTTP.** `agent-effects-http` turns a `reqwest` request into an action
+  that sends `Idempotency-Key` and classifies every failure (a timeout after
+  sending is ambiguous, not failed).
+- **Retention.** `.retention(RetentionPolicy::settled(age))` prunes settled
+  records once old enough; anything unresolved is kept. A pruned key is
+  new again.
 - `.retry(policy)`: lifetime attempt budget, backoff with jitter, honours
   `retry_after`.
 - `.attempt_timeout(d)`.
@@ -139,10 +150,13 @@ still applies.
 |---|---|
 | `agent-effects` | The runtime; the crate applications depend on. Features: `testkit` (`FakeRemote`), `fault-injection` (`FaultInjector`). |
 | `agent-effects-sqlite` | SQLite store; several processes may share one file. |
+| `agent-effects-http` | HTTP requests as effects (reqwest): failure classification, `Idempotency-Key`. |
+| `agent-effects-otel` | OpenTelemetry metrics through an `EffectObserver`. |
+| `agent-effects-postgres` | PostgreSQL store for many workers on many hosts; leases use the database's clock. |
 | `agent-effects-memory` | In-memory store for tests and development. |
 | `agent-effects-store` | Storage contract and state machine, for writing new backends; includes the backend conformance suite (`testkit`). |
 
-MSRV: Rust 1.90; `agent-effects-sqlite` needs 1.94 (sqlx).
+MSRV: Rust 1.90; `agent-effects-sqlite` and `agent-effects-postgres` need 1.94 (sqlx).
 
 ## Documentation
 
@@ -150,8 +164,8 @@ MSRV: Rust 1.90; `agent-effects-sqlite` needs 1.94 (sqlx).
   and how to run it in production
 - [Design](docs/design.md): state machine, failure model, store contract,
   decisions log
-- [Roadmap](docs/roadmap.md): v0.2 adds a durable handler registry,
-  compensation, approval, Postgres, HTTP and OpenTelemetry
+- [Roadmap](docs/roadmap.md): what is left before 0.1.0, and the adapters
+  after it
 - [Changelog](CHANGELOG.md)
 
 ## Development
@@ -160,8 +174,12 @@ MSRV: Rust 1.90; `agent-effects-sqlite` needs 1.94 (sqlx).
 cargo test --workspace --all-features
 cargo clippy --workspace --all-targets --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
-cargo +1.90 test --workspace --exclude agent-effects-sqlite --all-features   # MSRV
-cargo +1.94 test -p agent-effects-sqlite                                      # its MSRV (sqlx)
+cargo +1.90 test --workspace --exclude agent-effects-sqlite --exclude agent-effects-postgres --all-features   # MSRV
+cargo +1.94 test -p agent-effects-sqlite -p agent-effects-postgres                                           # their MSRV (sqlx)
+
+# PostgreSQL tests (they skip without a database):
+podman run --rm -d -p 55432:5432 -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=effects postgres:17
+AGENT_EFFECTS_POSTGRES_URL=postgres://postgres:pw@localhost:55432/effects cargo test -p agent-effects-postgres
 ```
 
 ## Releasing

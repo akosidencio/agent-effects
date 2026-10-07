@@ -12,7 +12,10 @@ authors = ["Dennis Paler"]
 
 [workspace.dependencies]
 agent-effects = { path = "crates/agent-effects", version = "0.1.0" }
+agent-effects-http = { path = "crates/agent-effects-http", version = "0.1.0" }
 agent-effects-memory = { path = "crates/agent-effects-memory", version = "0.1.0" }
+agent-effects-otel = { path = "crates/agent-effects-otel", version = "0.1.0" }
+agent-effects-postgres = { path = "crates/agent-effects-postgres", version = "0.1.0" }
 agent-effects-sqlite = { path = "crates/agent-effects-sqlite", version = "0.1.0" }
 agent-effects-store = { path = "crates/agent-effects-store", version = "0.1.0" }
 
@@ -22,7 +25,9 @@ uuid = { version = "1.27.0", features = ["v5", "v7", "serde"] }
 
 serde_json = "1.0.151"
 sha2 = "0.11.0"
-sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
+# Each store crate adds its own driver feature (sqlite / postgres).
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "migrate", "macros"] }
+time = "0.3.55"
 tokio = { version = "1.53.2", default-features = false }
 tracing = "0.1.44"
 

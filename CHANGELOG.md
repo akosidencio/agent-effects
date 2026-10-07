@@ -6,11 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/). Before 1.0, minor
 versions may break the API and the storage format; the release notes say
 when they do.
 
-## [Unreleased]
 
 ## [0.1.0]
-
-First release.
 
 ### `agent-effects`
 
@@ -18,6 +15,17 @@ First release.
   separate capability) is registered via `RuntimeBuilder::register` and run
   with `runtime.submit::<H>(key, input)`. Inputs are stored, so `recover()`
   finishes registered effects after a crash with no caller.
+- **Retention.** `RetentionPolicy` (none by default) prunes settled
+  records per status once old enough, with their audit trail, through
+  `runtime.prune()` and every `run_recovery` round. Unsettled records are
+  never pruned; a pruned key starts a new effect.
+- **Observers.** `EffectObserver` (`on_created`, `on_transition` with
+  durations) sees every recorded effect and stored transition; a panicking
+  observer is contained.
+- **Redaction.** `Secret<T>` is stored as `"[REDACTED]"`. A runtime
+  `Redactor` (`RedactKeys` included) rewrites inputs, outputs, audit payloads
+  and error messages before they are written. Fingerprints are taken after
+  redaction, so secrets are never stored, not even hashed.
 - **Risk policy.** `RiskLevel` per effect, plus `RiskPolicy` /
   `PolicyBuilder` (`for_risk`, `for_kind`, `require_approval`,
   `require_verification`, `disable_automatic_retry`). Requirements only
@@ -85,7 +93,7 @@ First release.
 
 - `EffectStore` trait, `EffectRecord` with the rules as pure operations
   (lease fencing, version checks, transition table, bookkeeping), audit
-  events and `ListQuery`.
+  events, `ListQuery`, and `prune(PruneQuery)` for retention.
 - The state machine `EffectStatus` × `Transition`, checked exhaustively and
   by property tests.
 - The `testkit` feature's backend conformance suite.
@@ -93,6 +101,31 @@ First release.
 ### `agent-effects-memory`
 
 - `MemoryStore`, for tests and development.
+
+### `agent-effects-http`
+
+- `HttpEffect`: a `reqwest` request as an effect's action (`send_json`,
+  `send`) or verification lookup (`verify_json`), sending the effect's
+  idempotency key as `Idempotency-Key`. Failures are classified so a
+  failure is only definite when the request was never sent or the server
+  said it did not apply; timeouts after sending, 409 and most 5xx are
+  ambiguous. `Retry-After` is honoured; `classify_status` overrides per
+  request.
+
+### `agent-effects-otel`
+
+- `OtelObserver`: OpenTelemetry counters, an up/down counter and duration
+  histograms for the effect lifecycle (spec §29 names), attributed by effect
+  name and kind.
+
+### `agent-effects-postgres`
+
+- `PostgresStore` on sqlx 0.9 for many workers on many hosts. It uses the
+  database's clock for leases by default (`ClockSource`), `FOR UPDATE`
+  writes, `FOR UPDATE SKIP LOCKED` recovery scans, and migrations under an
+  advisory lock. Pruning ages records by the database's clock and skips
+  locked rows. It passes the conformance suite and a multi-process test
+  against a real PostgreSQL.
 
 ### `agent-effects-sqlite`
 
@@ -102,12 +135,14 @@ First release.
 
 ### Testing
 
-- Store conformance on both backends.
+- Store conformance on all three backends.
 - A crash suite covering every crash point, in-process and with real
-  process death on SQLite.
-- A model-based property test of the runtime against the transition table.
+  process death on SQLite, including durable handlers finished by recovery
+  alone, approval and compensation.
+- A model-based property test of the runtime against the transition table,
+  covering closures and durable handlers, crashes at every point,
+  recovery, compensation, approval, risk policy, operator decisions,
+  observers, redaction and pruning.
 - A multi-process test on one SQLite file.
 - Mutation checks for each safety rule.
 
-[Unreleased]: https://github.com/akosidencio/agent-effects/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/akosidencio/agent-effects/releases/tag/v0.1.0

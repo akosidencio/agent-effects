@@ -512,6 +512,46 @@ Mutation checks:
 - Skipping the resume step breaks five tests.
 - Blind re-running breaks the unprotected test.
 
+### Retention
+
+Implemented in `retention.rs` (N9). Records are kept forever by default. A
+`RetentionPolicy` on the builder sets, per settled status, how long after
+its last transition a record is kept:
+
+```rust
+Runtime::builder(store)
+    .retention(RetentionPolicy::settled(30 * DAY).failed(7 * DAY))
+    .build();
+```
+
+`runtime.prune()` deletes what the policy allows, in batches of 500 until
+none is left, and returns a `PruneReport` (counts per status).
+`run_recovery` calls it after every recovery pass.
+
+- **Only settled records.** `EffectStatus::is_settled`: `Committed`,
+  `Failed`, `Rejected`, `Compensated`. Everything else is work in progress
+  or waits for a person (`Unknown`, `NeedsIntervention`,
+  `AwaitingApproval`, `CompensationFailed`, …) and is kept however old.
+- **Never under a live lease.** A committed effect whose compensation has
+  just taken the lease is skipped.
+- **Age is time since `updated_at`,** the last transition, so it measures
+  how long the record has been settled.
+- **The audit trail goes with the record.** Applications that must keep it
+  longer export it first (an `EffectObserver`, or `events()`).
+- **Pruning forgets.** The key is free: the next call with it inserts a
+  new record and runs the effect again, and a pruned committed effect can
+  no longer be compensated. Committed records should be kept at least as
+  long as any caller might retry with the same key. This is the same
+  contract a remote system's idempotency keys have, and why there is no
+  default policy.
+
+Tests (`tests/retention.rs`): every settled status pruned at its own age
+and nothing unsettled even after 10,000 hours; the default keeping
+everything; a pruned key running again (the documented trade-off); 1,201
+records pruned in one pass across batches; and `run_recovery` pruning.
+Mutation checks: pruning one batch per pass, dropping the builder's policy,
+and a recovery loop that never prunes each fail a test.
+
 ## 8. Store contract
 
 Lives in `agent-effects-store` (see [§13](#13-crate-layout)).
@@ -527,6 +567,7 @@ pub trait EffectStore: Send + Sync + 'static {
     fn transition(&self, request: TransitionRequest) -> impl Future<Output = Result<EffectRecord, StoreError>> + Send;
     fn list(&self, query: ListQuery) -> impl Future<Output = Result<Vec<EffectRecord>, StoreError>> + Send;
     fn events(&self, id: EffectId) -> impl Future<Output = Result<Vec<EffectEvent>, StoreError>> + Send;
+    fn prune(&self, query: PruneQuery) -> impl Future<Output = Result<u64, StoreError>> + Send;
 }
 ```
 
@@ -559,19 +600,27 @@ backend therefore enforces identical semantics:
 - `list(ListQuery)` filters by status, by "no live lease at time T", and by
   an id cursor, ordered by id (UUIDv7, so creation order).
   `ListQuery::expired_leases(now)` is the recovery scan.
+- `prune(PruneQuery)` deletes up to `limit` records, lowest id first, in
+  one settled status, last changed at least `older_than` before `now` and
+  with no live lease at `now` (`PruneQuery::matches`), with their audit
+  events, atomically per record. A query for an unsettled status deletes
+  nothing. The age is a duration, not a cutoff, so a store with its own
+  clock applies it to that clock.
 - `now` is passed in from the runtime's `Clock`. Stores must keep at least
-  millisecond precision. *(v0.2: Postgres uses database `now()` to remove
-  cross-host clock skew.)*
+  millisecond precision. `PostgresStore` uses the database's clock instead
+  by default, removing cross-host clock skew ([§9b](#9b-storage-postgresql-via-sqlx)).
 
 Every backend must pass `agent_effects_store::testkit::conformance` (the
-`testkit` feature). It runs 16 cases: read-back of all fields, key
+`testkit` feature). It runs 17 cases: read-back of all fields, key
 idempotency, 16-way concurrent inserts, missing records, lease exclusivity,
 takeover fencing, strict renewal, release, a full transition history with its
 events, rejected transitions leaving no trace, lease-less operator
 resolution, terminal finality, listing/paging, and persisting
 `may_have_applied` while refusing `FailedDefinitively` under it, and the
 compensation lifecycle (attempt counter, retry schedule, operator retry), and
-approval (`approved` persisted; denial rejects). Its sensitivity was checked
+approval (`approved` persisted; denial rejects), and pruning (only settled,
+idle, old records, lowest id first within the limit, events removed, the
+key freed for a new record). Its sensitivity was checked
 by breaking `MemoryStore` on purpose: ignoring the unique key, or persisting
 the event without the record. The suite caught both.
 
@@ -634,6 +683,7 @@ CREATE TABLE effects (
     UNIQUE (effect_name, logical_key)
 );
 CREATE INDEX effects_status_lease ON effects (status, lease_expires_at);
+CREATE INDEX effects_status_updated ON effects (status, updated_at);  -- retention
 
 CREATE TABLE effect_events (
     effect_id   TEXT    NOT NULL REFERENCES effects (id),
@@ -665,19 +715,109 @@ Mutation checks:
 - A deferred `BEGIN` breaks the multi-process test.
 - Dropping `ON CONFLICT` breaks conformance and reopening.
 - Dropping the lease filter from `list` breaks conformance.
+- Pruning selects and deletes under the same `BEGIN IMMEDIATE`. Dropping
+  its lease filter, or leaving audit events behind (the foreign key
+  refuses), breaks conformance.
+
+## 9b. Storage: PostgreSQL via sqlx
+
+`agent-effects-postgres`, built in N5 for services with many workers on many
+hosts. It depends on `agent-effects-store` only, and runs the same pure
+`EffectRecord` operations as every store.
+
+- **The database's clock (default, `ClockSource::Database`).** Lease
+  liveness, expiry and takeover, transition timestamps, and the "no live
+  lease" filter of scans all use Postgres's `clock_timestamp()`, not the
+  calling worker's clock. Workers with skewed clocks still agree on who
+  holds a lease. This removes the clock-skew limit leases have on other
+  stores. Retry schedules (`next_attempt_at`) are still the worker's.
+  `ClockSource::Caller` restores caller time, which the conformance suite
+  needs to drive time.
+- **Writes.** Every write loads the row `SELECT … FOR UPDATE` (with
+  `clock_timestamp()` in the same statement), applies the operation, and
+  saves it in one transaction. The `UPDATE` also checks the version it read.
+- **Scans.** Recovery and pending scans (queries with a lease filter) end
+  `FOR UPDATE SKIP LOCKED`, so rows another worker is changing right now are
+  skipped, not waited on.
+- **Pruning.** One statement: a `FOR UPDATE SKIP LOCKED` selection, then
+  deletes of its events and rows. With the database clock, both the age and
+  lease liveness are measured against `clock_timestamp()`.
+- **Schema and migrations.** Real types (`UUID`, `JSONB`, `TIMESTAMPTZ`,
+  `BOOLEAN`), with times kept at millisecond precision like SQLite. Its own
+  migrations (`crates/agent-effects-postgres/migrations`) run under sqlx's
+  advisory lock, so concurrent startups are safe.
+- **Tests.** They run against a real Postgres (`AGENT_EFFECTS_POSTGRES_URL`)
+  and skip without one. CI's `postgres` job runs them against a service
+  container with `AGENT_EFFECTS_REQUIRE_POSTGRES=1`, so a missing database
+  fails rather than skips. Each test works in its own schema:
+  - the conformance suite;
+  - the database-clock test: workers an hour behind and ahead still see
+    one lease;
+  - a lock-skipping scan test;
+  - pruning by the database's clock (a caller a day ahead prunes nothing
+    just settled) that skips locked rows;
+  - the runtime replaying across pools;
+  - three worker processes running 150 effects with no duplicates.
+
+  Mutation checks: the worker-clock-only, no-row-lock and no-`SKIP LOCKED`
+  mutations (on scans and on pruning) each fail the matching test.
 
 ## 10. Sensitive data
 
-Inputs are persisted. With closures, persisting is only for fingerprinting and
-audit. With the planned registry, it is also for re-execution. Therefore:
+Implemented in `redaction.rs` (N6). The runtime persists four kinds of
+value, and each can leak:
 
-- **Credentials belong in the closure or handler, never in the input.**
-- Audit payloads and outputs go through a redaction hook (`Secret<T>`
-  serializes as `"[REDACTED]"`). A derive macro may come later. v0.1 has no
-  macros.
-- Records are kept until a retention policy prunes them *(planned)*. Pruning
-  a key frees it, so a later call with that key starts a new effect. This
-  matches how remote idempotency keys expire.
+| Value | Kept for | Read back by |
+|---|---|---|
+| input | identity (fingerprint), audit | handler recovery |
+| output | audit | later callers (replay) |
+| audit payloads | audit | operators |
+| error messages | audit | callers and operators (they often echo tokens back) |
+
+- **`Secret<T>` is the default protection.** It serializes as
+  `"[REDACTED]"`, so a secret field in an input or output never reaches the
+  store. Its `Debug` and `Display` print `[REDACTED]`. The action holds the
+  real value in memory. Reading a `Secret` back from storage yields a
+  redacted one (`expose()` → `None`, `is_redacted()`), for any stored shape.
+- **A `Redactor` on the runtime** (`RuntimeBuilder::redactor`) rewrites all
+  four kinds of value before anything is written. It receives the field
+  (`Input`, `Output`, `AuditPayload`, `ErrorMessage`) and the effect name.
+  Any `Fn(Field, &EffectName, &mut Value)` qualifies. `RedactKeys` masks
+  named object fields at any depth, case-insensitively.
+- **Where it applies.** Inputs are redacted in `execute`. Outputs, payloads
+  and errors are redacted at the one place every transition passes through
+  (`transition_leased`), and in recovery's marking, `resolve` and
+  `approve`/`deny`. Approvers are shown the stored, redacted input.
+- **Identity.** The fingerprint is taken after redaction, so secrets are not
+  part of an effect's identity: a rotated token is the same effect, and a
+  secret is never stored, not even hashed. A resumed effect brings its
+  stored input and fingerprint, flagged as already stored, and is not
+  redacted or fingerprinted again.
+- **Limits.** What is redacted cannot be replayed or resumed: the caller
+  that ran the effect gets the real output, a replay gets the stored one, and
+  a resumed handler gets the redacted input. Credentials therefore belong in
+  the closure's captured state or in the handler, never in the input.
+- **Retention.** Records, including redacted ones, are kept until a
+  [retention policy](#retention) prunes them with their audit trail.
+  Pruning a key frees it, so a later call with that key starts a new
+  effect, as remote idempotency keys expire too.
+
+Tests (`tests/redaction.rs`):
+
+- a secret input reaching the action but stored redacted;
+- a rotated secret counting as the same effect, while another field still
+  does not;
+- a secret output reaching its caller but replaying redacted;
+- `RedactKeys` on inputs, action outputs, `Resolution::Applied` outputs and
+  operator notes;
+- an error message echoing a key, redacted;
+- the approver seeing only redacted input;
+- a redacted field never hashed into the identity.
+
+Each test scans everything stored about the effect (record and audit trail)
+for the secret. Mutation checks, each failing a test: fingerprinting before
+redaction, skipping redaction on transitions, and skipping it on operator
+decisions.
 
 ## 11. Crash points
 
@@ -716,18 +856,40 @@ Three suites cover it:
   SQLite file and a remote whose state is a file. The parent asserts the
   child died exactly when the point was reachable, then waits out the lease,
   recovers and re-runs. For a kill while the request is in flight, it allows
-  that the request may not have left yet.
+  that the request may not have left yet. Three more modes (N10):
+  - **Durable handler**, the same matrix with nobody calling again: the
+    parent only runs `recover()`, which must leave the effect `Committed`
+    (created once) or, for an unprotected effect in doubt,
+    `NeedsIntervention` (created at most once).
+  - **Killed after asking for approval**: the request survives, recovery
+    leaves it alone, an operator approves, and recovery runs it once.
+  - **Killed mid-compensation**: recovery finishes the undo, exactly once.
 - **`tests/model.rs`** (model-based, 512 cases per run). Proptest generates
-  random effect configurations, `FakeRemote` scripts, and sequences of
-  calls, crashes at random points, lease expiries and recovery passes. After
-  each case:
+  random effect configurations (closure or durable handler, kind,
+  verification, remote idempotency, approval, a no-retry risk policy),
+  `FakeRemote` scripts, and sequences of calls, crashes at every point
+  including after an approval request, lease expiries, recovery passes,
+  compensations (with crashes), operator approvals and denials, truthful
+  operator resolutions, and pruning. A prune that removes the record starts
+  a new generation against a fresh remote. Before each prune and after the
+  last step:
   - the audit trail must replay through the transition table from `Pending`
     with contiguous sequence numbers, ending at the record's status and
     version;
   - an effect that is not naturally idempotent must have been created at
     most once;
   - `Committed` implies created, and `Failed` (for such effects) implies not
-    created.
+    created;
+  - no automatic retry under a no-retry policy, no attempt before approval,
+    nothing created after a denial, nothing cancelled before compensation
+    started, `Compensated` implies the resource is gone;
+  - observers saw exactly the audit trail, crashes or not (a transition is
+    stored and observed in one step; crashes strike between steps);
+  - a `Secret` in the input appears nowhere in the record or trail.
+
+  Every prune must remove exactly the records that are settled and under no
+  live lease. The model spells "settled" out rather than calling
+  `is_settled`, so it does not share the code's definition.
 
 Mutation checks:
 
@@ -735,13 +897,116 @@ Mutation checks:
 - Blind re-running of unknown outcomes fails exactly the three in-doubt
   points, in both crash suites, and the model test (shrunk to a duplicate).
 - Recording ambiguous failures as `Failed` fails the model test.
+- N10: a `Secret` that serializes its value, recovery marking `Unknown`
+  without notifying observers, and an unobserved transition each fail the
+  model test; recovery that never resumes, or leaves interrupted
+  compensations alone, fails the subprocess suite; treating
+  `NeedsIntervention` as settled fails conformance. A lease-blind prune
+  survives the model (it never builds a committed record under a live
+  lease) and fails conformance.
 
 ## 12. Observability
 
-`tracing` spans named `agent_effect.execute`, with fields `effect.id`,
-`effect.name`, `effect.kind`, `effect.status`, `effect.logical_key`,
-`effect.attempt`. Metrics and OpenTelemetry come in v0.2. The most
-important signal is the count of effects in `Unknown`.
+**Traces.** `tracing` spans `agent_effect.execute` (fields `effect.id`,
+`effect.name`, `effect.kind`, `effect.risk_level`, `effect.status`,
+`effect.logical_key`, `effect.attempt`) and `agent_effect.compensate`.
+They export through `tracing-opentelemetry` like any other spans.
+
+**Metrics (N7).** An `EffectObserver` (`RuntimeBuilder::observer`, any
+number of them) receives two calls:
+
+- `on_created(record)` when a new effect is recorded;
+- `on_transition(observation)` after each transition is stored.
+
+Every transition is written through one function, `commit_transition`
+(redact, store, notify), so calls, recovery, compensation, approval and
+operator decisions are all observed. An `Observation` carries the record
+after the transition, the transition with its `from` and `to` status,
+`in_previous_status` (an attempt's duration when leaving `Executing`, time
+spent unknown when leaving `Unknown`) and `since_created`. Observers run
+synchronously; one that panics is caught and logged, because the
+transition is already stored. Levels (like effects awaiting approval) are
+deltas since the observer started; `pending()` gives exact numbers.
+
+`agent-effects-otel` implements the observer with OpenTelemetry metrics
+(`OtelObserver::global()` or `::new(&meter)`). Its instruments are
+`agent_effects.started`, `.completed`, `.failed`, `.rejected`, `.unknown`,
+`.needs_intervention`, `.retry.count`, `.compensation.{started,completed,failed}`,
+the `.pending_approval` up/down counter, and histograms in seconds:
+`.duration`, `.attempt.duration` (tagged `outcome`) and `.unknown.duration`.
+Attributes are `effect.name` and `effect.kind`, never the logical key, which
+is unbounded and may identify customers. The most important signal is
+`agent_effects.unknown`: a spike means remote systems are answering
+ambiguously.
+
+Tests:
+
+- `tests/observer.rs`: exact sequences and durations on paused time, with
+  replays observing nothing new; recovery, operator decisions and time spent
+  unknown; approval and compensation; and a panicking observer that breaks
+  nothing while other observers still see everything.
+- `agent-effects-otel/tests/metrics.rs`: every instrument's value read back
+  through the OpenTelemetry SDK's in-memory exporter.
+
+Mutation checks: uncontained observer panics, and recovery bypassing
+`commit_transition`, each fail a test.
+
+## 12b. HTTP effects
+
+`agent-effects-http` turns a `reqwest` request into an effect's action.
+`HttpEffect::post(&client, url).json(&body)` builds it; `.send_json::<T>()`
+or `.send()` makes the action, `.verify_json::<T>()` a lookup for
+`.verify(...)`. `.idempotency_key_header()` sends `ctx.idempotency_key()`
+as `Idempotency-Key` (`.idempotency_header(name)` for providers that call
+it something else), the same value on every attempt, worker and restart.
+The crate enables no reqwest features; TLS comes from the application's own
+`reqwest` dependency and the `Client` it passes in.
+
+Classification follows one rule: a failure is definite only when the
+request provably never reached the server, or the server's answer says it
+did not apply.
+
+| Outcome | Class |
+|---|---|
+| connect, DNS or TLS failure | Transient (`request_sent(false)`) |
+| invalid URL or header | Validation, nothing sent |
+| timeout or connection lost after sending | Ambiguous |
+| 2xx with an unreadable or unparseable body | Ambiguous: it applied, the answer was lost |
+| 408, 425, 503 | Transient |
+| 429, or 503 with `Retry-After` | RateLimited, honouring `Retry-After` (seconds or HTTP date) |
+| 400, 422 | Validation |
+| 401 / 403 | Authentication / Authorization |
+| 409, 500, 502, 504, other 5xx | Ambiguous |
+| 501, other 4xx | Permanent |
+
+409 is ambiguous because idempotency-key providers answer it while a
+request with the same key is still in flight. 500, 502 and 504 may come
+from a gateway after the origin applied the request. `.classify_status(f)`
+overrides the table per request for a provider that documents otherwise.
+Error messages keep at most 512 bytes of the response body, and pass
+through the runtime's `Redactor` like any other.
+
+`verify_json` returns `NotApplied` only for 404 and 410. Any other failure
+of the lookup (a 405, a 500, a timeout) is an error, which the runtime
+treats as inconclusive: a lookup that is broken must never be read as
+"the effect did not happen", since that re-runs it.
+
+Tests (`agent-effects-http/tests/http.rs`) run against a small local
+HTTP/1.1 server that applies POSTs, deduplicates them by
+`Idempotency-Key`, and can drop the connection after applying or hang:
+
+- a success sends the JSON body, headers and the effect's key;
+- every status in the table reaches the runtime as its class;
+- a refused connection is Transient; a timeout after sending is Ambiguous;
+- a dropped answer is re-sent under the same key and applied once;
+- a lookup confirms a dropped answer without re-sending; a 404 lookup lets
+  a lost request run again; a 405 lookup leaves the effect `Unknown`;
+- a 2xx with an unparseable body is Ambiguous; an invalid header sends
+  nothing.
+
+Mutation checks: treating connect errors as sent, dropping the idempotency
+header, ignoring the timeout, and reading a 405 lookup or never reading a
+404 lookup as not applied each fail a test.
 
 ## 13. Crate layout
 
@@ -749,15 +1014,15 @@ important signal is the count of effects in `Unknown`.
 agent-effects/
 ├── crates/
 │   ├── agent-effects            runtime: effect, runtime, state*, retry, policy,
-│   │                            verification, compensation (v0.2), clock
+│   │                            verification, compensation, retention, clock
 │   ├── agent-effects-store      the contract: ids, kinds, failure classes, state
 │   │                            machine, records, leases, EffectStore, testkit
 │   ├── agent-effects-memory     MemoryStore
 │   ├── agent-effects-sqlite     SqliteStore (sqlx)
-│   ├── agent-effects-postgres   (v0.2)
-│   ├── agent-effects-http       (v0.2)
-│   ├── agent-effects-otel       (v0.2)
-│   └── agent-effects-mcp        (v0.3)
+│   ├── agent-effects-postgres   PostgresStore (sqlx), database-clock leases
+│   ├── agent-effects-http       HttpEffect: reqwest actions, classification, Idempotency-Key
+│   ├── agent-effects-otel       OtelObserver: OpenTelemetry metrics
+│   └── agent-effects-mcp        (planned)
 ├── examples/                    unpublished workspace member: payment, agent_tool
 ├── (tests)                      per crate today: crates/*/tests (crash, model, multi-process, …)
 └── docs/
@@ -812,6 +1077,11 @@ Crates are added when their milestone starts, not as empty placeholders.
 | D32 | 2026-10-06 | Compensation: `Committed → Compensating → Compensated / CompensationFailed`, idempotent attempts retried with no `Unknown` state, a separate compensation idempotency key, `CompensableEffect` + closure API, recovery resumes compensable handlers; `Committed` is no longer terminal | Spec §16: compensation is a durable operation with attempts, timestamps, errors and an idempotency id, never "try once, ignore the error" |
 | D33 | 2026-10-06 | Approval: `Pending → AwaitingApproval` after the precondition, before the first attempt; `ApprovalProvider` (`Approved`/`Denied`/`Deferred`) asked per call; operator `approve`/`deny`; `approved` persisted so it is asked once; precondition re-checked after approval; recovery never decides | Spec §24: approval survives restarts; a decision that took hours must not act on stale state |
 | D34 | 2026-10-07 | Risk policy (spec §25): `RiskLevel` per effect; `RiskPolicy` rules select by risk, kind or both; requirements are the union of all matching rules plus the effect's own (monotonic, order-free); unmet `require_verification` refuses before recording; `disable_automatic_retry` gates every self-initiated re-run but not operator retries | "Defined precedence" that cannot surprise: no combination of rules can make an effect less guarded than any single rule says |
+| D35 | 2026-10-07 | `agent-effects-postgres`: database clock by default (`ClockSource`), `FOR UPDATE` writes, `FOR UPDATE SKIP LOCKED` scans, MSRV 1.94; sqlx driver features moved into each store crate | Cross-host clock skew is the one lease weakness a shared database can remove; scans should never queue behind live work |
+| D36 | 2026-10-07 | Redaction: `Secret<T>` (serializes as `"[REDACTED]"`, reads back redacted) plus a runtime `Redactor` over inputs, outputs, audit payloads and error messages; fingerprint after redaction; resumed inputs flagged as already stored | Spec §27: the audit log never stores secrets by default. A secret hashed into a fingerprint is still a stored secret |
+| D37 | 2026-10-07 | Every transition goes through `commit_transition` (redact, store, notify); `EffectObserver` with `on_created` / `on_transition` and durations derived from `updated_at`; observer panics contained; `agent-effects-otel` instruments named per spec §29, never keyed by logical key | One choke point means no path can skip redaction or metrics; derived durations need no extra columns |
+| D38 | 2026-10-07 | `agent-effects-http`: `HttpEffect` builder over a caller-supplied `reqwest::Client` with no reqwest features; definite failures only when provably not sent or answered as not applied (409/500/502/504 ambiguous); `verify_json` reads only 404/410 as not applied | Misclassifying in the definite direction duplicates effects; misclassifying toward ambiguous only costs a verification or an operator |
+| D39 | 2026-10-07 | Retention: `RetentionPolicy` per settled status (none by default); `EffectStore::prune(PruneQuery)` with the age as a duration, never under a live lease, audit trail deleted with the record; `prune()` loops batches of 500; `run_recovery` prunes | Pruning forgets keys, so it must be opted into; a duration lets Postgres age by its own clock; unsettled records are work or wait for a person and are never pruned |
 
 ## Open questions
 

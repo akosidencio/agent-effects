@@ -74,7 +74,6 @@ use crate::compensation::{
 };
 use crate::effect::{EffectContext, EffectFailure, EffectOutcome, EffectSpec, Precondition};
 use crate::error::RuntimeError;
-use crate::fingerprint::fingerprint;
 use crate::id::{EffectKey, EffectName, LogicalKey};
 use crate::kind::EffectKind;
 use crate::policy::{Capabilities, RiskLevel};
@@ -350,9 +349,11 @@ impl<'a, S: EffectStore, H: EffectHandler> IntoFuture for Submission<'a, S, H> {
             let key = EffectKey::new(EffectName::new(H::NAME)?, LogicalKey::new(self.key)?);
             let json = serde_json::to_value(&self.input).map_err(RuntimeError::Input)?;
             let stored = Stored {
-                fingerprint: Some(fingerprint(&json)),
+                // Computed by the runtime, after redaction.
+                fingerprint: None,
                 json,
                 actor: self.actor,
+                from_record: false,
             };
             run(self.runtime, &handler, key, Arc::new(self.input), stored).await
         })
@@ -397,6 +398,7 @@ async fn resume<S: EffectStore, H: EffectHandler>(
         json,
         fingerprint: record.input_fingerprint.clone(),
         actor: record.created_by.clone(),
+        from_record: true,
     };
     run(
         runtime,
@@ -419,6 +421,8 @@ struct Stored {
     json: Value,
     fingerprint: Option<String>,
     actor: Option<String>,
+    /// From an existing record: already redacted, fingerprint kept as is.
+    from_record: bool,
 }
 
 /// Runs `handler`'s effect through the same machinery as a closure effect.
@@ -458,6 +462,7 @@ async fn run<S: EffectStore, H: EffectHandler>(
         require_approval: effect.requires_approval(),
         risk: effect.risk(),
         automatic_retry: true,
+        input_stored: stored.from_record,
     };
     let action = {
         let (effect, input) = (Arc::clone(&effect), Arc::clone(&input));

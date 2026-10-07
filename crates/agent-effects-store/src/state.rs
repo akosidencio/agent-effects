@@ -68,6 +68,20 @@ impl EffectStatus {
         matches!(self, Self::Failed | Self::Rejected | Self::Compensated)
     }
 
+    /// Whether nothing is left to do without a new request: the effect
+    /// committed, failed, was rejected or was undone. Only settled records
+    /// may be pruned ([`PruneQuery`](crate::PruneQuery)).
+    ///
+    /// Unlike [`Self::is_terminal`] this includes `Committed`, whose
+    /// compensation would be a new request. `CompensationFailed` is not
+    /// settled: it waits for an operator.
+    pub const fn is_settled(self) -> bool {
+        matches!(
+            self,
+            Self::Committed | Self::Failed | Self::Rejected | Self::Compensated
+        )
+    }
+
     /// Whether the effect may have changed the outside world without the
     /// runtime knowing the result, so it must not simply be started again.
     pub const fn is_in_doubt(self) -> bool {

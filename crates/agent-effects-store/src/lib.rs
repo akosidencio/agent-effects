@@ -108,6 +108,17 @@ pub trait EffectStore: Send + Sync + 'static {
         &self,
         id: EffectId,
     ) -> impl Future<Output = Result<Vec<EffectEvent>, StoreError>> + Send;
+
+    /// Deletes up to `query.limit` records matching `query`, lowest id
+    /// first, together with their audit events, and returns how many it
+    /// deleted. Each record is checked and deleted atomically, so a record
+    /// that a worker leases or changes concurrently is either deleted before
+    /// that change or not at all.
+    ///
+    /// A deleted key is free: the next `insert_or_get` for it inserts a new
+    /// record. A query for a status that is not
+    /// [settled](EffectStatus::is_settled) deletes nothing.
+    fn prune(&self, query: PruneQuery) -> impl Future<Output = Result<u64, StoreError>> + Send;
 }
 
 /// A new effect to record.
@@ -254,6 +265,62 @@ pub struct EffectEvent {
     pub payload: Option<Value>,
     /// When it happened.
     pub at: SystemTime,
+}
+
+/// Which records [`EffectStore::prune`] deletes: those in a settled
+/// `status` that last changed at least `older_than` before `now` and hold no
+/// live lease at `now`.
+///
+/// The age is a duration, not a cutoff time, so a store that reads its own
+/// clock (like PostgreSQL's) can apply it to that clock.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PruneQuery {
+    /// The status to prune. Must be [settled](EffectStatus::is_settled).
+    pub status: EffectStatus,
+    /// The minimum time since the record's last transition (`updated_at`).
+    pub older_than: Duration,
+    /// The current time.
+    pub now: SystemTime,
+    /// At most this many records.
+    pub limit: usize,
+}
+
+impl PruneQuery {
+    /// The default batch size.
+    pub const DEFAULT_LIMIT: usize = 500;
+
+    /// Records in `status` settled at least `older_than` before `now`.
+    pub fn new(status: EffectStatus, older_than: Duration, now: SystemTime) -> Self {
+        Self {
+            status,
+            older_than,
+            now,
+            limit: Self::DEFAULT_LIMIT,
+        }
+    }
+
+    /// Caps the batch size.
+    #[must_use]
+    pub fn limit(mut self, limit: usize) -> Self {
+        self.limit = limit;
+        self
+    }
+
+    /// The latest `updated_at` a record may have to be pruned, or `None` if
+    /// that time cannot be represented (nothing is that old).
+    pub fn cutoff(&self) -> Option<SystemTime> {
+        self.now.checked_sub(self.older_than)
+    }
+
+    /// Whether `record` should be pruned (ignoring `limit`).
+    pub fn matches(&self, record: &EffectRecord) -> bool {
+        self.status.is_settled()
+            && record.status == self.status
+            && self
+                .cutoff()
+                .is_some_and(|cutoff| record.updated_at <= cutoff)
+            && record.live_lease_owner(self.now).is_none()
+    }
 }
 
 /// A filter for [`EffectStore::list`].

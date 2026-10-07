@@ -38,8 +38,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent_effects_store::{
     EffectEvent, EffectId, EffectKey, EffectKind, EffectName, EffectRecord, EffectStatus,
-    EffectStore, ErrorRecord, InsertOutcome, Lease, ListQuery, LogicalKey, NewEffect, StoreError,
-    Transition, TransitionRequest, WorkerId,
+    EffectStore, ErrorRecord, InsertOutcome, Lease, ListQuery, LogicalKey, NewEffect, PruneQuery,
+    StoreError, Transition, TransitionRequest, WorkerId,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -320,6 +320,45 @@ impl EffectStore for SqliteStore {
         .iter()
         .map(decode_event)
         .collect()
+    }
+
+    async fn prune(&self, query: PruneQuery) -> Result<u64, StoreError> {
+        let Some(cutoff) = query.cutoff().filter(|_| query.status.is_settled()) else {
+            return Ok(0);
+        };
+        // Selected and deleted under one write lock: nothing can lease or
+        // change a selected record in between.
+        let mut tx = self.begin().await?;
+        let ids: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM effects WHERE status = ? AND updated_at <= ? \
+             AND (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?) \
+             ORDER BY id LIMIT ?",
+        )
+        .bind(query.status.as_str())
+        .bind(to_ms(cutoff))
+        .bind(to_ms(query.now))
+        .bind(i64::try_from(query.limit).unwrap_or(i64::MAX))
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(StoreError::backend)?;
+        for chunk in ids.chunks(500) {
+            let marks = vec!["?"; chunk.len()].join(", ");
+            for (table, column) in [("effect_events", "effect_id"), ("effects", "id")] {
+                // Only placeholders are interpolated; every value is bound.
+                let mut statement = sqlx::query(AssertSqlSafe(format!(
+                    "DELETE FROM {table} WHERE {column} IN ({marks})"
+                )));
+                for id in chunk {
+                    statement = statement.bind(id.as_str());
+                }
+                statement
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(StoreError::backend)?;
+            }
+        }
+        tx.commit().await.map_err(StoreError::backend)?;
+        Ok(ids.len() as u64)
     }
 }
 

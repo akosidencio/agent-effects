@@ -1,0 +1,27 @@
+[package]
+name = "agent-effects-http"
+description = "HTTP effects for agent-effects: reqwest failures classified, Idempotency-Key sent"
+keywords = ["agents", "idempotency", "side-effects", "http", "reqwest"]
+categories = ["asynchronous", "web-programming::http-client"]
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+agent-effects.workspace = true
+httpdate = "1.0.3"
+# No features: the caller's own reqwest dependency decides TLS and the rest.
+reqwest = { version = "0.13.5", default-features = false }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+agent-effects-memory.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync"] }
+
+[lints]
+workspace = true

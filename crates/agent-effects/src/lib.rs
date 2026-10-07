@@ -39,12 +39,17 @@
 //! # }
 //! ```
 //!
-//! **Status:** pre-release. The runtime runs effects with retries,
-//! timeouts, preconditions and verification, records their outcome, and
-//! re-attaches later calls to it; [`recovery`] adds the operator tools. The
-//! SQLite store comes next; see `docs/roadmap.md`. The persisted vocabulary
-//! (identity, kinds, the state machine) and the [`EffectStore`] contract come
-//! from [`agent-effects-store`](store) and are re-exported here.
+//! Beyond running effects with retries, timeouts, preconditions and
+//! verification, the runtime finishes registered [handlers](handler)
+//! without a caller after a crash ([`recovery`]), undoes effects
+//! ([`compensation`]), waits for [`approval`], applies a risk [`policy`],
+//! keeps secrets out of storage ([`redaction`]), reports metrics to
+//! [observers](observer), and prunes old records ([`retention`]).
+//!
+//! Stores: `agent-effects-memory` (tests), `agent-effects-sqlite`,
+//! `agent-effects-postgres`. The persisted vocabulary (identity, kinds, the
+//! state machine) and the [`EffectStore`] contract come from
+//! [`agent-effects-store`](store) and are re-exported here.
 
 pub mod approval;
 pub mod clock;
@@ -53,8 +58,11 @@ pub mod effect;
 pub mod error;
 pub mod fault;
 pub mod handler;
+pub mod observer;
 pub mod policy;
 pub mod recovery;
+pub mod redaction;
+pub mod retention;
 pub mod retry;
 pub mod runtime;
 #[cfg(feature = "testkit")]
@@ -79,8 +87,11 @@ pub use error::RuntimeError;
 pub use handler::{
     CompensableEffect, CompensationSubmission, EffectHandler, Handler, Submission, VerifiableEffect,
 };
+pub use observer::{EffectObserver, Observation};
 pub use policy::{Capabilities, PolicyBuilder, Requirements, RiskLevel, RiskPolicy, UnknownPlan};
 pub use recovery::{RecoveryReport, Resolution};
+pub use redaction::{RedactKeys, Redactor, Secret};
+pub use retention::{PruneReport, RetentionPolicy};
 pub use retry::RetryPolicy;
 pub use runtime::{Runtime, RuntimeBuilder};
 pub use verification::{NotFoundReading, Verification, VerificationMode};

@@ -13,7 +13,6 @@ use serde_json::Value;
 
 use crate::error::RuntimeError;
 use crate::failure::FailureClass;
-use crate::fingerprint::fingerprint;
 use crate::id::{EffectId, EffectKey, IdempotencyKey};
 use crate::kind::EffectKind;
 use crate::policy::{Capabilities, RiskLevel};
@@ -442,7 +441,8 @@ impl<S: EffectStore, V> EffectBuilder<S, V> {
         );
         let input = self.input.transpose().map_err(RuntimeError::Input)?;
         let spec = EffectSpec {
-            fingerprint: input.as_ref().map(fingerprint),
+            // Computed by the runtime, after redaction.
+            fingerprint: None,
             input,
             key,
             capabilities: Capabilities {
@@ -457,6 +457,7 @@ impl<S: EffectStore, V> EffectBuilder<S, V> {
             require_approval: self.require_approval,
             risk: self.risk,
             automatic_retry: true,
+            input_stored: false,
         };
         self.runtime.execute(spec, action, self.verifier).await
     }
@@ -477,4 +478,7 @@ pub(crate) struct EffectSpec {
     /// Whether the runtime may retry or re-run on its own; a risk policy
     /// can turn it off.
     pub(crate) automatic_retry: bool,
+    /// The input comes from the store (a resumed effect): it is already
+    /// redacted, and `fingerprint` is the stored one, used as is.
+    pub(crate) input_stored: bool,
 }

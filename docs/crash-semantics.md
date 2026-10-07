@@ -85,12 +85,18 @@ From `Unknown`, a later call with the same key does one of these:
 - **Give operators `resolve`.**
   `runtime.resolve(id, Resolution::{Applied, NotApplied, Retry}, actor, note)`
   records a person's decision and the reason in the audit trail.
+- **Watch `agent_effects.unknown`.** Add `OtelObserver` (`agent-effects-otel`)
+  or your own `EffectObserver`. A rise in unknown outcomes means a remote
+  system is answering ambiguously, before it turns into a queue of
+  operator work.
 - **Set a risk policy.** `RuntimeBuilder::risk_policy` can demand approval,
   verification, or no automatic retries by risk level and effect kind.
   Requirements only add up: no rule can loosen another.
 - **Prefer idempotency keys.** Forward `ctx.idempotency_key()`. It is stable
   across attempts, workers and restarts. Then declare
-  `.remote_idempotency(true)`.
+  `.remote_idempotency(true)`. For HTTP APIs, `agent-effects-http` does
+  both the forwarding (`.idempotency_key_header()`) and the failure
+  classification.
 - **Verify with the right mode.** Use `.verify(...)` only if the lookup
   reads its own writes. For search or list APIs that lag, use
   `.verify_eventually(settle, ...)`, with `settle` longer than the lag.
@@ -100,12 +106,24 @@ From `Unknown`, a later call with the same key does one of these:
   default) is presumed dead. Keep it well above any pause your process can
   have (GC, VM migration, a blocked executor), and above the clock skew
   between machines.
-- **Use a durable store.** `MemoryStore` loses everything with the process.
-  It is for tests. `SqliteStore` commits with `synchronous = FULL`, because
-  the record of an attempt must survive a power cut too.
-- **Keep credentials out of inputs.** Inputs are stored as given, for
-  fingerprinting and audit. Capture credentials in the action closure
-  instead.
+- **Use a durable store.**
+  - `MemoryStore` loses everything with the process; it is for tests.
+  - `SqliteStore` suits a single host. It commits with `synchronous = FULL`,
+    because the record of an attempt must survive a power cut too.
+  - For many workers on many hosts, use `PostgresStore`: leases use the
+    database's clock, and scans skip rows in use.
+- **Choose a retention policy.** Records are kept forever by default.
+  `RuntimeBuilder::retention(RetentionPolicy::settled(age))` prunes settled
+  records (`run_recovery` does it every round, or call `runtime.prune()`).
+  Keep committed records longer than any caller might retry with the same
+  key: a pruned key runs again.
+- **Keep secrets out of storage.**
+  - Capture credentials in the action closure or the handler, not the input.
+  - Wrap any secret that must travel in an input or output in `Secret<T>`;
+    it is stored as `"[REDACTED]"`.
+  - Add a `Redactor` (e.g. `RedactKeys::new(["card_number"])`) to mask
+    fields and scrub error messages before they are written.
+  - Redacted values cannot be replayed or resumed with their original value.
 
 ## Known limits
 
@@ -115,11 +133,13 @@ From `Unknown`, a later call with the same key does one of these:
   lands, and the effect has happened twice. Settle delays shorten this
   window, and attempt timeouts plus a long lease make it rarer. Only a
   remote idempotency key closes it.
-- **Leases trust the workers' clocks.** Each worker compares lease expiry
-  against its own clock. A worker whose clock runs ahead may take over a
-  live lease early. Fencing still rejects every write of the original
-  holder, but the effect may then be re-run under the rules above. Keep
-  clocks synchronized (NTP) and the lease TTL far above the skew.
+- **Leases trust the workers' clocks, except on PostgreSQL.** On the
+  in-memory and SQLite stores, each worker compares lease expiry against its
+  own clock. A worker whose clock runs ahead may take over a live lease
+  early. Fencing still rejects every write of the original holder, but the
+  effect may then be re-run under the rules above. Keep clocks synchronized
+  (NTP) and the lease TTL far above the skew. `PostgresStore` uses the
+  database's clock for leases by default, which removes this limit.
 - **A fenced worker's late success is not recorded.** If A's action
   succeeds after B took over, A's result is refused. The operator resolving
   the effect does not see it. This is an open design question.
@@ -129,6 +149,11 @@ From `Unknown`, a later call with the same key does one of these:
 - **Stored inputs must stay readable.** A handler's input is stored so
   recovery can rebuild the call. If the input type changes incompatibly, old
   effects land in `RecoveryReport::resume_errors` instead of running.
+- **Pruning forgets.** Once a settled record is pruned, its key is new
+  again: a late retry runs the effect a second time unless the remote
+  system's own idempotency key still holds, and a pruned committed effect
+  can no longer be compensated. Only settled records idle under no lease
+  are pruned; anything in doubt is kept.
 - **Outputs are replayed as stored.** If the output type changes between
   releases, replaying an old result fails with `RuntimeError::Output`
   instead of returning wrong data.
@@ -138,10 +163,11 @@ From `Unknown`, a later call with the same key does one of these:
 | Suite | What it covers |
 |---|---|
 | `crates/agent-effects/tests/crash.rs` | Every crash point × {verified, remote-idempotent, unprotected}: crash, lease expiry, recovery, re-run. Asserts every point is actually reached. |
-| `crates/agent-effects-sqlite/tests/crash_subprocess.rs` | The same matrix, with a child process that `abort()`s on a SQLite file. |
-| `crates/agent-effects/tests/model.rs` | Random configurations, remote failures, crashes, lease expiries and recovery passes. Checks that every audit trail follows the state machine, and that a non-idempotent effect is never created twice. |
+| `crates/agent-effects-sqlite/tests/crash_subprocess.rs` | The same matrix, with a child process that `abort()`s on a SQLite file; again for durable handlers finished by `recover()` alone; and kills after an approval request and mid-compensation. |
+| `crates/agent-effects/tests/model.rs` | Random configurations (closures and durable handlers), remote failures, crashes, lease expiries, recovery passes, compensation, approval, operator decisions and pruning. Checks that every audit trail follows the state machine, a non-idempotent effect is never created twice, policies hold, observers see exactly the trail, and secrets are never stored. |
 | `crates/agent-effects/tests/recovery.rs` | Stalled-worker takeover without duplicates; operator resolution. |
-| `crates/agent-effects-sqlite/tests/multi_process.rs` | Three processes on one database file run each effect exactly once. |
+| `crates/agent-effects-sqlite/tests/multi_process.rs`, `crates/agent-effects-postgres/tests/multi_process.rs` | Three processes on one database run each effect exactly once. |
+| `agent_effects_store::testkit::conformance` | Every store backend (memory, SQLite, PostgreSQL) enforces the same leases, transitions and pruning. |
 
 Each safety rule above was also broken on purpose to confirm a test fails
 (see [design.md](design.md), §11).

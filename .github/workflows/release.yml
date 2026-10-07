@@ -25,7 +25,7 @@ env:
   CARGO_TERM_COLOR: always
   # Publish order: each crate after the crates it depends on. Preflight
   # checks this list against the workspace's publishable crates.
-  CRATES: agent-effects-store agent-effects-memory agent-effects agent-effects-sqlite
+  CRATES: agent-effects-store agent-effects-memory agent-effects agent-effects-otel agent-effects-http agent-effects-sqlite agent-effects-postgres
 
 jobs:
   preflight:

@@ -103,10 +103,45 @@ jobs:
             target
           key: msrv-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: msrv-${{ runner.os }}-
-      - name: Rust 1.90 (all crates but SQLite)
-        run: cargo +1.90 test --workspace --exclude agent-effects-sqlite --all-features --locked
-      - name: Rust 1.94 (agent-effects-sqlite)
-        run: cargo +1.94 test -p agent-effects-sqlite --locked
+      - name: Rust 1.90 (all crates but the SQL stores)
+        run: cargo +1.90 test --workspace --exclude agent-effects-sqlite --exclude agent-effects-postgres --all-features --locked
+      - name: Rust 1.94 (agent-effects-sqlite, agent-effects-postgres)
+        # The Postgres tests skip here; the postgres job runs them for real.
+        run: cargo +1.94 test -p agent-effects-sqlite -p agent-effects-postgres --locked
+
+  postgres:
+    name: PostgreSQL
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: pw
+          POSTGRES_DB: effects
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      AGENT_EFFECTS_POSTGRES_URL: postgres://postgres:pw@localhost:5432/effects
+      # Without the database the tests skip; here that must be a failure.
+      AGENT_EFFECTS_REQUIRE_POSTGRES: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal --no-self-update
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: postgres-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: postgres-${{ runner.os }}-
+      # Conformance, database clock, lock-skipping scans, the runtime, and
+      # three worker processes on one database.
+      - run: cargo +stable test -p agent-effects-postgres --locked
 
   docs:
     name: Docs
@@ -156,7 +191,7 @@ jobs:
   ci-pass:
     name: CI pass
     if: always()
-    needs: [fmt, clippy, test, msrv, docs, package]
+    needs: [fmt, clippy, test, msrv, postgres, docs, package]
     runs-on: ubuntu-latest
     steps:
       - name: All jobs succeeded
