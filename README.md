@@ -1,16 +1,33 @@
-# agent-effects
+# agent-effects: Reliable side effects for AI agents in Rust
 
-**The reliability layer between agents and the real world.**
+<div align="center">
 
-`agent-effects` is a Rust runtime for executing real-world side effects
-(payments, emails, cloud resources, tickets) initiated by AI agents and other
-autonomous software. It records intent before acting, tells "failed" apart
-from "don't know", and resolves unknown outcomes by verification or provably
-safe retry instead of guessing.
+[![Version: 0.1.0](https://img.shields.io/badge/Version-v0.1.0-blue)](CHANGELOG.md)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT_OR_Apache--2.0-blue.svg)](#license)
+[![Rust: 2024 Edition](https://img.shields.io/badge/Rust-2024_Edition-orange?logo=rust)](Cargo.toml)
+[![MSRV: Rust 1.90](https://img.shields.io/badge/MSRV-1.90%2B-orange?logo=rust)](#rust-crates-and-storage-backends)
+<br/>
+[![CI](https://github.com/akosidencio/agent-effects/actions/workflows/ci.yml/badge.svg)](https://github.com/akosidencio/agent-effects/actions/workflows/ci.yml)
+[![Async: Tokio](https://img.shields.io/badge/Async-Tokio-purple)](crates/agent-effects/Cargo.toml)
+[![Stores: Memory, SQLite, PostgreSQL](https://img.shields.io/badge/Stores-Memory%20%7C%20SQLite%20%7C%20PostgreSQL-green)](#rust-crates-and-storage-backends)
+[![SQL stores: Rust 1.94](https://img.shields.io/badge/SQL_stores-Rust_1.94%2B-orange?logo=rust)](#rust-crates-and-storage-backends)
 
-> Let agents decide. Make effects deterministic.
+</div>
 
-## The problem
+`agent-effects` is a Rust library for reliable AI agent tool calls and
+side-effect execution. It combines idempotency keys, durable execution,
+safe retries and crash recovery for payments, emails, cloud resources and
+tickets initiated by LLM agents or other autonomous applications.
+
+The runtime records intent before acting, distinguishes definite failures
+from unknown outcomes, and uses remote verification or idempotent retry to
+resolve uncertainty. Store effects in SQLite or PostgreSQL, and track their
+lifecycle with tracing and OpenTelemetry metrics.
+
+[Quick start](#quick-start) · [Features](#features) ·
+[Examples](#examples) · [Documentation](#documentation)
+
+## Why agent tool calls need idempotency
 
 ```text
 agent decides to charge a customer
@@ -28,7 +45,20 @@ Unknown ─┬─ verification available ─→ ask the provider what happened
          └─ neither ─→ needs an operator
 ```
 
+## When to use agent-effects
+
+- **AI agent and LLM tools:** attach repeated tool calls to the same effect
+  and replay committed results.
+- **Payments, emails and resource provisioning:** handle timeouts without
+  blindly repeating an operation that may already have applied.
+- **Rust services that need crash recovery:** resume registered handlers
+  from durable storage after a worker restarts.
+- **Operations that need human oversight:** require approval, retain an
+  audit trail and compensate committed effects.
+
 ## Quick start
+
+Add the runtime and a SQLite store to your Rust application:
 
 ```toml
 [dependencies]
@@ -44,7 +74,7 @@ use agent_effects_sqlite::SqliteStore;
 let runtime = Runtime::new(SqliteStore::open("effects.db").await?);
 
 let outcome = runtime
-    .effect("payment.charge", &order.id)        // one record per (name, key), ever
+    .effect("payment.charge", &order.id)        // one record per (name, key) while retained
     .kind(EffectKind::IrreversibleWrite)
     .input(&charge)                             // a reused key with another input is an error
     .remote_idempotency(true)                   // the provider deduplicates on our key
@@ -69,6 +99,8 @@ match outcome {
 }
 ```
 
+## Idempotency and outcome verification
+
 Pick the protection your remote system allows:
 
 | The remote… | Builder | After an unknown outcome |
@@ -77,7 +109,7 @@ Pick the protection your remote system allows:
 | can be queried | `.verify(...)` or `.verify_eventually(settle, ...)` | checked; re-run only if verifiably not applied |
 | neither | | escalated to an operator (`runtime.resolve`) |
 
-Also available:
+## Features
 
 - **Durable handlers.** Implement `EffectHandler`, `register` it, and
   `runtime.submit::<H>(key, input)`. Recovery then finishes the effect from
@@ -102,29 +134,33 @@ Also available:
 - **Retention.** `.retention(RetentionPolicy::settled(age))` prunes settled
   records once old enough; anything unresolved is kept. A pruned key is
   new again.
-- `.retry(policy)`: lifetime attempt budget, backoff with jitter, honours
-  `retry_after`.
-- `.attempt_timeout(d)`.
-- `.precondition(...)`: rejects a stale decision before the first attempt.
-- `runtime.wait(id, timeout)`.
-- Recovery: `runtime.run_recovery(interval)`, `runtime.pending(..)` and
-  `runtime.resolve(..)`.
+- **Retries and timeouts.** `.retry(policy)` sets a lifetime attempt budget
+  and backoff with jitter, honouring `retry_after`; `.attempt_timeout(d)`
+  bounds each action attempt.
+- **Preconditions.** `.precondition(...)` rejects a stale decision before
+  the first attempt.
+- **Recovery and operator tools.** `runtime.run_recovery(interval)` resumes
+  durable handlers; `runtime.pending(..)` lists unresolved effects and
+  `runtime.resolve(..)` records an operator's decision. Use
+  `runtime.wait(id, timeout)` to wait for another caller's effect.
 
 ## Examples
+
+Run the payment reliability and LLM agent tool examples locally:
 
 ```sh
 cargo run --example payment
 cargo run --example agent_tool
 ```
 
-- [`payment`](examples/payment.rs): a provider that
+- [Payment retries and verification](examples/payment.rs): a provider that
   charges and then drops the connection, shown under each protection, with
   the audit trail.
-- [`agent_tool`](examples/agent_tool.rs): a
+- [LLM agent refund tool](examples/agent_tool.rs): a
   `refund_order` tool for an LLM agent, handling duplicate calls, a changed
   amount and a stale decision.
 
-## Guarantees
+## Reliability guarantees and limits
 
 - Intent is persisted **before** the external call.
 - One logical effect (`name` + application key) maps to one record, however
@@ -144,29 +180,28 @@ It is not a workflow engine, a job queue or an agent framework, and it does
 not decide whether an agent is *allowed* to act. Application authorization
 still applies.
 
-## Crates
+## Rust crates and storage backends
 
 | Crate | Purpose |
 |---|---|
-| `agent-effects` | The runtime; the crate applications depend on. Features: `testkit` (`FakeRemote`), `fault-injection` (`FaultInjector`). |
-| `agent-effects-sqlite` | SQLite store; several processes may share one file. |
-| `agent-effects-http` | HTTP requests as effects (reqwest): failure classification, `Idempotency-Key`. |
-| `agent-effects-otel` | OpenTelemetry metrics through an `EffectObserver`. |
-| `agent-effects-postgres` | PostgreSQL store for many workers on many hosts; leases use the database's clock. |
-| `agent-effects-memory` | In-memory store for tests and development. |
-| `agent-effects-store` | Storage contract and state machine, for writing new backends; includes the backend conformance suite (`testkit`). |
+| [`agent-effects`](crates/agent-effects) | The runtime; the crate applications depend on. Features: `testkit` (`FakeRemote`), `fault-injection` (`FaultInjector`). |
+| [`agent-effects-sqlite`](crates/agent-effects-sqlite) | SQLite store; several processes may share one file. |
+| [`agent-effects-http`](crates/agent-effects-http) | HTTP requests as effects (reqwest): failure classification, `Idempotency-Key`. |
+| [`agent-effects-otel`](crates/agent-effects-otel) | OpenTelemetry metrics through an `EffectObserver`. |
+| [`agent-effects-postgres`](crates/agent-effects-postgres) | PostgreSQL store for many workers on many hosts; leases use the database's clock. |
+| [`agent-effects-memory`](crates/agent-effects-memory) | In-memory store for tests and development. |
+| [`agent-effects-store`](crates/agent-effects-store) | Storage contract and state machine, for writing new backends; includes the backend conformance suite (`testkit`). |
 
 MSRV: Rust 1.90; `agent-effects-sqlite` and `agent-effects-postgres` need 1.94 (sqlx).
 
 ## Documentation
 
-- [Crash semantics](docs/crash-semantics.md): the contract when things fail,
+- [Crash recovery and production guidance](docs/crash-semantics.md): the contract when things fail,
   and how to run it in production
-- [Design](docs/design.md): state machine, failure model, store contract,
+- [Runtime design and state machine](docs/design.md): failure model, store contract,
   decisions log
-- [Roadmap](docs/roadmap.md): what is left before 0.1.0, and the adapters
-  after it
-- [Changelog](CHANGELOG.md)
+- [Integration roadmap](docs/roadmap.md): planned adapters and effect groups
+- [Release changelog](CHANGELOG.md)
 
 ## Development
 
