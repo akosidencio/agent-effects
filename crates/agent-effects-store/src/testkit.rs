@@ -868,17 +868,26 @@ async fn pruning_removes_only_settled_idle_old_records<S: EffectStore>(store: S)
     assert_eq!(prune(EffectStatus::Failed, minute, 100).await, 1);
     assert!(!exists(failed).await);
 
+    pruned_records_leave_nothing_behind(&store, old_a, young).await;
+}
+
+/// After `pruned` (key 0) was pruned and `kept` was not.
+async fn pruned_records_leave_nothing_behind<S: EffectStore>(
+    store: &S,
+    pruned: EffectId,
+    kept: EffectId,
+) {
     // The audit trail goes with the record; others keep theirs.
     assert!(matches!(
-        store.events(old_a).await,
-        Err(StoreError::NotFound(id)) if id == old_a
+        store.events(pruned).await,
+        Err(StoreError::NotFound(id)) if id == pruned
     ));
-    assert_eq!(store.events(young).await.unwrap().len(), 2);
+    assert_eq!(store.events(kept).await.unwrap().len(), 2);
     // The key is free again: the next request is a new effect.
     assert!(store.get_by_key(&key(0)).await.unwrap().is_none());
     let again = store.insert_or_get(new_effect(0)).await.unwrap();
     assert!(again.inserted);
-    assert_ne!(again.record.id, old_a);
+    assert_ne!(again.record.id, pruned);
     assert_eq!(again.record.status, EffectStatus::Pending);
     assert_eq!(store.events(again.record.id).await.unwrap(), Vec::new());
 }

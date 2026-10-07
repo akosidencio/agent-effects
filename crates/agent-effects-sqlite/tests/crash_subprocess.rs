@@ -177,6 +177,8 @@ struct FileEffect {
     approval: bool,
 }
 
+// The file remote is synchronous; `async` only satisfies the trait.
+#[allow(unknown_lints, clippy::unused_async_trait_impl)]
 impl EffectHandler for FileEffect {
     const NAME: &'static str = "op";
     type Input = u32;
@@ -197,6 +199,8 @@ impl EffectHandler for FileEffect {
     }
 }
 
+// The file remote is synchronous; `async` only satisfies the trait.
+#[allow(unknown_lints, clippy::unused_async_trait_impl)]
 impl VerifiableEffect for FileEffect {
     async fn verify(
         &self,
@@ -210,6 +214,8 @@ impl VerifiableEffect for FileEffect {
     }
 }
 
+// The file remote is synchronous; `async` only satisfies the trait.
+#[allow(unknown_lints, clippy::unused_async_trait_impl)]
 impl CompensableEffect for FileEffect {
     async fn compensate(
         &self,
