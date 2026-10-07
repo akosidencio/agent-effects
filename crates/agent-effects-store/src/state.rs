@@ -150,7 +150,7 @@ impl EffectStatus {
             }
 
             (S::Committed, T::StartCompensation)
-            | (S::Compensating, T::ScheduleCompensationRetry)
+            | (S::Compensating, T::ScheduleCompensationRetry | T::StartCompensationRetry)
             | (S::CompensationFailed, T::ResolvedRetry) => S::Compensating,
             (S::Compensating, T::CompensationSucceeded)
             | (S::CompensationFailed, T::ResolvedCompensated) => S::Compensated,
@@ -220,9 +220,11 @@ pub enum Transition {
     /// Undoing a committed effect begins. Persisted before the first
     /// compensation attempt.
     StartCompensation,
-    /// Another compensation attempt is scheduled, after a failure or to
-    /// resume one a crash interrupted.
+    /// Another compensation attempt is scheduled, after a failed attempt.
     ScheduleCompensationRetry,
+    /// Another compensation attempt begins: a scheduled retry, or a rerun
+    /// of an attempt a crash interrupted. Persisted before it runs.
+    StartCompensationRetry,
     /// The compensation succeeded.
     CompensationSucceeded,
     /// The compensation failed for good.
@@ -232,7 +234,7 @@ pub enum Transition {
 }
 
 /// Every transition, for exhaustive tests.
-pub const ALL_TRANSITIONS: [Transition; 23] = [
+pub const ALL_TRANSITIONS: [Transition; 24] = [
     Transition::RequestApproval,
     Transition::Approve,
     Transition::Deny,
@@ -253,6 +255,7 @@ pub const ALL_TRANSITIONS: [Transition; 23] = [
     Transition::ResolvedRetry,
     Transition::StartCompensation,
     Transition::ScheduleCompensationRetry,
+    Transition::StartCompensationRetry,
     Transition::CompensationSucceeded,
     Transition::CompensationFailed,
     Transition::ResolvedCompensated,
@@ -287,6 +290,7 @@ impl Transition {
             Self::ResolvedRetry => "effect.resolved_retry",
             Self::StartCompensation => "effect.compensation_started",
             Self::ScheduleCompensationRetry => "effect.compensation_retry_scheduled",
+            Self::StartCompensationRetry => "effect.compensation_retry_started",
             Self::CompensationSucceeded => "effect.compensated",
             Self::CompensationFailed => "effect.compensation_failed",
             Self::ResolvedCompensated => "effect.resolved_compensated",

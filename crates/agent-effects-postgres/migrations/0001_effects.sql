@@ -21,6 +21,7 @@ CREATE TABLE effects (
     approved              BOOLEAN     NOT NULL,
     next_attempt_at       TIMESTAMPTZ,
     attempt_started_at    TIMESTAMPTZ,
+    attempt_ended_at      TIMESTAMPTZ,
     lease_owner           TEXT,
     lease_epoch           BIGINT      NOT NULL,
     lease_expires_at      TIMESTAMPTZ,

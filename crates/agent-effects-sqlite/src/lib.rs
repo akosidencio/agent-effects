@@ -55,7 +55,7 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 const COLUMNS: &str = "id, effect_name, logical_key, kind, status, input, input_fingerprint, \
      output, last_error, created_by, attempt_count, may_have_applied, \
      compensation_attempts, approved, next_attempt_at, \
-     attempt_started_at, \
+     attempt_started_at, attempt_ended_at, \
      lease_owner, lease_epoch, lease_expires_at, version, created_at, updated_at, committed_at";
 
 /// An [`EffectStore`] in a SQLite database.
@@ -145,7 +145,7 @@ impl EffectStore for SqliteStore {
         let inserted = bind_record(
             sqlx::query(AssertSqlSafe(format!(
                 "INSERT INTO effects ({COLUMNS}) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
                  ON CONFLICT (effect_name, logical_key) DO NOTHING"
             ))),
             &record,
@@ -371,7 +371,8 @@ async fn save(
     let updated = sqlx::query(
         "UPDATE effects SET status = ?, output = ?, last_error = ?, attempt_count = ?, \
          may_have_applied = ?, compensation_attempts = ?, approved = ?, \
-         next_attempt_at = ?, attempt_started_at = ?, lease_owner = ?, lease_epoch = ?, \
+         next_attempt_at = ?, attempt_started_at = ?, attempt_ended_at = ?, \
+         lease_owner = ?, lease_epoch = ?, \
          lease_expires_at = ?, version = ?, updated_at = ?, committed_at = ? \
          WHERE id = ? AND version = ?",
     )
@@ -384,6 +385,7 @@ async fn save(
     .bind(record.approved)
     .bind(record.next_attempt_at.map(to_ms))
     .bind(record.attempt_started_at.map(to_ms))
+    .bind(record.attempt_ended_at.map(to_ms))
     .bind(record.lease_owner.as_ref().map(WorkerId::as_str))
     .bind(to_i64(record.lease_epoch)?)
     .bind(record.lease_expires_at.map(to_ms))
@@ -427,6 +429,7 @@ fn bind_record<'q>(query: Query<'q>, r: &EffectRecord) -> Result<Query<'q>, Stor
         .bind(r.approved)
         .bind(r.next_attempt_at.map(to_ms))
         .bind(r.attempt_started_at.map(to_ms))
+        .bind(r.attempt_ended_at.map(to_ms))
         .bind(r.lease_owner.as_ref().map(|w| w.as_str().to_owned()))
         .bind(to_i64(r.lease_epoch)?)
         .bind(r.lease_expires_at.map(to_ms))
@@ -461,6 +464,7 @@ fn decode_record(row: &SqliteRow) -> Result<EffectRecord, StoreError> {
         approved: get(row, "approved")?,
         next_attempt_at: get::<Option<i64>>(row, "next_attempt_at")?.map(from_ms),
         attempt_started_at: get::<Option<i64>>(row, "attempt_started_at")?.map(from_ms),
+        attempt_ended_at: get::<Option<i64>>(row, "attempt_ended_at")?.map(from_ms),
         lease_owner: get::<Option<String>>(row, "lease_owner")?.map(WorkerId::new),
         lease_epoch: to_u64(get(row, "lease_epoch")?)?,
         lease_expires_at: get::<Option<i64>>(row, "lease_expires_at")?.map(from_ms),
@@ -556,6 +560,7 @@ fn normalize(record: &mut EffectRecord) {
     for time in [
         &mut record.next_attempt_at,
         &mut record.attempt_started_at,
+        &mut record.attempt_ended_at,
         &mut record.lease_expires_at,
         &mut record.committed_at,
     ]

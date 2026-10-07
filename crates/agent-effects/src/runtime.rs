@@ -580,7 +580,7 @@ impl<S: EffectStore> Runtime<S> {
         }
 
         for _ in 0..MAX_ROUNDS {
-            if let Some(outcome) = self.observe(&record)? {
+            if let Some(outcome) = observe(&record)? {
                 return Ok(outcome);
             }
             let lease = match store
@@ -631,26 +631,25 @@ impl<S: EffectStore> Runtime<S> {
         }
         Ok(EffectOutcome::InProgress { id: record.id })
     }
+}
 
-    /// The outcome to report without acting, or `None` if this call should
-    /// take the lease and move the effect forward.
-    fn observe<T: DeserializeOwned>(
-        &self,
-        record: &EffectRecord,
-    ) -> Result<Option<EffectOutcome<T>>, RuntimeError> {
-        match record.status {
-            status if settled(status) => report(record, None).map(Some),
-            EffectStatus::Pending
-            | EffectStatus::AwaitingApproval
-            | EffectStatus::Executing
-            | EffectStatus::Verifying
-            | EffectStatus::Unknown
-                if record.live_lease_owner(self.now()).is_none() =>
-            {
-                Ok(None)
-            }
-            _ => Ok(Some(EffectOutcome::InProgress { id: record.id })),
-        }
+/// The outcome to report without acting, or `None` if this call should try
+/// to take the lease and move the effect forward.
+///
+/// Whether a lease is still live is left to `acquire_lease`: a store may
+/// judge it by its own clock (`PostgresStore` does), and this worker's
+/// clock could disagree.
+fn observe<T: DeserializeOwned>(
+    record: &EffectRecord,
+) -> Result<Option<EffectOutcome<T>>, RuntimeError> {
+    match record.status {
+        status if settled(status) => report(record, None).map(Some),
+        EffectStatus::Pending
+        | EffectStatus::AwaitingApproval
+        | EffectStatus::Executing
+        | EffectStatus::Verifying
+        | EffectStatus::Unknown => Ok(None),
+        _ => Ok(Some(EffectOutcome::InProgress { id: record.id })),
     }
 }
 
@@ -709,11 +708,12 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
                         .await?;
                     Span::current().record("effect.attempt", record.attempt_count);
                     self.rt.checkpoint(FaultPoint::AfterAttemptPersisted);
-                    let (next, produced) = self.attempt(record).await?;
+                    let (next, produced, exhausted) = self.attempt(record).await?;
                     record = next;
                     if produced.is_some() {
                         output = produced;
                     }
+                    verification_exhausted = exhausted;
                 }
                 // The previous holder's lease expired mid-attempt or
                 // mid-verification. Whatever it was doing may have happened.
@@ -770,11 +770,12 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
         Ok((record, output))
     }
 
-    /// Runs the action once and records what happened.
+    /// Runs the action once and records what happened. The flag reports
+    /// that the postcondition checks ran out while inconclusive.
     async fn attempt<T, Fut>(
         &self,
         record: EffectRecord,
-    ) -> Result<(EffectRecord, Option<T>), Interrupt>
+    ) -> Result<(EffectRecord, Option<T>, bool), Interrupt>
     where
         T: Serialize + Send + 'static,
         F: Fn(EffectContext) -> Fut,
@@ -802,12 +803,13 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
 
         match joined {
             Ok(Ok(value)) if self.spec.capabilities.verification != VerificationMode::None => {
-                let (record, verified, _) = self.verify(record, Some(output_json(&value))).await?;
+                let (record, verified, exhausted) =
+                    self.verify(record, Some(output_json(&value))).await?;
                 let output = match record.status {
                     EffectStatus::Committed => verified.or(Some(value)),
                     _ => None,
                 };
-                Ok((record, output))
+                Ok((record, output, exhausted))
             }
             Ok(Ok(value)) => {
                 let (output, payload) = output_json(&value);
@@ -817,7 +819,7 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
                         r.payload = payload;
                     })
                     .await?;
-                Ok((record, Some(value)))
+                Ok((record, Some(value), false))
             }
             Ok(Err(failure)) => {
                 debug!(%failure, "action failed");
@@ -860,7 +862,7 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
                         .await?
                     }
                 };
-                Ok((record, None))
+                Ok((record, None, false))
             }
             Err(join_error) => {
                 // The action may have sent its request before panicking.
@@ -872,7 +874,7 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
                         });
                     })
                     .await?;
-                Ok((record, None))
+                Ok((record, None, false))
             }
         }
     }
@@ -904,6 +906,16 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
         let mode = self.spec.capabilities.verification;
         let max_checks = self.retry().max_attempts.max(1);
         let mut last_problem = String::from("no check completed");
+        // Settle delays count from the end of the attempt: a slow request
+        // may write just before it returns. Both times come from the store's
+        // clock (`updated_at` was just stamped by `StartVerification`), and
+        // the time since is measured locally, so this worker's clock never
+        // meets the store's.
+        let verifying_since = record.updated_at;
+        let ended_before = record.attempt_ended_at.map_or(Duration::ZERO, |ended| {
+            verifying_since.duration_since(ended).unwrap_or_default()
+        });
+        let started = tokio::time::Instant::now();
 
         for check in 0..max_checks {
             let Some(future) = self.verifier.check(context(&record)) else {
@@ -943,28 +955,15 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
                     return Ok((record, None, false));
                 }
                 Verification::NotApplied => {
-                    let started = record.attempt_started_at.unwrap_or(self.rt.now());
-                    let elapsed = self.rt.now().duration_since(started).unwrap_or_default();
-                    match mode.read_not_found(elapsed) {
+                    match mode.read_not_found(ended_before + started.elapsed()) {
                         NotFoundReading::NotApplied => {
-                            let error = ErrorRecord {
-                                class: None,
-                                message: "verification found that the effect did not apply".into(),
-                            };
-                            record = if self.may_retry(record.attempt_count) {
-                                self.schedule_retry(&record, FailureClass::Transient, Some(error))
-                                    .await?
-                            } else {
-                                self.transition(&record, Transition::VerificationNotApplied, |r| {
-                                    r.error = Some(error);
-                                })
-                                .await?
-                            };
-                            return Ok((record, None, false));
+                            return Ok((self.not_applied(&record).await?, None, false));
                         }
                         NotFoundReading::TooEarly { wait } => {
                             last_problem = "not visible yet within the settle delay".into();
-                            self.sleep(wait).await?;
+                            if check + 1 < max_checks {
+                                self.sleep(wait).await?;
+                            }
                         }
                     }
                 }
@@ -972,10 +971,12 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
                     if last_problem == "no check completed" {
                         last_problem = "remote system could not tell".into();
                     }
-                    let delay = self
-                        .retry()
-                        .delay(check, FailureClass::Transient, jitter_sample());
-                    self.sleep(delay).await?;
+                    if check + 1 < max_checks {
+                        let delay =
+                            self.retry()
+                                .delay(check, FailureClass::Transient, jitter_sample());
+                        self.sleep(delay).await?;
+                    }
                 }
             }
         }
@@ -991,6 +992,24 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
             })
             .await?;
         Ok((record, None, true))
+    }
+
+    /// Records a trusted "not applied": re-run if the budget allows, else
+    /// `Failed`.
+    async fn not_applied(&self, record: &EffectRecord) -> Result<EffectRecord, Interrupt> {
+        let error = ErrorRecord {
+            class: None,
+            message: "verification found that the effect did not apply".into(),
+        };
+        if self.may_retry(record.attempt_count) {
+            self.schedule_retry(record, FailureClass::Transient, Some(error))
+                .await
+        } else {
+            self.transition(record, Transition::VerificationNotApplied, |r| {
+                r.error = Some(error);
+            })
+            .await
+        }
     }
 
     /// Evaluates the precondition. Returns the reason to reject, if any.

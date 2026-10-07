@@ -49,8 +49,8 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 const COLUMNS: &str = "id, effect_name, logical_key, kind, status, input, input_fingerprint, \
      output, last_error, created_by, attempt_count, may_have_applied, compensation_attempts, \
-     approved, next_attempt_at, attempt_started_at, lease_owner, lease_epoch, lease_expires_at, \
-     version, created_at, updated_at, committed_at";
+     approved, next_attempt_at, attempt_started_at, attempt_ended_at, lease_owner, lease_epoch, \
+     lease_expires_at, version, created_at, updated_at, committed_at";
 
 /// Whose clock the store trusts for leases and recorded times.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -175,7 +175,7 @@ impl EffectStore for PostgresStore {
         normalize(&mut record);
         let inserted = sqlx::query(AssertSqlSafe(format!(
             "INSERT INTO effects ({COLUMNS}) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
-             $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23) \
+             $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24) \
              ON CONFLICT (effect_name, logical_key) DO NOTHING"
         )))
         .bind(*record.id.as_uuid())
@@ -194,6 +194,7 @@ impl EffectStore for PostgresStore {
         .bind(record.approved)
         .bind(record.next_attempt_at.map(timestamp))
         .bind(record.attempt_started_at.map(timestamp))
+        .bind(record.attempt_ended_at.map(timestamp))
         .bind(record.lease_owner.as_ref().map(|w| w.as_str().to_owned()))
         .bind(to_i64(record.lease_epoch)?)
         .bind(record.lease_expires_at.map(timestamp))
@@ -447,9 +448,10 @@ async fn save(
     let updated = sqlx::query(
         "UPDATE effects SET status = $1, output = $2, last_error = $3, attempt_count = $4, \
          may_have_applied = $5, compensation_attempts = $6, approved = $7, \
-         next_attempt_at = $8, attempt_started_at = $9, lease_owner = $10, lease_epoch = $11, \
-         lease_expires_at = $12, version = $13, updated_at = $14, committed_at = $15 \
-         WHERE id = $16 AND version = $17",
+         next_attempt_at = $8, attempt_started_at = $9, attempt_ended_at = $10, \
+         lease_owner = $11, lease_epoch = $12, lease_expires_at = $13, version = $14, \
+         updated_at = $15, committed_at = $16 \
+         WHERE id = $17 AND version = $18",
     )
     .bind(record.status.as_str())
     .bind(record.output.clone())
@@ -460,6 +462,7 @@ async fn save(
     .bind(record.approved)
     .bind(record.next_attempt_at.map(timestamp))
     .bind(record.attempt_started_at.map(timestamp))
+    .bind(record.attempt_ended_at.map(timestamp))
     .bind(record.lease_owner.as_ref().map(|w| w.as_str().to_owned()))
     .bind(to_i64(record.lease_epoch)?)
     .bind(record.lease_expires_at.map(timestamp))
@@ -509,6 +512,8 @@ fn decode_record(row: &PgRow) -> Result<EffectRecord, StoreError> {
         next_attempt_at: get::<Option<OffsetDateTime>>(row, "next_attempt_at")?
             .map(SystemTime::from),
         attempt_started_at: get::<Option<OffsetDateTime>>(row, "attempt_started_at")?
+            .map(SystemTime::from),
+        attempt_ended_at: get::<Option<OffsetDateTime>>(row, "attempt_ended_at")?
             .map(SystemTime::from),
         lease_owner: get::<Option<String>>(row, "lease_owner")?.map(WorkerId::new),
         lease_epoch: to_u64(get(row, "lease_epoch")?)?,
@@ -598,6 +603,7 @@ fn normalize(record: &mut EffectRecord) {
     for time in [
         &mut record.next_attempt_at,
         &mut record.attempt_started_at,
+        &mut record.attempt_ended_at,
         &mut record.lease_expires_at,
         &mut record.committed_at,
     ]

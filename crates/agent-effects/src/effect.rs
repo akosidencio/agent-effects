@@ -294,7 +294,7 @@ impl<S: EffectStore> EffectBuilder<S> {
 
     /// Like [`Self::verify`], for a remote lookup that lags behind its writes
     /// by up to `settle`. [`Verification::NotApplied`] is trusted only once
-    /// `settle` has passed since the attempt started; until then the runtime
+    /// `settle` has passed since the attempt ended; until then the runtime
     /// waits and checks again.
     pub fn verify_eventually<T, F, Fut>(
         self,

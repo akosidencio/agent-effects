@@ -5,12 +5,12 @@ use std::time::Duration;
 
 use agent_effects::fault::{FaultInjector, FaultPoint};
 use agent_effects::handler::{CompensableEffect, EffectHandler, Handler};
-use agent_effects::store::EffectStore;
+use agent_effects::store::{EffectStore, TransitionRequest};
 use agent_effects::testkit::{Behavior, FakeRemote};
 use agent_effects::{
-    CompensationContext, CompensationOutcome, EffectContext, EffectFailure, EffectKey, EffectKind,
-    EffectName, EffectOutcome, EffectStatus, FailureClass, LogicalKey, Resolution, RetryPolicy,
-    Runtime, RuntimeError, TokioClock, Transition, WorkerId,
+    Clock, CompensationContext, CompensationOutcome, EffectContext, EffectFailure, EffectKey,
+    EffectKind, EffectName, EffectOutcome, EffectStatus, FailureClass, LogicalKey, Resolution,
+    RetryPolicy, Runtime, RuntimeError, TokioClock, Transition, WorkerId,
 };
 use agent_effects_memory::MemoryStore;
 
@@ -211,10 +211,65 @@ async fn ambiguous_and_transient_failures_are_retried_and_deduplicated() {
         [
             Transition::StartCompensation,
             Transition::ScheduleCompensationRetry,
+            Transition::StartCompensationRetry,
             Transition::ScheduleCompensationRetry,
+            Transition::StartCompensationRetry,
             Transition::CompensationSucceeded,
         ]
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_retry_that_fell_due_while_its_worker_was_down_counts_once() {
+    let (store, rt, clock) = setup();
+    let remote = FakeRemote::new(clock);
+    reserve(&rt, &remote).await;
+    // Attempt 1 failed and attempt 2 was scheduled; then the worker died,
+    // and nobody resumed the compensation until after attempt 2 was due.
+    let record = store
+        .get_by_key(&key("reserve", "k"))
+        .await
+        .unwrap()
+        .unwrap();
+    let lease = store
+        .acquire_lease(record.id, &WorkerId::new("dead"), clock.now(), TTL)
+        .await
+        .unwrap();
+    let record = store
+        .transition(TransitionRequest::new(
+            &record,
+            Some(&lease),
+            Transition::StartCompensation,
+            clock.now(),
+        ))
+        .await
+        .unwrap();
+    let mut retry = TransitionRequest::new(
+        &record,
+        Some(&lease),
+        Transition::ScheduleCompensationRetry,
+        clock.now(),
+    );
+    retry.next_attempt_at = Some(clock.now() + Duration::from_secs(1));
+    store.transition(retry).await.unwrap();
+    tokio::time::advance(TTL * 2).await;
+
+    // Attempt 2 fails too; attempt 3 is the last the budget allows.
+    let remote = remote.script([Behavior::Unreachable]);
+    let budget = RetryPolicy {
+        max_attempts: 3,
+        ..RetryPolicy::NONE
+    };
+    assert_eq!(
+        release(&rt, &remote, Some(budget)).await.unwrap(),
+        CompensationOutcome::Compensated
+    );
+    let record = store
+        .get_by_key(&key("reserve", "k"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.compensation_attempts, 3);
 }
 
 #[tokio::test(start_paused = true)]

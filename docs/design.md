@@ -64,6 +64,7 @@ Stores never change a status except through it.
 | Unknown / NeedsIntervention | `ResolvedRetry` | Pending |
 | Committed | `StartCompensation` | Compensating |
 | Compensating | `ScheduleCompensationRetry` | Compensating |
+| Compensating | `StartCompensationRetry` | Compensating |
 | Compensating | `CompensationSucceeded` | **Compensated** |
 | Compensating | `CompensationFailed` | CompensationFailed |
 | CompensationFailed | `ResolvedCompensated` | **Compensated** |
@@ -128,11 +129,18 @@ Verification modes:
 - `Authoritative`: the target reads its own writes. "Not found" means not
   applied.
 - `EventuallyConsistent { settle }`: "not found" is trusted only once
-  `settle` has passed since the attempt started. Before that it counts as
-  inconclusive and the runtime verifies again later.
+  `settle` has passed since the attempt ended. Before that it counts as
+  inconclusive and the runtime verifies again later. "Ended" is
+  `attempt_ended_at`, the first transition out of `Executing`: when the
+  action returned, timed out or panicked, or when its lease was found
+  expired. Counting from the start would trust "not found" at once after a
+  request slower than `settle` that wrote just before it returned.
+  Both times come from the store's clock (the elapsed time since the check
+  began is measured locally), so worker clock skew does not enter.
 
-Known limit: a request that a stalled worker sent long ago can still land
-after verification said "not applied". Settle delays shrink this window and
+Known limit: a request that a stalled worker sent long ago, or one a timeout
+abandoned while the server kept processing it, can still land after
+verification said "not applied". Settle delays shrink this window and
 remote idempotency closes it. Nothing else can. This is documented, not hidden.
 
 ## 6. Retry policy
@@ -210,7 +218,10 @@ Rules:
   its TTL. If renewal reports the lease lost, the attempt keeps running (it
   is already in flight), but none of its writes will be accepted.
 - **Concurrent callers.** A second caller whose key is held by a live lease
-  gets `InProgress { id }` immediately. `runtime.wait::<T>(id, timeout)` polls
+  gets `InProgress { id }` immediately. Whether the lease is live is the
+  store's call: the caller tries `acquire_lease` and reports `InProgress` on
+  `LeaseHeld`, never comparing the lease's expiry with its own clock, which
+  may disagree with a store that uses its own (`PostgresStore`). `runtime.wait::<T>(id, timeout)` polls
   the store until nobody holds the effect (10 ms doubling to 250 ms), then
   reports it.
 - **Closures must be `Fn`**, not `FnOnce`, because an effect may be attempted
@@ -246,8 +257,9 @@ Rules:
     budget remains, else `Failed`.
   - `Conflict { details }` goes to `NeedsIntervention`.
   - `Inconclusive`, a failing check or a panicking check are retried with
-    backoff, up to `max_attempts` checks per call. Then the effect stays
-    `Unknown`, not escalated, and a later call or recovery checks again.
+    backoff, up to `max_attempts` checks per call, a success's
+    postcondition checks included. Then the effect stays `Unknown`, not
+    escalated, and a later call or recovery checks again.
 
 ### Re-attaching
 
@@ -328,7 +340,7 @@ lifecycle of its own:
 
 ```text
 Committed ─StartCompensation→ Compensating ─CompensationSucceeded→ Compensated
-                                  │  ↺ ScheduleCompensationRetry
+                                  │  ↺ ScheduleCompensationRetry, StartCompensationRetry
                                   └─CompensationFailed→ CompensationFailed ─ResolvedCompensated→ Compensated
                                                                      └─ResolvedRetry→ Compensating
 ```
@@ -352,9 +364,15 @@ runtime.compensate::<ReserveInventory>(&order.id).reason("order cancelled").awai
   distinct from the effect's own key, so a remote never mistakes the undo
   for a replay.
 - **Recorded before it runs.** `StartCompensation` is persisted before the
-  first attempt. Each retry is a `ScheduleCompensationRetry`: the attempt
-  counter is `compensation_attempts`, the error is `last_error`, and the
-  reason goes in the event payload.
+  first attempt. A retry is a `ScheduleCompensationRetry` (sets
+  `next_attempt_at`, records the error in `last_error`), then a
+  `StartCompensationRetry` when it begins (counts it in
+  `compensation_attempts`, clears `next_attempt_at`). The reason goes in
+  the event payload. So a resumed compensation can tell a retry that was
+  scheduled but never started (`next_attempt_at` set, due or not: it waits,
+  then starts it) from an attempt that a crash cut short (`next_attempt_at`
+  clear: it starts another, marked `resumed`), and counts each attempt
+  once.
 - **Retries.** Transient and ambiguous failures retry with backoff within
   the retry budget. A permanent failure, or a spent budget, ends
   `CompensationFailed`. An operator then calls
@@ -591,8 +609,9 @@ backend therefore enforces identical semantics:
 - `transition` checks, in order, the lease (or, for lease-less operator
   calls, that nobody holds a live one), compare-and-set on `version`, and the
   [transition table](#3-state-machine). On success it updates the
-  bookkeeping (attempt count, `attempt_started_at`, `next_attempt_at`,
-  `committed_at`, output, last error), bumps `version`, and appends an audit
+  bookkeeping (attempt count, `attempt_started_at`, `attempt_ended_at`,
+  `next_attempt_at`, `compensation_attempts`, `committed_at`, output, last
+  error), bumps `version`, and appends an audit
   event whose `sequence` equals the new version. On failure nothing changes.
 - Lease operations do not bump `version`. A lease heartbeat therefore never
   conflicts with the transition that follows it, and the epoch alone fences
@@ -673,6 +692,7 @@ CREATE TABLE effects (
     approved           INTEGER NOT NULL,  -- 0 or 1
     next_attempt_at    INTEGER,
     attempt_started_at INTEGER,
+    attempt_ended_at   INTEGER,
     lease_owner        TEXT,
     lease_epoch        INTEGER NOT NULL,
     lease_expires_at   INTEGER,
@@ -966,12 +986,21 @@ Classification follows one rule: a failure is definite only when the
 request provably never reached the server, or the server's answer says it
 did not apply.
 
+A connection failure proves that only if the client follows no redirects.
+reqwest follows them inside `send()` by default, and a POST that applied and
+answered `303` to an unreachable host fails with the same `is_connect()`
+error, and the original URL, as a POST that never got through. The adapter
+cannot inspect the caller's `Client`, so the caller declares it:
+`.client_follows_no_redirects()` on a client built with
+`redirect::Policy::none()`.
+
 | Outcome | Class |
 |---|---|
-| connect, DNS or TLS failure | Transient (`request_sent(false)`) |
+| connect, DNS or TLS failure | Ambiguous; Transient (`request_sent(false)`) only with `.client_follows_no_redirects()` |
 | invalid URL or header | Validation, nothing sent |
 | timeout or connection lost after sending | Ambiguous |
 | 2xx with an unreadable or unparseable body | Ambiguous: it applied, the answer was lost |
+| 3xx (only seen when the client does not follow redirects) | Ambiguous |
 | 408, 425, 503 | Transient |
 | 429, or 503 with `Retry-After` | RateLimited, honouring `Retry-After` (seconds or HTTP date) |
 | 400, 422 | Validation |
@@ -997,15 +1026,19 @@ HTTP/1.1 server that applies POSTs, deduplicates them by
 
 - a success sends the JSON body, headers and the effect's key;
 - every status in the table reaches the runtime as its class;
-- a refused connection is Transient; a timeout after sending is Ambiguous;
+- a refused connection is Transient for a client declared without
+  redirects and Ambiguous otherwise; a POST that applied and redirected to
+  an unreachable host is not re-sent; an unfollowed 303 is Ambiguous; a
+  timeout after sending is Ambiguous;
 - a dropped answer is re-sent under the same key and applied once;
 - a lookup confirms a dropped answer without re-sending; a 404 lookup lets
   a lost request run again; a 405 lookup leaves the effect `Unknown`;
 - a 2xx with an unparseable body is Ambiguous; an invalid header sends
   nothing.
 
-Mutation checks: treating connect errors as sent, dropping the idempotency
-header, ignoring the timeout, and reading a 405 lookup or never reading a
+Mutation checks: treating connect errors as sent, treating them as unsent
+for a client that may follow redirects, reading a 3xx as permanent,
+dropping the idempotency header, ignoring the timeout, and reading a 405 lookup or never reading a
 404 lookup as not applied each fail a test.
 
 ## 13. Crate layout
@@ -1082,6 +1115,10 @@ Crates are added when their milestone starts, not as empty placeholders.
 | D37 | 2026-10-07 | Every transition goes through `commit_transition` (redact, store, notify); `EffectObserver` with `on_created` / `on_transition` and durations derived from `updated_at`; observer panics contained; `agent-effects-otel` instruments named per spec §29, never keyed by logical key | One choke point means no path can skip redaction or metrics; derived durations need no extra columns |
 | D38 | 2026-10-07 | `agent-effects-http`: `HttpEffect` builder over a caller-supplied `reqwest::Client` with no reqwest features; definite failures only when provably not sent or answered as not applied (409/500/502/504 ambiguous); `verify_json` reads only 404/410 as not applied | Misclassifying in the definite direction duplicates effects; misclassifying toward ambiguous only costs a verification or an operator |
 | D39 | 2026-10-07 | Retention: `RetentionPolicy` per settled status (none by default); `EffectStore::prune(PruneQuery)` with the age as a duration, never under a live lease, audit trail deleted with the record; `prune()` loops batches of 500; `run_recovery` prunes | Pruning forgets keys, so it must be opted into; a duration lets Postgres age by its own clock; unsettled records are work or wait for a person and are never pruned |
+| D40 | 2026-10-07 | Settle delays count from `attempt_ended_at` (first transition out of `Executing`), measured in the store's clock | A slow request can write just before it returns; counting from its start trusted "not found" too early and duplicated it |
+| D41 | 2026-10-07 | The runtime never judges lease liveness with its own clock; it calls `acquire_lease` and treats `LeaseHeld` as `InProgress` | A worker behind `PostgresStore`'s database clock reported `InProgress` for expired leases, delaying takeover |
+| D42 | 2026-10-07 | `StartCompensationRetry` counts a compensation retry when it starts, not when it is scheduled | A retry that fell due while its worker was down was counted twice and spent the budget early |
+| D43 | 2026-10-07 | `agent-effects-http`: connection failures are ambiguous unless the effect declares `.client_follows_no_redirects()`; unfollowed 3xx are ambiguous | A redirect's unreachable target fails exactly like the original host after the original request applied |
 
 ## Open questions
 

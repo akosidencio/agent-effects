@@ -325,6 +325,32 @@ async fn an_eventually_consistent_lookup_is_waited_out() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn the_settle_delay_counts_from_the_end_of_a_slow_attempt() {
+    // The request outlasts the settle delay and writes just before it
+    // returns; the lookup lags the write by the whole settle delay.
+    let (_, rt, clock) = setup();
+    let remote = FakeRemote::new(clock).lag(Duration::from_secs(10));
+    let slow = {
+        let remote = remote.clone();
+        move |_| {
+            let remote = remote.clone();
+            async move {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                remote.create(RES, None).await
+            }
+        }
+    };
+    let outcome = rt
+        .effect(NAME, "slow")
+        .verify_eventually(Duration::from_secs(10), find(&remote))
+        .run(slow)
+        .await
+        .unwrap();
+    assert_eq!(outcome, EffectOutcome::Committed("res#1".into()));
+    assert_eq!(remote.applications(RES), 1, "not re-run");
+}
+
+#[tokio::test(start_paused = true)]
 async fn treating_a_lagging_lookup_as_authoritative_duplicates() {
     // The hazard `verify_eventually` exists for: "not found" from a lagging
     // index, trusted at once, re-runs an effect that already happened.
@@ -398,6 +424,33 @@ async fn inconclusive_verification_stays_unknown_until_a_later_call_resolves_it(
         .unwrap();
     assert_eq!(second, EffectOutcome::Committed("found".into()));
     assert_eq!(remote.requests(), 1, "never re-run without proof");
+}
+
+#[tokio::test(start_paused = true)]
+async fn one_call_makes_at_most_max_attempts_postcondition_checks() {
+    let (_, rt, clock) = setup();
+    let remote = FakeRemote::new(clock);
+    let checks = Arc::new(AtomicU32::new(0));
+    let counted = Arc::clone(&checks);
+    let outcome = rt
+        .effect(NAME, "postcondition")
+        .retry(RetryPolicy {
+            max_attempts: 2,
+            ..RetryPolicy::NONE
+        })
+        .verify(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            async { Ok::<_, EffectFailure>(Verification::<String>::Inconclusive) }
+        })
+        .run(create(&remote, false))
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, EffectOutcome::Unknown { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(checks.load(Ordering::SeqCst), 2);
+    assert_eq!(remote.requests(), 1);
 }
 
 #[tokio::test(start_paused = true)]

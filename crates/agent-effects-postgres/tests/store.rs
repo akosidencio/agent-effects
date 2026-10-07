@@ -14,7 +14,7 @@ use agent_effects::store::{
 };
 use agent_effects::{
     EffectFailure, EffectKey, EffectKind, EffectName, EffectOutcome, EffectStatus, LogicalKey,
-    Runtime, Transition, WorkerId,
+    ManualClock, Runtime, Transition, WorkerId,
 };
 use agent_effects_postgres::{ClockSource, PostgresStore};
 use sqlx::Executor;
@@ -124,6 +124,42 @@ async fn leases_follow_the_database_clock_not_the_workers() {
         .await
         .unwrap();
     assert_eq!(scan, Vec::new());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_worker_behind_the_database_clock_takes_over_an_expired_lease() {
+    let Some(url) = url() else { return };
+    let store = fresh(&url, ClockSource::Database).await;
+    let record = store
+        .insert_or_get(NewEffect::new(
+            key("k"),
+            EffectKind::IrreversibleWrite,
+            SystemTime::UNIX_EPOCH,
+        ))
+        .await
+        .unwrap()
+        .record;
+    // A worker died holding the lease, which the database lets expire.
+    store
+        .acquire_lease(
+            record.id,
+            &WorkerId::new("dead"),
+            SystemTime::UNIX_EPOCH,
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // This worker's clock is an hour behind the database's.
+    let behind = ManualClock::new(SystemTime::now() - Duration::from_secs(3600));
+    let outcome = Runtime::builder(store)
+        .clock(behind)
+        .build()
+        .effect("op", "k")
+        .run(|_| async { Ok::<_, EffectFailure>(7_u32) })
+        .await
+        .unwrap();
+    assert_eq!(outcome, EffectOutcome::Committed(7));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

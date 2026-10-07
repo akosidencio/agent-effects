@@ -21,6 +21,7 @@ CREATE TABLE effects (
     approved           INTEGER NOT NULL,  -- 0 or 1
     next_attempt_at    INTEGER,
     attempt_started_at INTEGER,
+    attempt_ended_at   INTEGER,
     lease_owner        TEXT,
     lease_epoch        INTEGER NOT NULL,
     lease_expires_at   INTEGER,

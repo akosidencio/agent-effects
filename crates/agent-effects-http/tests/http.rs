@@ -26,6 +26,8 @@ enum Reply {
     Status(u16, Headers, String),
     /// Apply the POST, then close the connection without answering.
     ApplyThenDrop,
+    /// Apply the POST, then answer `303 See Other` to this location.
+    ApplyThenRedirect(String),
     /// Never answer.
     Hang,
 }
@@ -166,6 +168,10 @@ async fn handle(mut stream: TcpStream, state: Arc<Mutex<State>>) {
                 Some(Reply::ApplyThenDrop) => {
                     apply(&mut state, key.as_ref());
                     return; // drop the connection unanswered
+                }
+                Some(Reply::ApplyThenRedirect(location)) => {
+                    apply(&mut state, key.as_ref());
+                    Some((303, vec![("location", location)], String::new()))
                 }
                 Some(Reply::Hang) => None,
             }
@@ -314,21 +320,108 @@ async fn statuses_reach_the_runtime_as_failure_classes() {
     }
 }
 
-#[tokio::test]
-async fn a_refused_connection_was_never_sent() {
+/// An address nothing listens on.
+async fn unreachable(path: &str) -> String {
     let free = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}/x", free.local_addr().unwrap());
+    let url = format!("http://{}{path}", free.local_addr().unwrap());
     drop(free);
+    url
+}
+
+fn client_without_redirects() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_refused_connection_was_never_sent_by_a_client_without_redirects() {
+    let url = unreachable("/x").await;
     let store = MemoryStore::new();
     let outcome = runtime(&store, RetryPolicy::NONE)
         .effect("http.call", "refused")
-        .run(HttpEffect::post(&reqwest::Client::new(), url).send_json::<Payment>())
+        .run(
+            HttpEffect::post(&client_without_redirects(), url)
+                .client_follows_no_redirects()
+                .send_json::<Payment>(),
+        )
         .await
         .unwrap();
     assert!(matches!(outcome, EffectOutcome::Failed(_)), "{outcome:?}");
     assert_eq!(
         last_error(&store, "refused").await.class,
         Some(FailureClass::Transient)
+    );
+}
+
+#[tokio::test]
+async fn a_refused_connection_is_ambiguous_for_a_client_that_may_follow_redirects() {
+    let url = unreachable("/x").await;
+    let store = MemoryStore::new();
+    let outcome = runtime(&store, NO_WAIT)
+        .effect("http.call", "maybe-redirected")
+        .kind(EffectKind::IrreversibleWrite)
+        .run(HttpEffect::post(&reqwest::Client::new(), url).send_json::<Payment>())
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, EffectOutcome::NeedsIntervention { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        last_error(&store, "maybe-redirected").await.class,
+        Some(FailureClass::Ambiguous)
+    );
+}
+
+#[tokio::test]
+async fn an_unreachable_redirect_after_an_applied_request_is_not_resent() {
+    let target = unreachable("/receipt").await;
+    let server = Server::start([
+        Reply::ApplyThenRedirect(target.clone()),
+        Reply::ApplyThenRedirect(target),
+    ])
+    .await;
+    let outcome = runtime(&MemoryStore::new(), NO_WAIT)
+        .effect("http.call", "redirected")
+        .kind(EffectKind::IrreversibleWrite)
+        .run(HttpEffect::post(&reqwest::Client::new(), server.url("/charges")).send())
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, EffectOutcome::NeedsIntervention { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(server.applied(), 1, "applied once");
+}
+
+#[tokio::test]
+async fn an_unfollowed_redirect_is_ambiguous() {
+    let server = Server::start([
+        Reply::ApplyThenRedirect("/receipt".into()),
+        Reply::ApplyThenRedirect("/receipt".into()),
+    ])
+    .await;
+    let store = MemoryStore::new();
+    let outcome = runtime(&store, NO_WAIT)
+        .effect("http.call", "unfollowed")
+        .kind(EffectKind::IrreversibleWrite)
+        .run(
+            HttpEffect::post(&client_without_redirects(), server.url("/charges"))
+                .client_follows_no_redirects()
+                .send(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, EffectOutcome::NeedsIntervention { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(server.applied(), 1, "applied once");
+    assert_eq!(
+        last_error(&store, "unfollowed").await.class,
+        Some(FailureClass::Ambiguous)
     );
 }
 

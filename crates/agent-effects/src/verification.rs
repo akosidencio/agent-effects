@@ -81,7 +81,8 @@ pub enum VerificationMode {
     Authoritative,
     /// The remote system's lookup lags behind its writes, as many search and
     /// list APIs do. "Not found" is only trusted once `settle` has passed
-    /// since the attempt started; earlier, it counts as inconclusive.
+    /// since the attempt ended (its action returned or was found
+    /// interrupted); earlier, it counts as inconclusive.
     EventuallyConsistent {
         /// How long a write may take to become visible to the lookup.
         settle: Duration,
@@ -102,7 +103,7 @@ pub enum NotFoundReading {
 
 impl VerificationMode {
     /// How to read "not found" when `elapsed` has passed since the attempt
-    /// in question started.
+    /// in question ended.
     ///
     /// [`VerificationMode::None`] has no verification to read; it is
     /// reported as [`NotFoundReading::TooEarly`] with no wait so callers that

@@ -40,15 +40,19 @@ pub struct EffectRecord {
     /// a trusted verification or an operator. While it is set, the effect
     /// cannot become `Failed` through a failed attempt (see [`Self::apply`]).
     pub may_have_applied: bool,
-    /// Compensation attempts started or scheduled so far.
+    /// Compensation attempts started so far.
     pub compensation_attempts: u32,
     /// The effect was approved, so it is not asked again, even after a
     /// restart.
     pub approved: bool,
     /// When a scheduled retry may start.
     pub next_attempt_at: Option<SystemTime>,
-    /// When the latest attempt started. Settle delays count from here.
+    /// When the latest attempt started.
     pub attempt_started_at: Option<SystemTime>,
+    /// When the latest attempt was last known to be in flight: the first
+    /// transition out of `Executing` after it started. Settle delays count
+    /// from here.
+    pub attempt_ended_at: Option<SystemTime>,
     /// Current lease holder, if any. The lease may have expired.
     pub lease_owner: Option<WorkerId>,
     /// Fencing token; incremented by every lease acquisition.
@@ -84,6 +88,7 @@ impl EffectRecord {
             approved: false,
             next_attempt_at: None,
             attempt_started_at: None,
+            attempt_ended_at: None,
             lease_owner: None,
             lease_epoch: 0,
             lease_expires_at: None,
@@ -174,11 +179,15 @@ impl EffectRecord {
     /// version, and the transition table. Then it updates the bookkeeping:
     ///
     /// - [`Transition::StartAttempt`] increments the attempt count, stamps
-    ///   `attempt_started_at` and clears `next_attempt_at`;
-    /// - [`Transition::StartCompensation`] sets `compensation_attempts` to 1;
-    ///   [`Transition::ScheduleCompensationRetry`] increments it and sets
-    ///   `next_attempt_at`;
-    /// - a retry transition sets `next_attempt_at` (default `now`);
+    ///   `attempt_started_at`, and clears `attempt_ended_at` and
+    ///   `next_attempt_at`; any transition out of `Executing` stamps
+    ///   `attempt_ended_at`;
+    /// - [`Transition::StartCompensation`] sets `compensation_attempts` to 1
+    ///   and [`Transition::StartCompensationRetry`] increments it; both
+    ///   clear `next_attempt_at`;
+    /// - a retry transition, including
+    ///   [`Transition::ScheduleCompensationRetry`], sets `next_attempt_at`
+    ///   (default `now`);
     /// - reaching `Committed` stamps `committed_at`;
     /// - reaching `Unknown` sets `may_have_applied`; evidence that the effect
     ///   did not apply clears it (`VerificationNotApplied`,
@@ -231,9 +240,12 @@ impl EffectRecord {
             Transition::StartAttempt => {
                 self.attempt_count = self.attempt_count.saturating_add(1);
                 self.attempt_started_at = Some(now);
+                self.attempt_ended_at = None;
                 self.next_attempt_at = None;
             }
-            Transition::ScheduleRetry | Transition::ResolvedRetry => {
+            Transition::ScheduleRetry
+            | Transition::ResolvedRetry
+            | Transition::ScheduleCompensationRetry => {
                 self.next_attempt_at = Some(request.next_attempt_at.unwrap_or(now));
             }
             Transition::Approve => self.approved = true,
@@ -241,11 +253,14 @@ impl EffectRecord {
                 self.compensation_attempts = 1;
                 self.next_attempt_at = None;
             }
-            Transition::ScheduleCompensationRetry => {
+            Transition::StartCompensationRetry => {
                 self.compensation_attempts = self.compensation_attempts.saturating_add(1);
-                self.next_attempt_at = Some(request.next_attempt_at.unwrap_or(now));
+                self.next_attempt_at = None;
             }
             _ => {}
+        }
+        if from == EffectStatus::Executing {
+            self.attempt_ended_at = Some(now);
         }
         if to == EffectStatus::Committed {
             self.committed_at = Some(now);
@@ -448,6 +463,7 @@ mod tests {
         });
         rec.apply(retry).unwrap();
         assert_eq!(rec.next_attempt_at, Some(t(10)));
+        assert_eq!(rec.attempt_ended_at, Some(t(2)));
         assert!(rec.last_error.is_some());
 
         rec.apply(TransitionRequest::new(
@@ -459,6 +475,7 @@ mod tests {
         .unwrap();
         assert_eq!(rec.attempt_count, 2);
         assert_eq!(rec.next_attempt_at, None);
+        assert_eq!(rec.attempt_ended_at, None);
 
         let mut done = TransitionRequest::new(&rec, Some(&lease), Transition::Succeeded, t(11));
         done.output = Some(serde_json::json!({ "payment": "pi_1" }));

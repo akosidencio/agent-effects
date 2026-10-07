@@ -278,7 +278,7 @@ impl<S: EffectStore> Runtime<S> {
                 })?;
         tracing::Span::current().record("effect.id", field::display(record.id));
         for _ in 0..MAX_ROUNDS {
-            if let Some(outcome) = self.observe_compensation(&record) {
+            if let Some(outcome) = observe_compensation(&record) {
                 return Ok(outcome);
             }
             let lease = match store
@@ -303,8 +303,7 @@ impl<S: EffectStore> Runtime<S> {
             }
             match result {
                 Ok(settled) => {
-                    return Ok(self
-                        .observe_compensation(&settled)
+                    return Ok(observe_compensation(&settled)
                         .unwrap_or(CompensationOutcome::InProgress { id: settled.id }));
                 }
                 Err(Interrupt::LeaseLost) => {
@@ -317,22 +316,6 @@ impl<S: EffectStore> Runtime<S> {
             }
         }
         Ok(CompensationOutcome::InProgress { id: record.id })
-    }
-
-    /// The outcome to report without acting, or `None` to take the lease
-    /// and work on the compensation.
-    fn observe_compensation(&self, record: &EffectRecord) -> Option<CompensationOutcome> {
-        let id = record.id;
-        match record.status {
-            EffectStatus::Compensated => Some(CompensationOutcome::Compensated),
-            EffectStatus::CompensationFailed => {
-                Some(CompensationOutcome::Failed(last_error(record)))
-            }
-            EffectStatus::Committed | EffectStatus::Compensating => record
-                .live_lease_owner(self.now())
-                .map(|_| CompensationOutcome::InProgress { id }),
-            status => Some(CompensationOutcome::NotCommitted { id, status }),
-        }
     }
 
     /// Starts or resumes the compensation and runs attempts until it
@@ -354,22 +337,23 @@ impl<S: EffectStore> Runtime<S> {
                 })
                 .await?
             }
-            // A retry scheduled for later: wait for it.
-            EffectStatus::Compensating
-                if record.next_attempt_at.is_some_and(|at| at > self.now()) =>
-            {
-                let at = record.next_attempt_at.unwrap_or_else(|| self.now());
-                self.sleep_leased(lease, at).await?;
-                record
-            }
-            // Resuming an attempt that a crash or a dead worker cut short.
             EffectStatus::Compensating => {
+                let resumed = match record.next_attempt_at {
+                    // A retry that was scheduled but has not started: it
+                    // is not an attempt yet. Wait for it, then start it.
+                    Some(at) => {
+                        self.sleep_leased(lease, at).await?;
+                        None
+                    }
+                    // An attempt that a crash or a dead worker cut short.
+                    None => Some(json!({ "resumed": true })),
+                };
                 self.transition_leased(
                     &record,
                     lease,
                     actor,
-                    Transition::ScheduleCompensationRetry,
-                    |r| r.payload = Some(json!({ "resumed": true })),
+                    Transition::StartCompensationRetry,
+                    |r| r.payload = resumed,
                 )
                 .await?
             }
@@ -432,6 +416,15 @@ impl<S: EffectStore> Runtime<S> {
                 )
                 .await?;
             self.sleep_leased(lease, at).await?;
+            record = self
+                .transition_leased(
+                    &record,
+                    lease,
+                    actor,
+                    Transition::StartCompensationRetry,
+                    |_| {},
+                )
+                .await?;
         }
     }
 
@@ -481,5 +474,18 @@ impl<S: EffectStore> Runtime<S> {
             return Ok(());
         }
         self.with_lease(lease, tokio::time::sleep(wait)).await
+    }
+}
+
+/// The outcome to report without acting, or `None` to try to take the lease
+/// and work on the compensation. Whether a lease is still live is left to
+/// `acquire_lease`, which may judge it by the store's own clock.
+fn observe_compensation(record: &EffectRecord) -> Option<CompensationOutcome> {
+    let id = record.id;
+    match record.status {
+        EffectStatus::Compensated => Some(CompensationOutcome::Compensated),
+        EffectStatus::CompensationFailed => Some(CompensationOutcome::Failed(last_error(record))),
+        EffectStatus::Committed | EffectStatus::Compensating => None,
+        status => Some(CompensationOutcome::NotCommitted { id, status }),
     }
 }

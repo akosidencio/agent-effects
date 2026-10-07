@@ -44,10 +44,11 @@
 //!
 //! | Outcome | Class |
 //! |---|---|
-//! | connect, DNS or TLS failure | `Transient` (never sent) |
+//! | connect, DNS or TLS failure | `Ambiguous`; `Transient` (never sent) only with [`HttpEffect::client_follows_no_redirects`] |
 //! | invalid request (bad URL or header) | `Validation` (never sent) |
 //! | timeout or connection lost after sending | `Ambiguous` |
 //! | 2xx with an unreadable or unparseable body | `Ambiguous` (it applied, the answer was lost) |
+//! | 3xx (seen only when the client does not follow redirects) | `Ambiguous` |
 //! | 408, 425, 503 | `Transient` |
 //! | 429, or 503 with `Retry-After` | `RateLimited`, honouring `Retry-After` |
 //! | 400, 422 | `Validation` |
@@ -57,6 +58,14 @@
 //! | 501, other 4xx | `Permanent` |
 //!
 //! Override per request with [`HttpEffect::classify_status`].
+//!
+//! A client that follows redirects (reqwest's default) can fail to connect
+//! to a redirect's target after the original request applied, and reqwest
+//! reports that exactly like a failure to reach the original server. So a
+//! connection failure only proves the request was never sent when the
+//! client does not follow redirects: build the client with
+//! `.redirect(reqwest::redirect::Policy::none())` and say so with
+//! [`HttpEffect::client_follows_no_redirects`].
 
 use std::future::Future;
 use std::pin::Pin;
@@ -88,6 +97,9 @@ pub enum StatusClass {
 pub fn classify_status(status: StatusCode, headers: &HeaderMap) -> StatusClass {
     let failure = match status.as_u16() {
         200..=299 => return StatusClass::Success,
+        // A redirect the client did not follow: whether the request
+        // applied before it is unknown.
+        300..=399 => FailureClass::Ambiguous,
         408 | 425 => FailureClass::Transient,
         429 => FailureClass::RateLimited {
             retry_after: retry_after(headers),
@@ -119,17 +131,28 @@ fn retry_after(headers: &HeaderMap) -> Option<Duration> {
     Some(at.duration_since(SystemTime::now()).unwrap_or_default())
 }
 
-/// The class of a request that failed without a response.
+/// The class of a request that failed without a response, from a client
+/// that may follow redirects: everything but an invalid request is
+/// ambiguous, a connection failure included (see the [crate docs](crate)).
 pub fn classify_error(error: &reqwest::Error) -> EffectFailure {
     let message = error.to_string();
     if error.is_builder() {
         EffectFailure::validation(message)
-    } else if error.is_connect() {
-        // Includes connect timeouts: nothing reached the server.
-        EffectFailure::ambiguous(message).request_sent(false)
     } else {
-        // Timed out or lost after sending, or the response broke midway.
+        // Timed out or lost after sending, the response broke midway, or a
+        // redirect's target was unreachable after the request applied.
         EffectFailure::ambiguous(message)
+    }
+}
+
+/// Like [`classify_error`], for a client that does not follow redirects: a
+/// connection failure (including a connect timeout) means nothing reached
+/// the server, so the request was never sent.
+pub fn classify_error_without_redirects(error: &reqwest::Error) -> EffectFailure {
+    if error.is_connect() {
+        EffectFailure::ambiguous(error.to_string()).request_sent(false)
+    } else {
+        classify_error(error)
     }
 }
 
@@ -151,6 +174,8 @@ pub struct HttpEffect {
     idempotency_header: Option<HeaderName>,
     timeout: Option<Duration>,
     classify: Option<StatusOverride>,
+    /// The caller declared that the client does not follow redirects.
+    no_redirects: bool,
     /// A builder mistake, reported as a `Validation` failure when run.
     invalid: Option<String>,
 }
@@ -167,6 +192,7 @@ impl HttpEffect {
             idempotency_header: None,
             timeout: None,
             classify: None,
+            no_redirects: false,
             invalid: None,
         }
     }
@@ -248,6 +274,18 @@ impl HttpEffect {
     /// it may have been sent.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
+        self
+    }
+
+    /// Declares that the client does not follow redirects: it was built
+    /// with `.redirect(reqwest::redirect::Policy::none())`. Only then does a
+    /// connection failure prove the request was never sent, so that it is
+    /// retried as `Transient`, even for an irreversible write. Without it,
+    /// a connection failure is ambiguous. This does not change the client:
+    /// declaring it for a client that does follow redirects can duplicate
+    /// effects.
+    pub fn client_follows_no_redirects(mut self) -> Self {
+        self.no_redirects = true;
         self
     }
 
@@ -359,7 +397,13 @@ impl HttpEffect {
         if let Some(timeout) = self.timeout {
             request = request.timeout(timeout);
         }
-        request.send().await.map_err(|e| classify_error(&e))
+        request.send().await.map_err(|e| {
+            if self.no_redirects {
+                classify_error_without_redirects(&e)
+            } else {
+                classify_error(&e)
+            }
+        })
     }
 
     /// The body of a successful response, or the classified failure.
@@ -440,6 +484,9 @@ mod tests {
             (200, Success),
             (201, Success),
             (204, Success),
+            (301, Failure(F::Ambiguous)),
+            (303, Failure(F::Ambiguous)),
+            (308, Failure(F::Ambiguous)),
             (400, Failure(F::Validation)),
             (401, Failure(F::Authentication)),
             (403, Failure(F::Authorization)),

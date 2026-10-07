@@ -349,6 +349,7 @@ async fn transitions_persist_with_events<St: EffectStore>(store: St) {
         "transition must return the stored record"
     );
     assert_eq!(record.next_attempt_at, Some(t(11)));
+    assert_eq!(record.attempt_ended_at, Some(t(2)));
     assert_eq!(record.last_error, Some(error));
 
     let record = drive(
@@ -379,6 +380,7 @@ async fn transitions_persist_with_events<St: EffectStore>(store: St) {
     assert_eq!(stored.committed_at, Some(t(13)));
     assert_eq!((stored.attempt_count, stored.version), (2, 5));
     assert_eq!(stored.next_attempt_at, None);
+    assert_eq!(stored.attempt_ended_at, Some(t(12)));
 
     let events = store.events(record.id).await.unwrap();
     let trail: Vec<_> = events
@@ -694,8 +696,23 @@ async fn compensation_is_persisted<S: EffectStore>(store: S) {
     let stored = reload(&store, record.id).await;
     assert_eq!(stored, record, "transition must return the stored record");
     assert_eq!(stored.status, EffectStatus::Compensating);
-    assert_eq!(stored.compensation_attempts, 2);
+    assert_eq!(
+        stored.compensation_attempts, 1,
+        "a scheduled retry is not an attempt until it starts"
+    );
     assert_eq!(stored.next_attempt_at, Some(t(5)));
+
+    let record = drive(
+        &store,
+        record,
+        Some(&lease),
+        &[Transition::StartCompensationRetry],
+        t(5),
+    )
+    .await;
+    let stored = reload(&store, record.id).await;
+    assert_eq!(stored.compensation_attempts, 2);
+    assert_eq!(stored.next_attempt_at, None);
 
     let record = drive(
         &store,
