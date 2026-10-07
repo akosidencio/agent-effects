@@ -4,8 +4,8 @@
 //! For each point and protection level, a child process (this test binary,
 //! re-invoked) runs the effect and calls `abort()` at the point: no
 //! destructors, no lease release, nothing flushed but what SQLite already
-//! committed. The parent then waits out the child's lease, runs recovery and
-//! re-runs the effect, as the restarted service would.
+//! committed. The parent then runs recovery and re-runs the effect, as the
+//! restarted service would, with a clock past the child's lease.
 //!
 //! The remote system is a file, so its state survives the child: each line
 //! is one application of the side effect.
@@ -20,21 +20,34 @@ use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use std::sync::Arc;
 
 use agent_effects::fault::{FaultInjector, FaultPoint};
 use agent_effects::handler::{CompensableEffect, EffectHandler, Handler, VerifiableEffect};
 use agent_effects::{
-    CompensationContext, EffectContext, EffectFailure, EffectKey, EffectName, EffectOutcome,
+    Clock, CompensationContext, EffectContext, EffectFailure, EffectKey, EffectName, EffectOutcome,
     EffectRecord, EffectStatus, EffectStore, IdempotencyKey, LogicalKey, RetryPolicy, Runtime,
     RuntimeError, Verification, WorkerId,
 };
 use agent_effects_sqlite::SqliteStore;
 
 const CHILD_ENV: &str = "AGENT_EFFECTS_SQLITE_CRASH";
-const CHILD_TTL: Duration = Duration::from_millis(300);
+/// Long enough that a live child never loses its lease, however slow the
+/// machine: a lost lease would turn a clean run into an unknown outcome.
+const LEASE_TTL: Duration = Duration::from_secs(60);
+
+/// The restarted worker's clock: past the dead child's lease from the start,
+/// instead of waiting it out. SQLite judges leases by the caller's clock.
+#[derive(Debug)]
+struct AfterTheLease;
+
+impl Clock for AfterTheLease {
+    fn now(&self) -> SystemTime {
+        SystemTime::now() + LEASE_TTL + Duration::from_secs(1)
+    }
+}
 
 const NO_WAIT: RetryPolicy = RetryPolicy {
     max_attempts: 5,
@@ -229,7 +242,8 @@ impl CompensableEffect for FileEffect {
 }
 
 /// A runtime over the database at `db`, with the handler registered for
-/// every mode but `Closure`.
+/// every mode but `Closure`. The child gets `faults`; the restarted worker
+/// gets none, and a clock past the child's lease.
 async fn runtime(
     db: &Path,
     remote: &FileRemote,
@@ -240,11 +254,12 @@ async fn runtime(
 ) -> Runtime<SqliteStore> {
     let mut builder = Runtime::builder(SqliteStore::open(db).await.unwrap())
         .worker_id(WorkerId::new(worker))
-        .lease_ttl(CHILD_TTL)
+        .lease_ttl(LEASE_TTL)
         .retry_policy(NO_WAIT);
-    if let Some(faults) = faults {
-        builder = builder.fault_injector(faults);
-    }
+    builder = match faults {
+        Some(faults) => builder.fault_injector(faults),
+        None => builder.clock(AfterTheLease),
+    };
     if mode != Mode::Closure {
         let mut handler = Handler::new(FileEffect {
             remote: remote.clone(),
@@ -392,8 +407,6 @@ async fn crash_point(mode: Mode, point: FaultPoint) {
             point != FaultPoint::AfterVerificationStarted || protection == Protection::Verified;
         assert_eq!(died, reachable, "{case}: child died at the point");
 
-        // The child is dead; its lease runs out.
-        tokio::time::sleep(CHILD_TTL + Duration::from_millis(100)).await;
         let rt = runtime(&db, &remote, mode, protection, "restarted", None).await;
         let report = rt.recover().await.unwrap();
         assert_eq!(report.resume_errors, Vec::new(), "{case}");
@@ -494,7 +507,6 @@ async fn killed_after_asking_for_approval() {
             "{case}"
         );
 
-        tokio::time::sleep(CHILD_TTL + Duration::from_millis(100)).await;
         let rt = runtime(&db, &remote, Mode::Approval, protection, "restarted", None).await;
         rt.recover().await.unwrap();
         let waiting = record(&db).await.unwrap();
@@ -534,7 +546,6 @@ async fn killed_while_compensating() {
             "{case}"
         );
 
-        tokio::time::sleep(CHILD_TTL + Duration::from_millis(100)).await;
         let rt = runtime(
             &db,
             &remote,
