@@ -371,8 +371,8 @@ runtime.compensate::<ReserveInventory>(&order.id).reason("order cancelled").awai
   the event payload. So a resumed compensation can tell a retry that was
   scheduled but never started (`next_attempt_at` set, due or not: it waits,
   then starts it) from an attempt that a crash cut short (`next_attempt_at`
-  clear: it starts another, marked `resumed`), and counts each attempt
-  once.
+  clear: it starts another, marked `resumed`, if the retry budget allows,
+  else ends `CompensationFailed`), and counts each attempt once.
 - **Retries.** Transient and ambiguous failures retry with backoff within
   the retry budget. A permanent failure, or a spent budget, ends
   `CompensationFailed`. An operator then calls
@@ -630,13 +630,13 @@ backend therefore enforces identical semantics:
   by default, removing cross-host clock skew ([§9b](#9b-storage-postgresql-via-sqlx)).
 
 Every backend must pass `agent_effects_store::testkit::conformance` (the
-`testkit` feature). It runs 17 cases: read-back of all fields, key
+`testkit` feature). It runs 18 cases: read-back of all fields, key
 idempotency, 16-way concurrent inserts, missing records, lease exclusivity,
 takeover fencing, strict renewal, release, a full transition history with its
 events, rejected transitions leaving no trace, lease-less operator
 resolution, terminal finality, listing/paging, and persisting
-`may_have_applied` while refusing `FailedDefinitively` under it, and the
-compensation lifecycle (attempt counter, retry schedule, operator retry), and
+`may_have_applied` while refusing `FailedDefinitively` under it, a new
+attempt clearing the stored output, and the compensation lifecycle (attempt counter, retry schedule, operator retry), and
 approval (`approved` persisted; denial rejects), and pruning (only settled,
 idle, old records, lowest id first within the limit, events removed, the
 key freed for a new record). Its sensitivity was checked
@@ -753,9 +753,10 @@ hosts. It depends on `agent-effects-store` only, and runs the same pure
   stores. Retry schedules (`next_attempt_at`) are still the worker's.
   `ClockSource::Caller` restores caller time, which the conformance suite
   needs to drive time.
-- **Writes.** Every write loads the row `SELECT … FOR UPDATE` (with
-  `clock_timestamp()` in the same statement), applies the operation, and
-  saves it in one transaction. The `UPDATE` also checks the version it read.
+- **Writes.** Every write loads the row `SELECT … FOR UPDATE`, reads
+  `clock_timestamp()` once the lock is held (in the locking statement it
+  would be evaluated before the lock wait, and be stale by all of it),
+  applies the operation, and saves it in one transaction. The `UPDATE` also checks the version it read.
 - **Scans.** Recovery and pending scans (queries with a lease filter) end
   `FOR UPDATE SKIP LOCKED`, so rows another worker is changing right now are
   skipped, not waited on.

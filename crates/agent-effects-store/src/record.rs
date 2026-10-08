@@ -179,8 +179,10 @@ impl EffectRecord {
     /// version, and the transition table. Then it updates the bookkeeping:
     ///
     /// - [`Transition::StartAttempt`] increments the attempt count, stamps
-    ///   `attempt_started_at`, and clears `attempt_ended_at` and
-    ///   `next_attempt_at`; any transition out of `Executing` stamps
+    ///   `attempt_started_at`, and clears `attempt_ended_at`,
+    ///   `next_attempt_at` and `output` (an output stored before belongs to
+    ///   an attempt that did not settle the effect, so it must never be
+    ///   replayed); any transition out of `Executing` stamps
     ///   `attempt_ended_at`;
     /// - [`Transition::StartCompensation`] sets `compensation_attempts` to 1
     ///   and [`Transition::StartCompensationRetry`] increments it; both
@@ -242,6 +244,7 @@ impl EffectRecord {
                 self.attempt_started_at = Some(now);
                 self.attempt_ended_at = None;
                 self.next_attempt_at = None;
+                self.output = None;
             }
             Transition::ScheduleRetry
             | Transition::ResolvedRetry

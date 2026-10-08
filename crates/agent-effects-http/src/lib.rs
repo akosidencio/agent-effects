@@ -49,6 +49,7 @@
 //! | timeout or connection lost after sending | `Ambiguous` |
 //! | 2xx with an unreadable or unparseable body | `Ambiguous` (it applied, the answer was lost) |
 //! | 3xx (seen only when the client does not follow redirects) | `Ambiguous` |
+//! | any failing status after the client followed a redirect | `Ambiguous` (it answers for the redirect's target) |
 //! | 408, 425, 503 | `Transient` |
 //! | 429, or 503 with `Retry-After` | `RateLimited`, honouring `Retry-After` |
 //! | 400, 422 | `Validation` |
@@ -66,6 +67,13 @@
 //! client does not follow redirects: build the client with
 //! `.redirect(reqwest::redirect::Policy::none())` and say so with
 //! [`HttpEffect::client_follows_no_redirects`].
+//!
+//! The same goes for statuses: after a redirect, the status is the
+//! target's, so a failing one says nothing about the original request and
+//! is ambiguous. reqwest keeps no redirect history, so a redirect is seen
+//! by the response's URL differing from the request's; one that leads back
+//! to the same URL (`POST /orders` → `303` → `GET /orders`) is not seen.
+//! For irreversible writes, use a client that does not follow redirects.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -291,7 +299,8 @@ impl HttpEffect {
 
     /// Overrides how statuses are classified: return `Some` to decide,
     /// `None` to fall back to [`classify_status`]. For APIs with their own
-    /// conventions, e.g. a 409 that means "already done".
+    /// conventions, e.g. a 409 that means "already done". A failure after
+    /// a followed redirect is still ambiguous (see the [crate docs](crate)).
     pub fn classify_status(
         mut self,
         classify: impl Fn(StatusCode, &HeaderMap) -> Option<StatusClass> + Send + Sync + 'static,
@@ -351,8 +360,9 @@ impl HttpEffect {
                 let response = request.send_once(&ctx).await?;
                 let status = response.status();
                 // Only "not found" proves the effect did not apply; every
-                // other failure is a check that could not tell.
-                if matches!(status.as_u16(), 404 | 410) {
+                // other failure is a check that could not tell. So is a
+                // "not found" for a redirect's target.
+                if matches!(status.as_u16(), 404 | 410) && !request.redirected(&response) {
                     return Ok(Verification::NotApplied);
                 }
                 let body = request.success_body(response).await?;
@@ -375,6 +385,12 @@ impl HttpEffect {
         let response = self.send_once(ctx).await?;
         let status = response.status().as_u16();
         Ok((status, self.success_body(response).await?))
+    }
+
+    /// Whether the client followed a redirect to reach `response`: its
+    /// status then answers for the target, not for this request.
+    fn redirected(&self, response: &reqwest::Response) -> bool {
+        reqwest::Url::parse(&self.url).map_or(true, |url| &url != response.url())
     }
 
     /// Sends the request once. Fails only if no response arrived.
@@ -414,6 +430,7 @@ impl HttpEffect {
             .as_ref()
             .and_then(|classify| classify(status, response.headers()))
             .unwrap_or_else(|| classify_status(status, response.headers()));
+        let redirected = self.redirected(&response);
         match verdict {
             StatusClass::Success => {
                 // It applied; losing the body now makes the answer unknown.
@@ -424,17 +441,15 @@ impl HttpEffect {
                 })?;
                 Ok(body.to_vec())
             }
+            // The request may have applied before the redirect.
+            StatusClass::Failure(_) if redirected => {
+                let snippet = error_snippet(response).await;
+                Err(EffectFailure::ambiguous(format!(
+                    "HTTP {status} after following a redirect: {snippet}"
+                )))
+            }
             StatusClass::Failure(class) => {
-                let body = response.bytes().await.unwrap_or_default();
-                let mut snippet = String::from_utf8_lossy(&body).into_owned();
-                if snippet.len() > ERROR_BODY_LIMIT {
-                    let cut = (0..=ERROR_BODY_LIMIT)
-                        .rev()
-                        .find(|&i| snippet.is_char_boundary(i))
-                        .unwrap_or(0);
-                    snippet.truncate(cut);
-                    snippet.push('…');
-                }
+                let snippet = error_snippet(response).await;
                 Err(EffectFailure::new(
                     class,
                     format!("HTTP {status}: {snippet}"),
@@ -442,6 +457,28 @@ impl HttpEffect {
             }
         }
     }
+}
+
+/// The start of an error response's body, reading no more of it than the
+/// message keeps: the body may be huge, or never end.
+async fn error_snippet(mut response: reqwest::Response) -> String {
+    let mut body = Vec::new();
+    while body.len() <= ERROR_BODY_LIMIT {
+        match response.chunk().await {
+            Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+            Ok(None) | Err(_) => break,
+        }
+    }
+    let mut snippet = String::from_utf8_lossy(&body).into_owned();
+    if snippet.len() > ERROR_BODY_LIMIT {
+        let cut = (0..=ERROR_BODY_LIMIT)
+            .rev()
+            .find(|&i| snippet.is_char_boundary(i))
+            .unwrap_or(0);
+        snippet.truncate(cut);
+        snippet.push('…');
+    }
+    snippet
 }
 
 /// A successful response, as stored and replayed.

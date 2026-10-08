@@ -514,3 +514,63 @@ async fn a_caller_finishes_an_interrupted_closure_compensation() {
     );
     assert_eq!(remote.cancellations(RES), 1);
 }
+
+#[tokio::test(start_paused = true)]
+async fn an_interrupted_compensation_resumes_only_within_its_budget() {
+    quiet_crashes();
+    let store = MemoryStore::new();
+    let clock = TokioClock::new();
+    let remote = FakeRemote::new(clock);
+    let doomed = Runtime::builder(store.clone())
+        .clock(clock)
+        .worker_id(WorkerId::new("doomed"))
+        .lease_ttl(TTL)
+        .fault_injector(Arc::new(
+            FaultInjector::new()
+                .at(FaultPoint::AfterCompensationStarted)
+                .crash(),
+        ))
+        .build();
+    reserve(&doomed, &remote).await;
+    assert!(
+        release(&doomed, &remote, Some(RetryPolicy::NONE))
+            .await
+            .is_err()
+    );
+
+    // The one allowed attempt was started; starting another is a retry.
+    tokio::time::sleep(TTL).await;
+    let restarted = Runtime::builder(store.clone()).clock(clock).build();
+    let outcome = release(&restarted, &remote, Some(RetryPolicy::NONE))
+        .await
+        .unwrap();
+    let CompensationOutcome::Failed(error) = outcome else {
+        panic!("no budget left for a retry: {outcome:?}");
+    };
+    assert!(error.message.contains("interrupted"), "{}", error.message);
+    assert_eq!(remote.cancellations(RES), 0);
+
+    // An operator's retry is granted regardless of the budget.
+    let id = store
+        .get_by_key(&key("reserve", "k"))
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    restarted
+        .resolve(
+            id,
+            Resolution::Retry,
+            "operator:dennis",
+            "checked the provider",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        release(&restarted, &remote, Some(RetryPolicy::NONE))
+            .await
+            .unwrap(),
+        CompensationOutcome::Compensated
+    );
+    assert_eq!(remote.cancellations(RES), 1);
+}
