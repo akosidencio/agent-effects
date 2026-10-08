@@ -2,7 +2,7 @@
 
 <div align="center">
 
-[![Version: 0.1.0](https://img.shields.io/badge/Version-v0.1.0-blue)](CHANGELOG.md)
+[![Version: 0.1.1](https://img.shields.io/badge/Version-v0.1.1-blue)](CHANGELOG.md)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT_OR_Apache--2.0-blue.svg)](#license)
 [![Rust: 2024 Edition](https://img.shields.io/badge/Rust-2024_Edition-orange?logo=rust)](Cargo.toml)
 [![MSRV: Rust 1.90](https://img.shields.io/badge/MSRV-1.90%2B-orange?logo=rust)](#rust-crates-and-storage-backends)

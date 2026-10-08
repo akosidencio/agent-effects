@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*", "examples"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.90"
 license = "MIT OR Apache-2.0"
@@ -12,13 +12,13 @@ homepage = "https://github.com/akosidencio/agent-effects"
 authors = ["Dennis Paler"]
 
 [workspace.dependencies]
-agent-effects = { path = "crates/agent-effects", version = "0.1.0" }
-agent-effects-http = { path = "crates/agent-effects-http", version = "0.1.0" }
-agent-effects-memory = { path = "crates/agent-effects-memory", version = "0.1.0" }
-agent-effects-otel = { path = "crates/agent-effects-otel", version = "0.1.0" }
-agent-effects-postgres = { path = "crates/agent-effects-postgres", version = "0.1.0" }
-agent-effects-sqlite = { path = "crates/agent-effects-sqlite", version = "0.1.0" }
-agent-effects-store = { path = "crates/agent-effects-store", version = "0.1.0" }
+agent-effects = { path = "crates/agent-effects", version = "0.1.1" }
+agent-effects-http = { path = "crates/agent-effects-http", version = "0.1.1" }
+agent-effects-memory = { path = "crates/agent-effects-memory", version = "0.1.1" }
+agent-effects-otel = { path = "crates/agent-effects-otel", version = "0.1.1" }
+agent-effects-postgres = { path = "crates/agent-effects-postgres", version = "0.1.1" }
+agent-effects-sqlite = { path = "crates/agent-effects-sqlite", version = "0.1.1" }
+agent-effects-store = { path = "crates/agent-effects-store", version = "0.1.1" }
 
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.21"
