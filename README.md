@@ -219,23 +219,6 @@ podman run --rm -d -p 55432:5432 -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=effects 
 AGENT_EFFECTS_POSTGRES_URL=postgres://postgres:pw@localhost:55432/effects cargo test -p agent-effects-postgres
 ```
 
-## Releasing
-
-Bump `version` in `Cargo.toml`, move the CHANGELOG's `[Unreleased]` notes
-under `## [x.y.z]`, merge to `main`, then push a tag:
-
-```sh
-git tag -a v0.1.0 -m "agent-effects 0.1.0" && git push origin v0.1.0
-```
-
-[`release.yml`](.github/workflows/release.yml) then:
-
-1. checks that the tag, versions and changelog agree;
-2. re-runs CI at the tag;
-3. publishes each crate to crates.io (needs the `CARGO_REGISTRY_TOKEN`
-   secret);
-4. creates the GitHub release.
-
 ## License
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
