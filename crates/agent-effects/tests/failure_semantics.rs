@@ -5,6 +5,7 @@
 //! backoff schedules (seconds to minutes) complete instantly and
 //! deterministically.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -15,8 +16,8 @@ use agent_effects::store::{EffectStore, ErrorRecord, NewEffect, TransitionReques
 use agent_effects::testkit::{Behavior, FakeRemote};
 use agent_effects::{
     Clock, EffectContext, EffectFailure, EffectKey, EffectKind, EffectName, EffectOutcome,
-    FailureClass, LogicalKey, Precondition, RetryPolicy, Runtime, TokioClock, Transition,
-    Verification, WorkerId,
+    FailureClass, LogicalKey, Precondition, RetryPolicy, Runtime, RuntimeError, TokioClock,
+    Transition, Verification, WorkerId,
 };
 use agent_effects_memory::MemoryStore;
 use tokio::sync::Notify;
@@ -451,6 +452,91 @@ async fn one_call_makes_at_most_max_attempts_postcondition_checks() {
     );
     assert_eq!(checks.load(Ordering::SeqCst), 2);
     assert_eq!(remote.requests(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_check_budget_spans_every_attempt_of_a_call() {
+    // The first postcondition check proves the attempt did not apply, so the
+    // effect runs again; the second attempt's checks draw on what is left.
+    let (_, rt, _) = setup();
+    let checks = Arc::new(AtomicU32::new(0));
+    let attempts = Arc::new(AtomicU32::new(0));
+    let (counted, ran) = (Arc::clone(&checks), Arc::clone(&attempts));
+    let outcome = rt
+        .effect(NAME, "budget")
+        .retry(RetryPolicy {
+            max_attempts: 3,
+            ..RetryPolicy::NONE
+        })
+        .verify(move |_| {
+            let first = counted.fetch_add(1, Ordering::SeqCst) == 0;
+            async move {
+                Ok::<_, EffectFailure>(if first {
+                    Verification::<String>::NotApplied
+                } else {
+                    Verification::Inconclusive
+                })
+            }
+        })
+        .run(move |_| {
+            ran.fetch_add(1, Ordering::SeqCst);
+            async { Ok::<_, EffectFailure>("done".to_string()) }
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, EffectOutcome::Unknown { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        checks.load(Ordering::SeqCst),
+        3,
+        "max_attempts checks per call"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_output_from_an_attempt_that_did_not_apply_is_never_replayed() {
+    // JSON cannot store a map with non-string keys, unless it is empty. So
+    // attempt 1's (empty) output is stored, attempt 2's is not.
+    type Picky = BTreeMap<Vec<u8>, u8>;
+    let (store, rt, _) = setup();
+    let attempts = Arc::new(AtomicU32::new(0));
+    let checks = Arc::new(AtomicU32::new(0));
+    let second = || Picky::from([(vec![2], 2)]);
+    let run = || {
+        let (ran, counted) = (Arc::clone(&attempts), Arc::clone(&checks));
+        rt.effect(NAME, "picky")
+            .verify(move |_| {
+                let first = counted.fetch_add(1, Ordering::SeqCst) == 0;
+                async move {
+                    Ok::<_, EffectFailure>(if first {
+                        Verification::NotApplied
+                    } else {
+                        Verification::Confirmed(second())
+                    })
+                }
+            })
+            .run(move |_| {
+                let attempt = ran.fetch_add(1, Ordering::SeqCst) + 1;
+                async move {
+                    Ok::<_, EffectFailure>(if attempt == 1 { Picky::new() } else { second() })
+                }
+            })
+    };
+    assert_eq!(run().await.unwrap(), EffectOutcome::Committed(second()));
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    let record = store.get_by_key(&key("picky")).await.unwrap().unwrap();
+    assert_eq!(record.output, None, "attempt 1's output must not survive");
+
+    // A replay cannot return attempt 1's output as this effect's result.
+    let replay = run().await;
+    assert!(
+        matches!(replay, Err(RuntimeError::Output { .. })),
+        "{replay:?}"
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 2, "not run again");
 }
 
 #[tokio::test(start_paused = true)]

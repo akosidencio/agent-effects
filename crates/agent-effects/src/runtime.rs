@@ -9,6 +9,7 @@ use std::fmt::Display;
 use std::future::Future;
 use std::hash::BuildHasher;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime};
 
 use serde::Serialize;
@@ -579,6 +580,9 @@ impl<S: EffectStore> Runtime<S> {
             check_matches(&record, &spec)?;
         }
 
+        // Verification checks this call has made, across every attempt and
+        // lease it goes through: the budget is per call.
+        let checks_made = AtomicU32::new(0);
         for _ in 0..MAX_ROUNDS {
             if let Some(outcome) = observe(&record)? {
                 return Ok(outcome);
@@ -609,6 +613,7 @@ impl<S: EffectStore> Runtime<S> {
                 action: &action,
                 verifier: &verifier,
                 lease: &lease,
+                checks_made: &checks_made,
             };
             let advanced = driver.advance(current).await;
             if let Err(e) = store.release_lease(&lease).await {
@@ -660,6 +665,8 @@ struct Driver<'a, S, F, V> {
     action: &'a F,
     verifier: &'a V,
     lease: &'a Lease,
+    /// Verification checks made so far in this call.
+    checks_made: &'a AtomicU32,
 }
 
 impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
@@ -904,7 +911,7 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
             .await?;
         self.rt.checkpoint(FaultPoint::AfterVerificationStarted);
         let mode = self.spec.capabilities.verification;
-        let max_checks = self.retry().max_attempts.max(1);
+        let mut checks = 0;
         let mut last_problem = String::from("no check completed");
         // Settle delays count from the end of the attempt: a slow request
         // may write just before it returns. Both times come from the store's
@@ -917,7 +924,9 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
         });
         let started = tokio::time::Instant::now();
 
-        for check in 0..max_checks {
+        while self.take_check() {
+            let check = checks;
+            checks += 1;
             let Some(future) = self.verifier.check(context(&record)) else {
                 break;
             };
@@ -961,7 +970,7 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
                         }
                         NotFoundReading::TooEarly { wait } => {
                             last_problem = "not visible yet within the settle delay".into();
-                            if check + 1 < max_checks {
+                            if self.has_checks_left() {
                                 self.sleep(wait).await?;
                             }
                         }
@@ -971,7 +980,7 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
                     if last_problem == "no check completed" {
                         last_problem = "remote system could not tell".into();
                     }
-                    if check + 1 < max_checks {
+                    if self.has_checks_left() {
                         let delay =
                             self.retry()
                                 .delay(check, FailureClass::Transient, jitter_sample());
@@ -981,17 +990,30 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
             }
         }
 
+        if checks == 0 {
+            last_problem = "this call's checks were already spent".into();
+        }
         record = self
             .transition(&record, Transition::OutcomeUnknown, |r| {
                 r.error = Some(ErrorRecord {
                     class: Some(FailureClass::Ambiguous),
                     message: format!(
-                        "verification inconclusive after {max_checks} checks: {last_problem}"
+                        "verification inconclusive after {checks} checks: {last_problem}"
                     ),
                 });
             })
             .await?;
         Ok((record, None, true))
+    }
+
+    /// Takes one of this call's verification checks (`max_attempts` per
+    /// call, across every attempt it makes), if any are left.
+    fn take_check(&self) -> bool {
+        self.checks_made.fetch_add(1, Ordering::Relaxed) < self.retry().max_attempts.max(1)
+    }
+
+    fn has_checks_left(&self) -> bool {
+        self.checks_made.load(Ordering::Relaxed) < self.retry().max_attempts.max(1)
     }
 
     /// Records a trusted "not applied": re-run if the budget allows, else

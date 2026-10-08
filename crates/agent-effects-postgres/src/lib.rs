@@ -140,8 +140,8 @@ impl PostgresStore {
     }
 
     /// Loads `id` locked `FOR UPDATE`, applies `change` (given the
-    /// database's current time), and saves the record. The transaction stays
-    /// open for further writes.
+    /// database's current time once the lock is held), and saves the
+    /// record. The transaction stays open for further writes.
     async fn modify<T>(
         &self,
         id: EffectId,
@@ -149,7 +149,7 @@ impl PostgresStore {
     ) -> Result<(T, EffectRecord, Transaction<'static, Postgres>), StoreError> {
         let mut tx = self.pool.begin().await.map_err(StoreError::backend)?;
         let row = sqlx::query(AssertSqlSafe(format!(
-            "SELECT {COLUMNS}, clock_timestamp() AS db_now FROM effects WHERE id = $1 FOR UPDATE"
+            "SELECT {COLUMNS} FROM effects WHERE id = $1 FOR UPDATE"
         )))
         .bind(*id.as_uuid())
         .fetch_optional(&mut *tx)
@@ -157,7 +157,12 @@ impl PostgresStore {
         .map_err(StoreError::backend)?
         .ok_or(StoreError::NotFound(id))?;
         let mut record = decode_record(&row)?;
-        let db_now: OffsetDateTime = row.try_get("db_now").map_err(StoreError::backend)?;
+        // Read only now: a clock read in the locking statement is taken
+        // before waiting for the lock, and can be stale by the whole wait.
+        let db_now: OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(StoreError::backend)?;
         let read_version = record.version;
         let result = change(&mut record, SystemTime::from(db_now))?;
         normalize(&mut record);

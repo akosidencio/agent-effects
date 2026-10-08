@@ -30,6 +30,8 @@ enum Reply {
     ApplyThenRedirect(String),
     /// Never answer.
     Hang,
+    /// Answer `500` with a body that never ends.
+    EndlessError,
 }
 
 #[derive(Clone, Debug)]
@@ -50,7 +52,9 @@ struct State {
 }
 
 /// A tiny HTTP/1.1 server: POSTs create a resource (deduplicated on the
-/// `Idempotency-Key`), `GET /lookup` finds it, `GET /broken` answers 405.
+/// `Idempotency-Key`), `GET /lookup` finds it, `GET /broken` answers 405,
+/// `GET /unavailable` 503, `GET /missing` 404, and `GET /moved` redirects
+/// to `/missing`.
 #[derive(Clone)]
 struct Server {
     base: String,
@@ -101,6 +105,31 @@ fn apply(state: &mut State, key: Option<&String>) -> String {
     id
 }
 
+/// The answer to a `GET` of `path`.
+fn lookup(path: &str, applied: u32) -> (u16, Headers, String) {
+    match (path, applied) {
+        ("/broken", _) => (405, Vec::new(), "no".to_owned()),
+        ("/unavailable", _) => (503, Vec::new(), "down".to_owned()),
+        ("/missing", _) => (404, Vec::new(), "not found".to_owned()),
+        ("/moved", _) => (
+            303,
+            vec![("location", "/missing".to_owned())],
+            String::new(),
+        ),
+        (_, 0) => (404, Vec::new(), "not found".to_owned()),
+        (_, _) => (200, Vec::new(), r#"{"id":"res#1"}"#.to_owned()),
+    }
+}
+
+/// Answers `500` with a body that goes on until the client hangs up.
+async fn endless_error(stream: &mut TcpStream) {
+    let head = "HTTP/1.1 500 X\r\ntransfer-encoding: chunked\r\n\r\n";
+    let chunk = format!("{:x}\r\n{}\r\n", 4096, "x".repeat(4096));
+    if stream.write_all(head.as_bytes()).await.is_ok() {
+        while stream.write_all(chunk.as_bytes()).await.is_ok() {}
+    }
+}
+
 async fn handle(mut stream: TcpStream, state: Arc<Mutex<State>>) {
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -139,6 +168,7 @@ async fn handle(mut stream: TcpStream, state: Arc<Mutex<State>>) {
     let body = String::from_utf8_lossy(&buffer[head_end..]).into_owned();
     let key = headers.get("idempotency-key").cloned();
 
+    let mut endless = false;
     let answer = {
         let mut state = state.lock().unwrap();
         state.requests.push(Recorded {
@@ -148,11 +178,7 @@ async fn handle(mut stream: TcpStream, state: Arc<Mutex<State>>) {
             body,
         });
         if method == "GET" {
-            match (path.as_str(), state.applied) {
-                ("/broken", _) => Some((405, Vec::new(), "no".to_owned())),
-                (_, 0) => Some((404, Vec::new(), "not found".to_owned())),
-                (_, _) => Some((200, Vec::new(), r#"{"id":"res#1"}"#.to_owned())),
-            }
+            Some(lookup(&path, state.applied))
         } else {
             match state.script.pop_front() {
                 None => {
@@ -174,9 +200,16 @@ async fn handle(mut stream: TcpStream, state: Arc<Mutex<State>>) {
                     Some((303, vec![("location", location)], String::new()))
                 }
                 Some(Reply::Hang) => None,
+                Some(Reply::EndlessError) => {
+                    endless = true;
+                    None
+                }
             }
         }
     };
+    if endless {
+        return endless_error(&mut stream).await;
+    }
     let Some((status, extra, payload)) = answer else {
         return std::future::pending().await;
     };
@@ -592,4 +625,82 @@ async fn an_invalid_request_is_a_validation_failure_and_never_sent() {
         Some(FailureClass::Validation)
     );
     assert!(server.requests().is_empty());
+}
+
+#[tokio::test]
+async fn a_failing_status_after_a_redirect_is_ambiguous() {
+    // The POST applied, then the client followed the redirect to a target
+    // that failed. That failure says nothing about the POST: a 503 must not
+    // re-send it, a 405 must not report it failed.
+    for (target, logical) in [
+        ("/unavailable", "redirect-503"),
+        ("/broken", "redirect-405"),
+    ] {
+        let server = Server::start([
+            Reply::ApplyThenRedirect(target.into()),
+            Reply::ApplyThenRedirect(target.into()),
+            Reply::ApplyThenRedirect(target.into()),
+        ])
+        .await;
+        let store = MemoryStore::new();
+        let outcome = runtime(&store, NO_WAIT)
+            .effect("http.call", logical)
+            .kind(EffectKind::IrreversibleWrite)
+            .run(HttpEffect::post(&reqwest::Client::new(), server.url("/charges")).send())
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, EffectOutcome::NeedsIntervention { .. }),
+            "{target}: {outcome:?}"
+        );
+        assert_eq!(server.applied(), 1, "{target}: applied once");
+        let error = last_error(&store, logical).await;
+        assert_eq!(error.class, Some(FailureClass::Ambiguous), "{target}");
+        assert!(error.message.contains("redirect"), "{}", error.message);
+    }
+}
+
+#[tokio::test]
+async fn a_lookup_redirected_to_not_found_is_not_read_as_not_applied() {
+    // The POST applied and its answer was lost; the lookup is redirected to
+    // a 404. That 404 is the target's, so the POST must not be re-sent.
+    let server = Server::start([Reply::ApplyThenDrop]).await;
+    let client = reqwest::Client::new();
+    let outcome = runtime(&MemoryStore::new(), NO_WAIT)
+        .effect("http.call", "moved-lookup")
+        .verify(HttpEffect::get(&client, server.url("/moved")).verify_json::<Payment>())
+        .run(HttpEffect::post(&client, server.url("/charges")).send_json::<Payment>())
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, EffectOutcome::Unknown { .. }),
+        "{outcome:?}"
+    );
+    let posts = server
+        .requests()
+        .iter()
+        .filter(|r| r.method == "POST")
+        .count();
+    assert_eq!((posts, server.applied()), (1, 1), "never re-sent");
+}
+
+#[tokio::test]
+async fn an_endless_error_body_is_cut_short() {
+    let server = Server::start([Reply::EndlessError]).await;
+    let store = MemoryStore::new();
+    let call = runtime(&store, RetryPolicy::NONE)
+        .effect("http.call", "endless")
+        .run(HttpEffect::post(&reqwest::Client::new(), server.url("/x")).send_json::<Payment>());
+    let outcome = tokio::time::timeout(Duration::from_secs(10), call)
+        .await
+        .expect("reading the error body stops early")
+        .unwrap();
+    assert!(
+        matches!(outcome, EffectOutcome::NeedsIntervention { .. }),
+        "{outcome:?}"
+    );
+    let error = last_error(&store, "endless").await;
+    assert_eq!(error.class, Some(FailureClass::Ambiguous));
+    assert!(error.message.len() < 600, "{}", error.message.len());
+    assert!(error.message.ends_with('…'));
 }

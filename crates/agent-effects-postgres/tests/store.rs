@@ -127,6 +127,56 @@ async fn leases_follow_the_database_clock_not_the_workers() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lease_that_expires_while_waiting_for_the_row_lock_is_not_renewed() {
+    let Some(url) = url() else { return };
+    let store = fresh(&url, ClockSource::Database).await;
+    let record = store
+        .insert_or_get(NewEffect::new(
+            key("k"),
+            EffectKind::IrreversibleWrite,
+            SystemTime::now(),
+        ))
+        .await
+        .unwrap()
+        .record;
+    let lease = store
+        .acquire_lease(
+            record.id,
+            &WorkerId::new("a"),
+            SystemTime::now(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+    // Someone holds the row lock, without changing the row, past the
+    // lease's expiry.
+    let mut locker = store.pool().begin().await.unwrap();
+    sqlx::query("SELECT id FROM effects WHERE id = $1 FOR UPDATE")
+        .bind(*record.id.as_uuid())
+        .execute(&mut *locker)
+        .await
+        .unwrap();
+    let renewing = tokio::spawn({
+        let store = store.clone();
+        let lease = lease.clone();
+        async move {
+            store
+                .renew_lease(&lease, SystemTime::now(), Duration::from_secs(30))
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    locker.commit().await.unwrap();
+
+    let renewed = renewing.await.unwrap();
+    assert!(
+        matches!(renewed, Err(StoreError::LeaseLost)),
+        "the lease expired before the renewal got the row: {renewed:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_worker_behind_the_database_clock_takes_over_an_expired_lease() {
     let Some(url) = url() else { return };
     let store = fresh(&url, ClockSource::Database).await;

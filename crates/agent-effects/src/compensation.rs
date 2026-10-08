@@ -318,6 +318,51 @@ impl<S: EffectStore> Runtime<S> {
         Ok(CompensationOutcome::InProgress { id: record.id })
     }
 
+    /// Starts the next attempt of a compensation found `Compensating`, or
+    /// ends it `CompensationFailed` if that attempt is a retry the budget
+    /// does not allow.
+    async fn resume_compensation(
+        &self,
+        record: &EffectRecord,
+        lease: &Lease,
+        actor: Option<&str>,
+        policy: RetryPolicy,
+    ) -> Result<EffectRecord, Interrupt> {
+        let resumed = match record.next_attempt_at {
+            // A retry that was scheduled but has not started: it is not an
+            // attempt yet. Wait for it, then start it.
+            Some(at) => {
+                self.sleep_leased(lease, at).await?;
+                None
+            }
+            // An attempt that a crash or a dead worker cut short. Another
+            // one is a retry, so it needs budget left.
+            None if policy.allows_another(record.compensation_attempts) => {
+                Some(json!({ "resumed": true }))
+            }
+            None => {
+                return self
+                    .transition_leased(record, lease, actor, Transition::CompensationFailed, |r| {
+                        r.error = Some(ErrorRecord {
+                            class: Some(FailureClass::Ambiguous),
+                            message: "a compensation attempt was interrupted, and no retries \
+                                      are left"
+                                .into(),
+                        });
+                    })
+                    .await;
+            }
+        };
+        self.transition_leased(
+            record,
+            lease,
+            actor,
+            Transition::StartCompensationRetry,
+            |r| r.payload = resumed,
+        )
+        .await
+    }
+
     /// Starts or resumes the compensation and runs attempts until it
     /// succeeds or fails for good.
     async fn compensate_leased(
@@ -338,24 +383,13 @@ impl<S: EffectStore> Runtime<S> {
                 .await?
             }
             EffectStatus::Compensating => {
-                let resumed = match record.next_attempt_at {
-                    // A retry that was scheduled but has not started: it
-                    // is not an attempt yet. Wait for it, then start it.
-                    Some(at) => {
-                        self.sleep_leased(lease, at).await?;
-                        None
-                    }
-                    // An attempt that a crash or a dead worker cut short.
-                    None => Some(json!({ "resumed": true })),
-                };
-                self.transition_leased(
-                    &record,
-                    lease,
-                    actor,
-                    Transition::StartCompensationRetry,
-                    |r| r.payload = resumed,
-                )
-                .await?
+                let resumed = self
+                    .resume_compensation(&record, lease, actor, policy)
+                    .await?;
+                if resumed.status != EffectStatus::Compensating {
+                    return Ok(resumed);
+                }
+                resumed
             }
             _ => return Ok(record),
         };

@@ -54,6 +54,7 @@ where
     terminal_records_are_final(make_store().await).await;
     listing_filters_and_pages(make_store().await).await;
     doubt_is_persisted_and_guards_failure(make_store().await).await;
+    a_new_attempt_clears_the_output(make_store().await).await;
     compensation_is_persisted(make_store().await).await;
     approval_is_persisted(make_store().await).await;
     pruning_removes_only_settled_idle_old_records(make_store().await).await;
@@ -665,6 +666,46 @@ async fn doubt_is_persisted_and_guards_failure<S: EffectStore>(store: S) {
         "a failed attempt must not fail an effect that may have applied"
     );
     assert_eq!(reload(&store, record.id).await, record);
+}
+
+async fn a_new_attempt_clears_the_output<S: EffectStore>(store: S) {
+    let record = insert(&store, 1).await;
+    let lease = store
+        .acquire_lease(record.id, &worker("a"), t(0), TTL)
+        .await
+        .unwrap();
+    let record = drive(
+        &store,
+        record,
+        Some(&lease),
+        &[Transition::StartAttempt],
+        t(1),
+    )
+    .await;
+    let mut verify =
+        TransitionRequest::new(&record, Some(&lease), Transition::StartVerification, t(1));
+    verify.output = Some(json!({ "attempt": 1 }));
+    let record = store.transition(verify).await.unwrap();
+    assert_eq!(
+        reload(&store, record.id).await.output,
+        Some(json!({ "attempt": 1 }))
+    );
+    // Shown not to have applied; the next attempt must not inherit its
+    // output.
+    let record = drive(
+        &store,
+        record,
+        Some(&lease),
+        &[Transition::ScheduleRetry, Transition::StartAttempt],
+        t(2),
+    )
+    .await;
+    assert_eq!(record.output, None);
+    assert_eq!(
+        reload(&store, record.id).await.output,
+        None,
+        "the store must persist the cleared output"
+    );
 }
 
 async fn compensation_is_persisted<S: EffectStore>(store: S) {
