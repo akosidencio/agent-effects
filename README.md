@@ -4,7 +4,7 @@
 
 [![crates.io](https://img.shields.io/crates/v/agent-effects.svg)](https://crates.io/crates/agent-effects)
 [![docs.rs](https://img.shields.io/docsrs/agent-effects)](https://docs.rs/agent-effects)
-[![Version: 0.1.2](https://img.shields.io/badge/Version-v0.1.2-blue)](CHANGELOG.md)
+[![Version: 0.1.3](https://img.shields.io/badge/Version-v0.1.3-blue)](CHANGELOG.md)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT_OR_Apache--2.0-blue.svg)](#license)
 [![Rust: 2024 Edition](https://img.shields.io/badge/Rust-2024_Edition-orange?logo=rust)](Cargo.toml)
 [![MSRV: Rust 1.90](https://img.shields.io/badge/MSRV-1.90%2B-orange?logo=rust)](#rust-crates-and-storage-backends)
@@ -220,6 +220,7 @@ podman network create ae
 podman run --rm -d --name ae-pg --network ae -p 55432:5432 -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=effects postgres:17
 podman run --rm -d --network ae -p 56432:5432 -e DATABASE_URL=postgres://postgres:pw@ae-pg:5432/effects \
   -e AUTH_TYPE=scram-sha-256 -e POOL_MODE=transaction -e MAX_PREPARED_STATEMENTS=0 -e DEFAULT_POOL_SIZE=4 \
+  -e 'IGNORE_STARTUP_PARAMETERS= ' \
   docker.io/edoburu/pgbouncer:v1.25.2-p0
 AGENT_EFFECTS_POSTGRES_URL=postgres://postgres:pw@localhost:55432/effects \
 AGENT_EFFECTS_PGBOUNCER_URL=postgres://postgres:pw@localhost:56432/effects \
