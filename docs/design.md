@@ -767,6 +767,24 @@ hosts. It depends on `agent-effects-store` only, and runs the same pure
   `BOOLEAN`), with times kept at millisecond precision like SQLite. Its own
   migrations (`crates/agent-effects-postgres/migrations`) run under sqlx's
   advisory lock, so concurrent startups are safe.
+- **Sharing an application's database (0.1.2, `PostgresOptions`).** By
+  default the tables are found through `search_path` and the history is
+  `_sqlx_migrations`, which an application's own `sqlx` migrations also use:
+  its version 1 and ours collide. `schema(name)` names the schema in every
+  query and keeps the history in `name._sqlx_migrations`. The migration files
+  stay unqualified (their checksums must not change), so `migrate` runs them
+  on a connection detached from the pool with `search_path` set to the
+  schema, then closes it. `migrate` needs a direct connection (session
+  advisory lock); `attach` uses any pool without migrating, after checking
+  that every migration is applied with the store's checksum.
+- **Transaction-mode poolers (`transaction_pooling`).** A pooler such as
+  PgBouncer in transaction mode may give each transaction, and each statement
+  outside one, a different server. Named prepared statements then fail, and
+  so do unnamed ones outside a transaction: sqlx sends Parse/Describe/Sync,
+  waits, then Bind/Execute/Sync, and the bind can reach a server that parsed
+  another client's statement (measured: 4,678 failures in 9,600 concurrent
+  calls). So every query is non-persistent and every store operation runs in
+  a transaction, at the cost of a `BEGIN`/`COMMIT` on reads.
 - **Tests.** They run against a real Postgres (`AGENT_EFFECTS_POSTGRES_URL`)
   and skip without one. CI's `postgres` job runs them against a service
   container with `AGENT_EFFECTS_REQUIRE_POSTGRES=1`, so a missing database
@@ -778,6 +796,12 @@ hosts. It depends on `agent-effects-store` only, and runs the same pure
   - pruning by the database's clock (a caller a day ahead prunes nothing
     just settled) that skips locked rows;
   - the runtime replaying across pools;
+  - a schema of its own beside an application's migrations, the clash
+    without one, and `attach` refusing an unmigrated schema;
+  - the conformance suite in a named schema with transaction pooling, and
+    through a real PgBouncer in transaction mode (CI service; skipped
+    without `AGENT_EFFECTS_PGBOUNCER_URL`) with many workers on few server
+    connections;
   - three worker processes running 150 effects with no duplicates.
 
   Mutation checks: the worker-clock-only, no-row-lock and no-`SKIP LOCKED`
@@ -1120,6 +1144,7 @@ Crates are added when their milestone starts, not as empty placeholders.
 | D41 | 2026-10-07 | The runtime never judges lease liveness with its own clock; it calls `acquire_lease` and treats `LeaseHeld` as `InProgress` | A worker behind `PostgresStore`'s database clock reported `InProgress` for expired leases, delaying takeover |
 | D42 | 2026-10-07 | `StartCompensationRetry` counts a compensation retry when it starts, not when it is scheduled | A retry that fell due while its worker was down was counted twice and spent the budget early |
 | D43 | 2026-10-07 | `agent-effects-http`: connection failures are ambiguous unless the effect declares `.client_follows_no_redirects()`; unfollowed 3xx are ambiguous | A redirect's unreachable target fails exactly like the original host after the original request applied |
+| D44 | 2026-10-16 | `PostgresOptions` (0.1.2): `schema`, separate `migrate`/`attach`, `transaction_pooling` (non-persistent statements, every operation in a transaction), `max_connections`; defaults unchanged | An application sharing its database through PgBouncer hit four blockers: the shared `_sqlx_migrations` history, `search_path` not carried by the pooler, migrations needing a session lock, and prepared statements across servers. Unnamed statements alone still fail outside a transaction |
 
 ## Open questions
 

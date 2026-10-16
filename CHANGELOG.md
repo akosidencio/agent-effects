@@ -5,6 +5,28 @@ All notable changes are listed here, following
 [Semantic Versioning](https://semver.org/). Before 1.0, minor releases may
 break the API or storage format.
 
+## [0.1.2]
+
+### Added
+
+- PostgreSQL: `PostgresOptions`, for a database shared with an application,
+  including through PgBouncer:
+  - `schema(name)` keeps the store's tables and its own migration history
+    (`name._sqlx_migrations`) in one schema, named in every query, so the
+    store no longer depends on `search_path` or collides with the
+    application's `sqlx` migrations.
+  - `migrate(&pool)` and `attach(pool)` are separate steps: migrate over a
+    direct connection, attach to a pooled one without migrating. `attach`
+    checks that every migration is applied and is the store's own.
+  - `transaction_pooling(true)` for a pooler in transaction mode: statements
+    are never prepared for reuse, and every store operation runs in a
+    transaction, so a statement's parse and execution reach the same server.
+    Unnamed statements alone are not enough: outside a transaction, PgBouncer
+    may send the bind to a different server.
+  - `max_connections(n)` for the pool `connect` opens, previously fixed at 10.
+
+`PostgresStore::connect`, `connect_with` and `from_pool` behave as before.
+
 ## [0.1.1]
 
 ### Fixed

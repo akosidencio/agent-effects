@@ -4,7 +4,7 @@
 
 [![crates.io](https://img.shields.io/crates/v/agent-effects.svg)](https://crates.io/crates/agent-effects)
 [![docs.rs](https://img.shields.io/docsrs/agent-effects)](https://docs.rs/agent-effects)
-[![Version: 0.1.1](https://img.shields.io/badge/Version-v0.1.1-blue)](CHANGELOG.md)
+[![Version: 0.1.2](https://img.shields.io/badge/Version-v0.1.2-blue)](CHANGELOG.md)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT_OR_Apache--2.0-blue.svg)](#license)
 [![Rust: 2024 Edition](https://img.shields.io/badge/Rust-2024_Edition-orange?logo=rust)](Cargo.toml)
 [![MSRV: Rust 1.90](https://img.shields.io/badge/MSRV-1.90%2B-orange?logo=rust)](#rust-crates-and-storage-backends)
@@ -190,7 +190,7 @@ still applies.
 | [`agent-effects-sqlite`](crates/agent-effects-sqlite) | SQLite store; several processes may share one file. |
 | [`agent-effects-http`](crates/agent-effects-http) | HTTP requests as effects (reqwest): failure classification, `Idempotency-Key`. |
 | [`agent-effects-otel`](crates/agent-effects-otel) | OpenTelemetry metrics through an `EffectObserver`. |
-| [`agent-effects-postgres`](crates/agent-effects-postgres) | PostgreSQL store for many workers on many hosts; leases use the database's clock. |
+| [`agent-effects-postgres`](crates/agent-effects-postgres) | PostgreSQL store for many workers on many hosts; leases use the database's clock. Can share an application's database, in a schema of its own, through PgBouncer in transaction mode. |
 | [`agent-effects-memory`](crates/agent-effects-memory) | In-memory store for tests and development. |
 | [`agent-effects-store`](crates/agent-effects-store) | Storage contract and state machine, for writing new backends; includes the backend conformance suite (`testkit`). |
 
@@ -214,9 +214,16 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
 cargo +1.90 test --workspace --exclude agent-effects-sqlite --exclude agent-effects-postgres --all-features   # MSRV
 cargo +1.94 test -p agent-effects-sqlite -p agent-effects-postgres                                           # their MSRV (sqlx)
 
-# PostgreSQL tests (they skip without a database):
-podman run --rm -d -p 55432:5432 -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=effects postgres:17
-AGENT_EFFECTS_POSTGRES_URL=postgres://postgres:pw@localhost:55432/effects cargo test -p agent-effects-postgres
+# PostgreSQL tests (they skip without a database), and through PgBouncer in
+# transaction mode (skipped without AGENT_EFFECTS_PGBOUNCER_URL):
+podman network create ae
+podman run --rm -d --name ae-pg --network ae -p 55432:5432 -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=effects postgres:17
+podman run --rm -d --network ae -p 56432:5432 -e DATABASE_URL=postgres://postgres:pw@ae-pg:5432/effects \
+  -e AUTH_TYPE=scram-sha-256 -e POOL_MODE=transaction -e MAX_PREPARED_STATEMENTS=0 -e DEFAULT_POOL_SIZE=4 \
+  docker.io/edoburu/pgbouncer:v1.25.2-p0
+AGENT_EFFECTS_POSTGRES_URL=postgres://postgres:pw@localhost:55432/effects \
+AGENT_EFFECTS_PGBOUNCER_URL=postgres://postgres:pw@localhost:56432/effects \
+  cargo test -p agent-effects-postgres
 ```
 
 ## License
