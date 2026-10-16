@@ -3,6 +3,9 @@
 //! through one uses it: migrated over a direct connection, attached to the
 //! pooled one.
 //!
+//! CI's PgBouncer ignores no startup parameters, so the pooled pool turns
+//! off sqlx's `extra_float_digits`, as an application's must.
+//!
 //! Set `AGENT_EFFECTS_PGBOUNCER_URL` to a PgBouncer in front of the database
 //! at `AGENT_EFFECTS_POSTGRES_URL` to run them; without both they are
 //! skipped.
@@ -13,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use agent_effects::store::ListQuery;
 use agent_effects::{EffectFailure, EffectOutcome, EffectStatus, EffectStore, Runtime, WorkerId};
 use agent_effects_postgres::{ClockSource, PostgresOptions, PostgresStore};
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
 fn urls() -> Option<(String, String)> {
     let direct = std::env::var("AGENT_EFFECTS_POSTGRES_URL").ok();
@@ -46,9 +49,10 @@ async fn attached(direct: &str, pooled: &str, connections: u32) -> PostgresStore
         .unwrap();
     options.migrate(&direct).await.unwrap();
     direct.close().await;
+    let pooled: PgConnectOptions = pooled.parse().unwrap();
     let pool = PgPoolOptions::new()
         .max_connections(connections)
-        .connect(pooled)
+        .connect_with(pooled.extra_float_digits(None))
         .await
         .unwrap();
     options.attach(pool).await.unwrap()

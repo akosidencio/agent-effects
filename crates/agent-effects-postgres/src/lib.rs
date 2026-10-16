@@ -25,15 +25,25 @@
 //!   query safe through a pooler in transaction mode.
 //!
 //! ```no_run
-//! # async fn demo(direct: sqlx::PgPool, pooled: sqlx::PgPool) -> Result<(), agent_effects_store::StoreError> {
+//! # async fn demo(direct: sqlx::PgPool) -> Result<(), Box<dyn std::error::Error>> {
 //! use agent_effects_postgres::PostgresOptions;
+//! use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 //!
 //! let options = PostgresOptions::new()
 //!     .schema("agent_effects")
 //!     .transaction_pooling(true);
 //! // Once, at deploy or startup, over a direct connection to Postgres.
 //! options.migrate(&direct).await?;
-//! // The application's pool, which goes through PgBouncer.
+//! // The application's pool, which goes through PgBouncer. sqlx sends the
+//! // `extra_float_digits` startup parameter unless told not to, and a
+//! // PgBouncer that does not ignore it refuses the connection.
+//! let pooled = PgPoolOptions::new()
+//!     .connect_with(
+//!         "postgres://app@pgbouncer:6432/app"
+//!             .parse::<PgConnectOptions>()?
+//!             .extra_float_digits(None),
+//!     )
+//!     .await?;
 //! let store = options.attach(pooled).await?;
 //! # Ok(())
 //! # }
@@ -150,6 +160,14 @@ impl PostgresOptions {
     /// that a statement's parse, bind and execution all reach the same
     /// server. Reads that would otherwise run alone cost a `BEGIN` and a
     /// `COMMIT` more.
+    ///
+    /// The pool is the application's, so its connect options are too. Two of
+    /// sqlx's matter behind a pooler: turn off the `extra_float_digits`
+    /// startup parameter (`PgConnectOptions::extra_float_digits(None)`)
+    /// unless the pooler ignores it, and do not set `search_path` through
+    /// `PgConnectOptions::options`, which a pooler does not pass on; use
+    /// [`schema`](Self::schema) instead. The store has no float columns, so
+    /// it does not depend on `extra_float_digits`.
     #[must_use]
     pub fn transaction_pooling(mut self, enabled: bool) -> Self {
         self.transaction_pooling = enabled;
@@ -167,6 +185,11 @@ impl PostgresOptions {
 
     /// Connects to `url`, applies migrations, and attaches.
     ///
+    /// Migrating needs a direct connection (see [`migrate`](Self::migrate)),
+    /// so `url` must not go through a pooler in transaction mode; for that,
+    /// [`migrate`](Self::migrate) directly and [`attach`](Self::attach) to the
+    /// pooled pool.
+    ///
     /// # Errors
     ///
     /// [`StoreError::Backend`] if connecting or migrating fails.
@@ -175,7 +198,8 @@ impl PostgresOptions {
         self.connect_with(options).await
     }
 
-    /// Connects with `options`, applies migrations, and attaches.
+    /// Connects with `options`, applies migrations, and attaches. Like
+    /// [`connect`](Self::connect), it needs a direct connection.
     ///
     /// # Errors
     ///
@@ -197,7 +221,9 @@ impl PostgresOptions {
     ///
     /// `pool` must reach Postgres directly, not through a pooler in
     /// transaction mode: migrations hold a session-level advisory lock, so
-    /// concurrent callers are safe. With a [schema](Self::schema), the
+    /// concurrent callers are safe. Through such a pooler the lock can be
+    /// left held on a server connection, blocking every later migration in
+    /// the database, the application's included. With a [schema](Self::schema), the
     /// connection used is closed afterwards instead of going back to the
     /// pool, so `pool` keeps its own `search_path`.
     ///
@@ -218,7 +244,9 @@ impl PostgresOptions {
         result
     }
 
-    /// Uses `pool` without migrating; `pool` may go through a pooler.
+    /// Uses `pool` without migrating; `pool` may go through a pooler (see
+    /// [`transaction_pooling`](Self::transaction_pooling) for its connect
+    /// options).
     ///
     /// Checks that every migration this version needs has been applied, so a
     /// missing [`migrate`](Self::migrate) fails here rather than on the first

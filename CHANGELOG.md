@@ -5,6 +5,22 @@ All notable changes are listed here, following
 [Semantic Versioning](https://semver.org/). Before 1.0, minor releases may
 break the API or storage format.
 
+## [0.1.3]
+
+### Changed
+
+- PostgreSQL: documented the connect options a pool behind PgBouncer needs:
+  `extra_float_digits(None)`, since sqlx sends that startup parameter by
+  default and a PgBouncer that does not ignore it refuses the connection, and
+  no `search_path` through `options`. The store has no float columns and does
+  not depend on it.
+- PostgreSQL: `PostgresOptions::connect` and `connect_with` are documented as
+  needing a direct connection, since they migrate; through a pooler in
+  transaction mode the migration lock can be left held. Use `migrate` over a
+  direct connection and `attach` to the pooled pool.
+- CI's PgBouncer ignores no startup parameters, so the PgBouncer tests run
+  against the strictest configuration.
+
 ## [0.1.2]
 
 ### Added

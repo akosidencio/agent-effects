@@ -125,10 +125,13 @@ jobs:
           --health-timeout 5s
           --health-retries 30
       # Transaction mode with no prepared statements, as applications that
-      # share their database through PgBouncer run it.
+      # share their database through PgBouncer run it, and strict: no startup
+      # parameter is ignored. The image falls back to ignoring
+      # extra_float_digits when the variable is empty, hence the space.
       pgbouncer:
         image: edoburu/pgbouncer:v1.25.2-p0
         env:
+          IGNORE_STARTUP_PARAMETERS: " "
           DATABASE_URL: postgres://postgres:pw@postgres:5432/effects
           AUTH_TYPE: scram-sha-256
           POOL_MODE: transaction

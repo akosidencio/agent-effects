@@ -784,7 +784,12 @@ hosts. It depends on `agent-effects-store` only, and runs the same pure
   waits, then Bind/Execute/Sync, and the bind can reach a server that parsed
   another client's statement (measured: 4,678 failures in 9,600 concurrent
   calls). So every query is non-persistent and every store operation runs in
-  a transaction, at the cost of a `BEGIN`/`COMMIT` on reads.
+  a transaction, at the cost of a `BEGIN`/`COMMIT` on reads. The pool's
+  connect options stay the application's: behind a PgBouncer that ignores no
+  startup parameters it needs `extra_float_digits(None)` (0.1.3, documented
+  and tested; the store does not turn it off itself, since `attach` must not
+  change the application's pool and `connect` migrates, which needs a direct
+  connection anyway).
 - **Tests.** They run against a real Postgres (`AGENT_EFFECTS_POSTGRES_URL`)
   and skip without one. CI's `postgres` job runs them against a service
   container with `AGENT_EFFECTS_REQUIRE_POSTGRES=1`, so a missing database
@@ -799,9 +804,9 @@ hosts. It depends on `agent-effects-store` only, and runs the same pure
   - a schema of its own beside an application's migrations, the clash
     without one, and `attach` refusing an unmigrated schema;
   - the conformance suite in a named schema with transaction pooling, and
-    through a real PgBouncer in transaction mode (CI service; skipped
-    without `AGENT_EFFECTS_PGBOUNCER_URL`) with many workers on few server
-    connections;
+    through a real PgBouncer in transaction mode that ignores no startup
+    parameters (CI service; skipped without `AGENT_EFFECTS_PGBOUNCER_URL`)
+    with many workers on few server connections;
   - three worker processes running 150 effects with no duplicates.
 
   Mutation checks: the worker-clock-only, no-row-lock and no-`SKIP LOCKED`
