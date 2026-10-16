@@ -1,0 +1,2 @@
+# Product names that read as code to clippy::doc_markdown; ".." keeps the defaults.
+doc-valid-idents = ["PgBouncer", ".."]

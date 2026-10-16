@@ -16,9 +16,10 @@ use agent_effects::{
     EffectFailure, EffectKey, EffectKind, EffectName, EffectOutcome, EffectStatus, LogicalKey,
     ManualClock, Runtime, Transition, WorkerId,
 };
-use agent_effects_postgres::{ClockSource, PostgresStore};
-use sqlx::Executor;
-use sqlx::postgres::PgConnectOptions;
+use agent_effects_postgres::{ClockSource, PostgresOptions, PostgresStore};
+use sqlx::migrate::{Migration, MigrationType, Migrator};
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::{Executor, SqlSafeStr};
 
 fn url() -> Option<String> {
     let url = std::env::var("AGENT_EFFECTS_POSTGRES_URL").ok();
@@ -57,6 +58,130 @@ async fn passes_the_conformance_suite() {
     let Some(url) = url() else { return };
     // The suite drives time itself, so the store takes the caller's clock.
     agent_effects_store::testkit::conformance(|| fresh(&url, ClockSource::Caller)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn passes_the_conformance_suite_in_a_named_schema_with_transaction_pooling() {
+    let Some(url) = url() else { return };
+    agent_effects_store::testkit::conformance(|| async {
+        // No search_path: every query must name the schema.
+        let options = PostgresOptions::new()
+            .schema(format!("s_{}", uuid_like()))
+            .transaction_pooling(true)
+            .max_connections(4);
+        options
+            .connect(&url)
+            .await
+            .unwrap()
+            .with_clock_source(ClockSource::Caller)
+    })
+    .await;
+}
+
+/// An application's own `sqlx` migrations, with a version 1 of their own.
+fn application_migrator() -> Migrator {
+    Migrator::with_migrations(vec![Migration::new(
+        1,
+        "assistant".into(),
+        MigrationType::Simple,
+        "CREATE TABLE carts (id BIGINT PRIMARY KEY)".into_sql_str(),
+        false,
+    )])
+}
+
+/// The application's schema and a one-connection pool on it, migrated, as
+/// the application has it.
+async fn application(url: &str) -> (String, sqlx::PgPool) {
+    let schema = format!("app_{}", uuid_like());
+    let admin = sqlx::PgPool::connect(url).await.unwrap();
+    admin
+        .execute(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+        .await
+        .unwrap();
+    let options: PgConnectOptions = url.parse().unwrap();
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options.options([("search_path", schema.as_str())]))
+        .await
+        .unwrap();
+    application_migrator().run(&pool).await.unwrap();
+    (schema, pool)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sharing_an_applications_migration_history_is_refused() {
+    let Some(url) = url() else { return };
+    let (_, pool) = application(&url).await;
+    let migrated = PostgresStore::from_pool(pool.clone()).await;
+    assert!(migrated.is_err(), "version 1 is the application's");
+    let attached = PostgresOptions::new().attach(pool).await.unwrap_err();
+    assert!(
+        attached.to_string().contains("not agent-effects' own"),
+        "{attached}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_schema_of_its_own_lives_beside_an_applications_migrations() {
+    let Some(url) = url() else { return };
+    let (app_schema, pool) = application(&url).await;
+    // Case, a space and a quote: the name is never spliced in as SQL.
+    let ours = format!("Agent \"Effects\" {}", uuid_like());
+    let options = PostgresOptions::new().schema(&ours);
+    options.migrate(&pool).await.unwrap();
+    options.migrate(&pool).await.unwrap();
+
+    // The application's migrations still run, and its one connection still
+    // has its own search_path.
+    application_migrator().run(&pool).await.unwrap();
+    let path: String = sqlx::query_scalar("SHOW search_path")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(path, app_schema);
+
+    let store = options.attach(pool.clone()).await.unwrap();
+    let outcome = Runtime::new(store)
+        .effect("cart.add", "molly-1")
+        .run(|_| async { Ok::<_, EffectFailure>(1_u32) })
+        .await
+        .unwrap();
+    assert_eq!(outcome, EffectOutcome::Committed(1));
+    let quoted = format!("\"{}\"", ours.replace('"', "\"\""));
+    let rows: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT count(*) FROM {quoted}.effects"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows, 1, "the effect is in the store's schema");
+    let app_tables: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.tables WHERE table_schema = $1 \
+         AND table_name IN ('effects', 'effect_events')",
+    )
+    .bind(&app_schema)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        app_tables, 0,
+        "nothing of the store's in the application's schema"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attach_refuses_a_schema_that_was_never_migrated() {
+    let Some(url) = url() else { return };
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let error = PostgresOptions::new()
+        .schema(format!("never_{}", uuid_like()))
+        .attach(pool)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("PostgresOptions::migrate"),
+        "{error}"
+    );
 }
 
 fn key(logical: &str) -> EffectKey {

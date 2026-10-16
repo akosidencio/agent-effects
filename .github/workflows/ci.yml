@@ -124,10 +124,24 @@ jobs:
           --health-interval 2s
           --health-timeout 5s
           --health-retries 30
+      # Transaction mode with no prepared statements, as applications that
+      # share their database through PgBouncer run it.
+      pgbouncer:
+        image: edoburu/pgbouncer:v1.25.2-p0
+        env:
+          DATABASE_URL: postgres://postgres:pw@postgres:5432/effects
+          AUTH_TYPE: scram-sha-256
+          POOL_MODE: transaction
+          MAX_PREPARED_STATEMENTS: "0"
+          DEFAULT_POOL_SIZE: "4"
+          MAX_CLIENT_CONN: "500"
+        ports: ["6432:5432"]
     env:
       AGENT_EFFECTS_POSTGRES_URL: postgres://postgres:pw@localhost:5432/effects
+      AGENT_EFFECTS_PGBOUNCER_URL: postgres://postgres:pw@localhost:6432/effects
       # Without the database the tests skip; here that must be a failure.
       AGENT_EFFECTS_REQUIRE_POSTGRES: "1"
+      AGENT_EFFECTS_REQUIRE_PGBOUNCER: "1"
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install stable --profile minimal --no-self-update
@@ -139,8 +153,8 @@ jobs:
             target
           key: postgres-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: postgres-${{ runner.os }}-
-      # Conformance, database clock, lock-skipping scans, the runtime, and
-      # three worker processes on one database.
+      # Conformance, database clock, lock-skipping scans, the runtime, three
+      # worker processes on one database, a schema of its own, and PgBouncer.
       - run: cargo +stable test -p agent-effects-postgres --locked
 
   docs:
