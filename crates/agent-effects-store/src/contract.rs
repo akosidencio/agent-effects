@@ -77,3 +77,37 @@ impl ExecutionContract {
         self == requested
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn compatibility_never_grants_changed_execution_assumptions(
+            remote in any::<bool>(), approval in any::<bool>(),
+            automatic in any::<bool>(), attempts in any::<u32>(),
+            format in 2_u32..u32::MAX,
+        ) {
+            let mut stored = ExecutionContract::new(EffectKind::IrreversibleWrite, attempts);
+            stored.remote_idempotency = remote;
+            stored.require_approval = approval;
+            stored.automatic_retry = automatic;
+            prop_assert!(stored.permits(&stored));
+            let mut changed = stored.clone();
+            changed.remote_idempotency = !remote;
+            prop_assert!(!stored.permits(&changed));
+            changed = stored.clone();
+            changed.require_approval = !approval;
+            prop_assert!(!stored.permits(&changed));
+            changed = stored.clone();
+            changed.automatic_retry = !automatic;
+            prop_assert!(!stored.permits(&changed));
+            changed = stored.clone();
+            changed.format_version = format;
+            prop_assert!(!stored.permits(&changed));
+            prop_assert!(!changed.permits(&changed));
+        }
+    }
+}

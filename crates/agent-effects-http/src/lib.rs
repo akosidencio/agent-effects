@@ -42,6 +42,9 @@
 //! between is ambiguous, and the runtime then verifies, re-runs only if
 //! safe, or escalates.
 //!
+//! With a declared no-redirect client, response statuses map as follows.
+//! Otherwise every failure response is ambiguous.
+//!
 //! | Outcome | Class |
 //! |---|---|
 //! | connect, DNS or TLS failure | `Ambiguous`; `Transient` (never sent) only with [`HttpEffect::client_follows_no_redirects`] |
@@ -73,10 +76,11 @@
 //!
 //! The same goes for statuses: after a redirect, the status is the
 //! target's, so a failing one says nothing about the original request and
-//! is ambiguous. reqwest keeps no redirect history, so a redirect is seen
-//! by the response's URL differing from the request's; one that leads back
-//! to the same URL (`POST /orders` → `303` → `GET /orders`) is not seen.
-//! For irreversible writes, use a client that does not follow redirects.
+//! is ambiguous. reqwest keeps no redirect history: comparing URLs cannot
+//! detect a redirect back to the original URL. Consequently every failing
+//! response remains ambiguous unless the application declares a client that
+//! follows no redirects. The status table's definite failures and negative
+//! verification lookups require that declaration too.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -344,7 +348,8 @@ impl HttpEffect {
 
     /// A verification: a lookup whose 2xx response, parsed as JSON `T`,
     /// confirms the effect, and whose 404 or 410 (only those) says it did not
-    /// apply. Any other status or error is a failed check, which the runtime
+    /// apply when a no-redirect client is declared with
+    /// [`Self::client_follows_no_redirects`]. Any other status or error is a failed check, which the runtime
     /// treats as inconclusive: a broken lookup must never be read as "not
     /// applied". Pass it to `.verify(..)` if the lookup reads its own
     /// writes, else to `.verify_eventually(settle, ..)`.
@@ -360,7 +365,10 @@ impl HttpEffect {
                 // Only "not found" proves the effect did not apply; every
                 // other failure is a check that could not tell. So is a
                 // "not found" for a redirect's target.
-                if matches!(status.as_u16(), 404 | 410) && !request.redirected(&response) {
+                if matches!(status.as_u16(), 404 | 410)
+                    && request.no_redirects
+                    && !request.redirected(&response)
+                {
                     return Ok(Verification::NotApplied);
                 }
                 let body = request.success_body(response).await?;
@@ -429,7 +437,7 @@ impl HttpEffect {
             .as_ref()
             .and_then(|classify| classify(status, response.headers()))
             .unwrap_or_else(|| classify_status(status, response.headers()));
-        let redirected = self.redirected(&response);
+        let redirected = !self.no_redirects || self.redirected(&response);
         match verdict {
             StatusClass::Success => {
                 // It applied; losing the body now makes the answer unknown.
@@ -445,7 +453,7 @@ impl HttpEffect {
                 let snippet = error_snippet(response).await;
                 Err(with_delay(
                     EffectFailure::ambiguous(format!(
-                        "HTTP {status} after following a redirect: {snippet}"
+                        "HTTP {status} after following or possibly following a redirect: {snippet}"
                     )),
                     retry_delay,
                 ))

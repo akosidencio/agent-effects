@@ -309,7 +309,7 @@ async fn a_success_sends_json_and_the_idempotency_key() {
 
 #[tokio::test]
 async fn statuses_reach_the_runtime_as_failure_classes() {
-    let client = reqwest::Client::new();
+    let client = client_without_redirects();
     let cases: Vec<(u16, Headers, FailureClass)> = vec![
         (400, vec![], FailureClass::Validation),
         (401, vec![], FailureClass::Authentication),
@@ -333,7 +333,11 @@ async fn statuses_reach_the_runtime_as_failure_classes() {
         let store = MemoryStore::new();
         let outcome = runtime(&store, RetryPolicy::NONE)
             .effect("http.call", status)
-            .run(HttpEffect::post(&client, server.url("/x")).send_json::<Payment>())
+            .run(
+                HttpEffect::post(&client, server.url("/x"))
+                    .client_follows_no_redirects()
+                    .send_json::<Payment>(),
+            )
             .await
             .unwrap();
         let error = last_error(&store, &status.to_string()).await;
@@ -542,11 +546,15 @@ async fn a_lookup_that_finds_nothing_lets_the_effect_run_again() {
     // The first request is lost before it applies; the lookup's 404 proves
     // that, so the runtime sends it again.
     let server = Server::start([Reply::Hang]).await;
-    let client = reqwest::Client::new();
+    let client = client_without_redirects();
     let outcome = runtime(&MemoryStore::new(), NO_WAIT)
         .effect("http.call", "lost")
         .kind(EffectKind::IrreversibleWrite)
-        .verify(HttpEffect::get(&client, server.url("/lookup")).verify_json::<Payment>())
+        .verify(
+            HttpEffect::get(&client, server.url("/lookup"))
+                .client_follows_no_redirects()
+                .verify_json::<Payment>(),
+        )
         .run(
             HttpEffect::post(&client, server.url("/charges"))
                 .timeout(Duration::from_millis(300))
@@ -824,7 +832,8 @@ async fn trusted_provider_can_override_a_documented_rejection() {
         .effect("http.call", "provider-rejection")
         .kind(EffectKind::IrreversibleWrite)
         .run(
-            HttpEffect::post(&reqwest::Client::new(), server.url("/charges"))
+            HttpEffect::post(&client_without_redirects(), server.url("/charges"))
+                .client_follows_no_redirects()
                 .classify_status(|status, _| {
                     (status.as_u16() == 503)
                         .then_some(StatusClass::Failure(FailureClass::Transient))
@@ -865,4 +874,25 @@ async fn retry_after_on_an_ambiguous_response_delays_a_safe_retry() {
     );
     assert!(started.elapsed() >= Duration::from_secs(1));
     assert_eq!((server.requests().len(), server.applied()), (2, 1));
+}
+
+#[tokio::test]
+async fn redirecting_back_to_the_same_url_cannot_prove_a_write_failed() {
+    let server = Server::start([Reply::ApplyThenRedirect("/missing".into())]).await;
+    let outcome = runtime(&MemoryStore::new(), NO_WAIT)
+        .effect("http.call", "same-url")
+        .kind(EffectKind::IrreversibleWrite)
+        .run(HttpEffect::post(&reqwest::Client::new(), server.url("/missing")).send())
+        .await
+        .unwrap();
+    assert!(matches!(outcome, EffectOutcome::NeedsIntervention { .. }));
+    assert_eq!(server.applied(), 1);
+    assert_eq!(
+        server
+            .requests()
+            .iter()
+            .filter(|r| r.method == "POST")
+            .count(),
+        1
+    );
 }

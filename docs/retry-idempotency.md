@@ -17,6 +17,11 @@ Use a client with redirects disabled and declare
 `HttpEffect::client_follows_no_redirects()` to classify connection failures
 that prove the request was never sent as transient. With redirect following,
 a connection failure may concern a later target after the original write.
+The same applies to failure statuses and negative verification: URL equality
+cannot exclude a redirect back to the original URL. Declare a client without
+redirects to use definite status classifications or 404/410 lookup absence;
+otherwise these remain ambiguous. This also applies to provider overrides
+that would classify a response as a definite rejection.
 
 Provider-specific `classify_status` overrides are trusted application code.
 Return `Transient`, `RateLimited`, or a definitive failure only when the
