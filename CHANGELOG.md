@@ -5,7 +5,7 @@ All notable changes are listed here, following
 [Semantic Versioning](https://semver.org/). Before 1.0, minor releases may
 break the API or storage format.
 
-## [Unreleased — 0.2.0]
+## [0.2.0]
 
 ### Added
 
