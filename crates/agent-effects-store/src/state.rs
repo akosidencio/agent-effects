@@ -2,8 +2,7 @@
 //!
 //! [`EffectStatus::apply`] is the single source of truth for which
 //! transitions are legal. Stores and the runtime never change a status
-//! without going through it. The table is documented in
-//! `docs/design.md#state-machine`.
+//! without going through it.
 
 use std::fmt;
 
