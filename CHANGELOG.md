@@ -5,7 +5,7 @@ All notable changes are listed here, following
 [Semantic Versioning](https://semver.org/). Before 1.0, minor releases may
 break the API or storage format.
 
-## [Unreleased]
+## [Unreleased — 0.2.0]
 
 ### Added
 
@@ -38,6 +38,13 @@ break the API or storage format.
   `NewEffect::new` remains available, and `with_contract` supplies assumptions.
 - Retry timing and attempt timeouts may change across deployments; the
   lifetime attempt ceiling and safety declarations must stay unchanged.
+
+### Security
+
+- Raise Tokio's minimum to 1.53.3 for RUSTSEC-2026-0386 and update the lockfile's
+  transitive `ctutils` to 0.4.4 for RUSTSEC-2026-0385. Downstream applications
+  must audit/update their own lockfiles; a library lockfile does not constrain
+  a downstream application's transitive resolution.
 
 ### Fixed
 

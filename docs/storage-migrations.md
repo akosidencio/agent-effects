@@ -12,8 +12,9 @@ Named schemas keep their own migration history. Do not migrate through a
 transaction-mode pooler; follow the existing PostgreSQL deployment guidance.
 
 A NULL contract is deliberately unknown. Settled legacy records can replay,
-but unresolved records cannot execute or compensate through a durable handler
-until reconciled. Unknown or intervention-required records can be resolved by
+but unresolved records cannot execute until reconciled. Durable compensation
+also requires an attested contract, even for a replayable legacy commit; a
+new handler must not silently become its recovery-capable compensator. Unknown or intervention-required records can be resolved by
 an authorized operator using remote evidence. Pending legacy records need a
 reviewed application migration or completion using the previous runtime before
 the upgrade; this release has no automatic adoption API. Never manufacture

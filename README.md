@@ -1,10 +1,10 @@
-# agent-effects: Reliable side effects for AI agents in Rust
+# Agent Effects — The Rust-native reliability layer for AI agent actions
 
 <div align="center">
 
 [![crates.io](https://img.shields.io/crates/v/agent-effects.svg)](https://crates.io/crates/agent-effects)
 [![docs.rs](https://img.shields.io/docsrs/agent-effects)](https://docs.rs/agent-effects)
-[![Version: 0.1.3](https://img.shields.io/badge/Version-v0.1.3-blue)](CHANGELOG.md)
+[![Version: 0.2.0 (unreleased)](https://img.shields.io/badge/Version-v0.2.0--unreleased-blue)](CHANGELOG.md)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT_OR_Apache--2.0-blue.svg)](#license)
 [![Rust: 2024 Edition](https://img.shields.io/badge/Rust-2024_Edition-orange?logo=rust)](Cargo.toml)
 [![MSRV: Rust 1.90](https://img.shields.io/badge/MSRV-1.90%2B-orange?logo=rust)](#rust-crates-and-storage-backends)
@@ -188,6 +188,11 @@ key for every effect.
 It is not a workflow engine, a job queue or an agent framework, and it does
 not decide whether an agent is *allowed* to act. Application authorization
 still applies.
+
+Use a workflow engine when you need durable branching processes, scheduling,
+signals, or orchestration across a large business workflow. Embed Agent Effects
+when your existing application needs a focused reliability boundary around
+consequential actions. It does not supply application authorization.
 
 ## Rust crates and storage backends
 

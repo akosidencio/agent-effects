@@ -618,6 +618,9 @@ impl<'a, S: EffectStore, H: EffectHandler> IntoFuture for CompensationSubmission
                 .ok_or_else(|| RuntimeError::NoSuchEffect {
                     key: spec.key.to_string(),
                 })?;
+            if record.execution_contract.is_none() {
+                return Err(RuntimeError::LegacyContract { id: record.id });
+            }
             self.runtime.enforce_contract(
                 &record,
                 handler.contract(

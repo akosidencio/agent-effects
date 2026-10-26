@@ -221,6 +221,69 @@ impl VerifiableEffect for Deployed {
     }
 }
 
+impl agent_effects::CompensableEffect for Deployed {
+    fn compensate(
+        &self,
+        _: &agent_effects::CompensationContext,
+        _input: &(),
+        _output: Option<&()>,
+    ) -> impl std::future::Future<Output = Result<(), EffectFailure>> + Send {
+        std::future::ready(Err(EffectFailure::permanent("unattested compensation ran")))
+    }
+}
+
+#[tokio::test]
+async fn replayable_legacy_commits_cannot_start_unattested_durable_compensation() {
+    let store = MemoryStore::new();
+    seed(&store, None).await;
+    let record = store.get_by_key(&key()).await.unwrap().unwrap();
+    let now = SystemTime::now();
+    let lease = store
+        .acquire_lease(
+            record.id,
+            &agent_effects::WorkerId::new("old"),
+            now,
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+    let started = store
+        .transition(agent_effects::store::TransitionRequest::new(
+            &record,
+            Some(&lease),
+            agent_effects::Transition::StartAttempt,
+            now,
+        ))
+        .await
+        .unwrap();
+    let mut success = agent_effects::store::TransitionRequest::new(
+        &started,
+        Some(&lease),
+        agent_effects::Transition::Succeeded,
+        now,
+    );
+    success.output = Some(serde_json::Value::Null);
+    store.transition(success).await.unwrap();
+    store.release_lease(&lease).await.unwrap();
+    let rt = Runtime::builder(store.clone())
+        .register(
+            Handler::new(Deployed {
+                version: "1",
+                executions: Arc::default(),
+            })
+            .compensable(),
+        )
+        .build();
+    assert!(matches!(
+        rt.compensate::<Deployed>("one").await,
+        Err(RuntimeError::LegacyContract { .. })
+    ));
+    assert_eq!(
+        store.get(record.id).await.unwrap().unwrap().status,
+        EffectStatus::Committed
+    );
+}
+
 #[tokio::test]
 async fn recovery_refuses_an_incompatible_deployment_before_deserializing_or_acting() {
     let store = MemoryStore::new();
