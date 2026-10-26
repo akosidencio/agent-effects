@@ -100,12 +100,9 @@ async fn supplementary_evidence_never_changes_authority<S: EffectStore>(store: S
             .unwrap(),
         [second]
     );
-    assert!(
-        store
-            .late_observations(before.id, None, 0)
-            .await
-            .unwrap()
-            .is_empty()
+    assert_eq!(
+        store.late_observations(before.id, None, 0).await.unwrap(),
+        [] as [LateObservation; 0]
     );
     assert_eq!(reload(&store, before.id).await, before);
     assert_eq!(store.events(before.id).await.unwrap(), history);
