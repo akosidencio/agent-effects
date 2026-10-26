@@ -113,6 +113,9 @@ Pick the protection your remote system allows:
 
 ## Features
 
+- **Versioned payloads.** Declare durable input/output schema versions and
+  optional JSON migrations across deployments. Unreadable output preserves
+  the committed effect. See [payload schemas](docs/payload-schemas.md).
 - **Persisted safety contracts.** Recovery refuses incompatible changes to
   idempotency, verification, handler semantics, approval, or retry ceilings.
   See the [migration guide](docs/storage-migrations.md) before upgrading a store.

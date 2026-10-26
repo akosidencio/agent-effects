@@ -68,9 +68,21 @@ pub struct CompensationContext {
     pub(crate) key: EffectKey,
     pub(crate) attempt: u32,
     pub(crate) reason: Option<String>,
+    pub(crate) input_schema_version: u32,
+    pub(crate) output_schema_version: u32,
 }
 
 impl CompensationContext {
+    /// Schema of the stored input supplied to a durable compensation.
+    pub fn input_schema_version(&self) -> u32 {
+        self.input_schema_version
+    }
+
+    /// Schema of the stored output supplied to a durable compensation.
+    pub fn output_schema_version(&self) -> u32 {
+        self.output_schema_version
+    }
+
     /// The effect's record id.
     pub fn effect_id(&self) -> EffectId {
         self.id
@@ -149,6 +161,7 @@ pub(crate) struct CompensationSpec {
 /// Undoes a closure effect. Created by [`Runtime::compensation`].
 #[must_use = "a compensation does nothing until `run` is awaited"]
 pub struct CompensationBuilder<'a, S> {
+    output_schema: crate::PayloadSchema,
     runtime: &'a Runtime<S>,
     name: String,
     key: String,
@@ -161,6 +174,7 @@ pub struct CompensationBuilder<'a, S> {
 impl<'a, S: EffectStore> CompensationBuilder<'a, S> {
     pub(crate) fn new(runtime: &'a Runtime<S>, name: String, key: String) -> Self {
         Self {
+            output_schema: crate::PayloadSchema::default(),
             runtime,
             name,
             key,
@@ -169,6 +183,13 @@ impl<'a, S: EffectStore> CompensationBuilder<'a, S> {
             retry: None,
             attempt_timeout: None,
         }
+    }
+
+    /// Interprets or migrates the stored output before invoking compensation.
+    /// Unsupported payloads never invoke the application's compensation.
+    pub fn output_schema(mut self, schema: crate::PayloadSchema) -> Self {
+        self.output_schema = schema;
+        self
     }
 
     /// Why the effect is being undone; recorded in the audit trail.
@@ -213,7 +234,17 @@ impl<'a, S: EffectStore> CompensationBuilder<'a, S> {
     {
         let key = EffectKey::new(EffectName::new(self.name)?, LogicalKey::new(self.key)?);
         let compensate: Compensator = Arc::new(move |ctx, _input, output| {
-            match output.map(serde_json::from_value::<T>).transpose() {
+            let decoded = output
+                .map(|output| {
+                    let value = self
+                        .output_schema
+                        .decode(ctx.output_schema_version(), output)
+                        .map_err(|e| EffectFailure::permanent(e.to_string()))?;
+                    serde_json::from_value::<T>(value)
+                        .map_err(|e| EffectFailure::permanent(e.to_string()))
+                })
+                .transpose();
+            match decoded {
                 Ok(output) => Box::pin(compensate(ctx, output)),
                 Err(e) => Box::pin(std::future::ready(Err(EffectFailure::permanent(format!(
                     "stored output does not match the compensation's type: {e}"
@@ -472,6 +503,8 @@ impl<S: EffectStore> Runtime<S> {
         compensate: &Compensator,
     ) -> Result<Result<(), EffectFailure>, Interrupt> {
         let ctx = CompensationContext {
+            input_schema_version: record.input_schema_version,
+            output_schema_version: record.output_schema_version,
             id: record.id,
             key: record.key.clone(),
             attempt: record.compensation_attempts,

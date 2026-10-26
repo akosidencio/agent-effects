@@ -44,3 +44,10 @@ atomically with insertion, return it unchanged on conflict, and preserve it on
 every transition and lease operation. `NewEffect::new` creates an unattested
 record; `with_contract` records explicit assumptions. Run the shared store
 conformance suite, which now checks nondefault contracts and conflict behavior.
+
+Migration 0003 adds `input_schema_version` and `output_schema_version`, both
+NOT NULL with default 1. Existing JSON is unchanged. New effects record the
+input schema at insertion; transitions store the output schema atomically
+with the output. SQL uses integer versions (PostgreSQL BIGINT supports the
+full Rust u32 range). Custom stores must persist these fields too. See the
+[payload guide](payload-schemas.md) before changing Rust data types.

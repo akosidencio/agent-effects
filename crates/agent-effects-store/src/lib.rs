@@ -134,6 +134,8 @@ pub struct NewEffect {
     pub kind: EffectKind,
     /// Immutable safety assumptions. `None` is a legacy, unattested record.
     pub execution_contract: Option<ExecutionContract>,
+    /// Schema of the stored input. Legacy payloads use version 1.
+    pub input_schema_version: u32,
     /// The input, already redacted for storage.
     pub input: Option<Value>,
     /// A stable hash of the unredacted input, used to reject a reused key
@@ -161,6 +163,7 @@ impl NewEffect {
             key,
             kind,
             execution_contract: None,
+            input_schema_version: 1,
             input: None,
             input_fingerprint: None,
             created_by: None,
@@ -213,6 +216,8 @@ pub struct TransitionRequest {
     pub now: SystemTime,
     /// The action's result, stored when present.
     pub output: Option<Value>,
+    /// Schema of `output`; omitted operator outputs use legacy version 1.
+    pub output_schema_version: Option<u32>,
     /// A failure to record as the effect's last error.
     pub error: Option<ErrorRecord>,
     /// For [`Transition::ScheduleRetry`] and [`Transition::ResolvedRetry`]:
@@ -239,6 +244,7 @@ impl TransitionRequest {
             transition,
             now,
             output: None,
+            output_schema_version: None,
             error: None,
             next_attempt_at: None,
             actor: None,

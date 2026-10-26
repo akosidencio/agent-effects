@@ -533,7 +533,7 @@ async fn an_output_from_an_attempt_that_did_not_apply_is_never_replayed() {
     // A replay cannot return attempt 1's output as this effect's result.
     let replay = run().await;
     assert!(
-        matches!(replay, Err(RuntimeError::Output { .. })),
+        matches!(replay, Err(RuntimeError::OutputUnavailable { .. })),
         "{replay:?}"
     );
     assert_eq!(attempts.load(Ordering::SeqCst), 2, "not run again");

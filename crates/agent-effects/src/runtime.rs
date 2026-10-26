@@ -336,6 +336,22 @@ impl<S: EffectStore> Runtime<S> {
         id: EffectId,
         timeout: Duration,
     ) -> Result<EffectOutcome<T>, RuntimeError> {
+        self.wait_with_output_schema(id, timeout, crate::PayloadSchema::default())
+            .await
+    }
+
+    /// Like [`Self::wait`], with a version-aware output schema and optional
+    /// migration. Unsupported or missing outputs leave committed state intact.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::wait`], plus payload version or migration errors.
+    pub async fn wait_with_output_schema<T: DeserializeOwned>(
+        &self,
+        id: EffectId,
+        timeout: Duration,
+        schema: crate::PayloadSchema,
+    ) -> Result<EffectOutcome<T>, RuntimeError> {
         let deadline = tokio::time::Instant::now() + timeout;
         let mut pause = Duration::from_millis(10);
         loop {
@@ -347,7 +363,7 @@ impl<S: EffectStore> Runtime<S> {
             let busy = !settled(record.status) && record.live_lease_owner(self.now()).is_some();
             let now = tokio::time::Instant::now();
             if !busy {
-                return report(&record, None);
+                return report(&record, None, &schema);
             }
             if now >= deadline {
                 return Ok(EffectOutcome::InProgress { id });
@@ -577,6 +593,7 @@ impl<S: EffectStore> Runtime<S> {
                 key: spec.key.clone(),
                 kind: spec.capabilities.kind,
                 execution_contract: Some(spec.contract()),
+                input_schema_version: spec.input_schema_version,
                 input: spec.input.clone(),
                 input_fingerprint: spec.fingerprint.clone(),
                 created_by: spec.actor.clone(),
@@ -597,7 +614,7 @@ impl<S: EffectStore> Runtime<S> {
         // lease it goes through: the budget is per call.
         let checks_made = AtomicU32::new(0);
         for _ in 0..MAX_ROUNDS {
-            if let Some(outcome) = observe(&record)? {
+            if let Some(outcome) = observe(&record, &spec.output_schema)? {
                 return Ok(outcome);
             }
             let lease = match store
@@ -635,7 +652,7 @@ impl<S: EffectStore> Runtime<S> {
             match advanced {
                 Ok((settled, output)) => {
                     Span::current().record("effect.status", settled.status.as_str());
-                    return report(&settled, output);
+                    return report(&settled, output, &spec.output_schema);
                 }
                 Err(Interrupt::LeaseLost) => {
                     warn!("lease lost mid-effect; re-reading the record");
@@ -659,9 +676,10 @@ impl<S: EffectStore> Runtime<S> {
 /// clock could disagree.
 fn observe<T: DeserializeOwned>(
     record: &EffectRecord,
+    schema: &crate::PayloadSchema,
 ) -> Result<Option<EffectOutcome<T>>, RuntimeError> {
     match record.status {
-        status if settled(status) => report(record, None).map(Some),
+        status if settled(status) => report(record, None, schema).map(Some),
         EffectStatus::Pending
         | EffectStatus::AwaitingApproval
         | EffectStatus::Executing
@@ -1173,7 +1191,12 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
                 self.lease,
                 self.spec.actor.as_deref(),
                 transition,
-                customize,
+                |request| {
+                    customize(request);
+                    if request.output.is_some() {
+                        request.output_schema_version = Some(self.spec.output_schema.version());
+                    }
+                },
             )
             .await
     }
@@ -1230,6 +1253,13 @@ fn settled(status: EffectStatus) -> bool {
 }
 
 fn check_matches(record: &EffectRecord, spec: &EffectSpec) -> Result<(), RuntimeError> {
+    if record.input_schema_version != spec.input_schema_version {
+        return Err(RuntimeError::InputSchemaMismatch {
+            id: record.id,
+            stored: record.input_schema_version,
+            requested: spec.input_schema_version,
+        });
+    }
     if record.kind != spec.capabilities.kind {
         return Err(RuntimeError::KindMismatch {
             id: record.id,
@@ -1264,16 +1294,27 @@ fn check_contract(
 fn report<T: DeserializeOwned>(
     record: &EffectRecord,
     fresh: Option<T>,
+    schema: &crate::PayloadSchema,
 ) -> Result<EffectOutcome<T>, RuntimeError> {
     let id = record.id;
     Ok(match record.status {
-        EffectStatus::Committed => match fresh {
-            Some(value) => EffectOutcome::Committed(value),
-            None => EffectOutcome::Committed(
-                serde_json::from_value(record.output.clone().unwrap_or(Value::Null))
-                    .map_err(|source| RuntimeError::Output { id, source })?,
-            ),
-        },
+        EffectStatus::Committed => {
+            if let Some(value) = fresh {
+                EffectOutcome::Committed(value)
+            } else {
+                let stored = record
+                    .output
+                    .clone()
+                    .ok_or(RuntimeError::OutputUnavailable { id })?;
+                let migrated = schema
+                    .decode(record.output_schema_version, stored)
+                    .map_err(|source| RuntimeError::OutputPayload { id, source })?;
+                EffectOutcome::Committed(
+                    serde_json::from_value(migrated)
+                        .map_err(|source| RuntimeError::Output { id, source })?,
+                )
+            }
+        }
         EffectStatus::Failed => EffectOutcome::Failed(last_error(record)),
         EffectStatus::Rejected => EffectOutcome::Rejected(last_error(record)),
         // A failed compensation also waits for an operator.

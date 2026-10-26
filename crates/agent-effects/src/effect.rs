@@ -272,6 +272,8 @@ pub struct EffectBuilder<S, V = NoVerification> {
     verifier: V,
     handler_version: String,
     adapter: Option<String>,
+    input_schema_version: u32,
+    output_schema: crate::PayloadSchema,
 }
 
 impl<S: EffectStore> EffectBuilder<S> {
@@ -294,6 +296,8 @@ impl<S: EffectStore> EffectBuilder<S> {
             verifier: NoVerification,
             handler_version: "1".into(),
             adapter: None,
+            input_schema_version: 1,
+            output_schema: crate::PayloadSchema::default(),
         }
     }
 
@@ -349,11 +353,27 @@ impl<S: EffectStore> EffectBuilder<S> {
             verifier,
             handler_version: self.handler_version,
             adapter: self.adapter,
+            input_schema_version: self.input_schema_version,
+            output_schema: self.output_schema,
         }
     }
 }
 
 impl<S: EffectStore, V> EffectBuilder<S, V> {
+    /// Versions the stored input (default 1). Reattachment must use the
+    /// recorded input schema; durable input migrations belong on handlers.
+    pub fn input_schema_version(mut self, version: u32) -> Self {
+        self.input_schema_version = version;
+        self
+    }
+
+    /// Versions new outputs and optionally migrates older outputs on replay.
+    /// A replay error leaves a committed effect committed and never re-runs it.
+    pub fn output_schema(mut self, schema: crate::PayloadSchema) -> Self {
+        self.output_schema = schema;
+        self
+    }
+
     /// Names the application's execution semantics (default `"1"`). Changing
     /// it for an existing logical key returns a contract mismatch. Retain
     /// it across releases only when execution assumptions stay compatible.
@@ -498,6 +518,8 @@ impl<S: EffectStore, V> EffectBuilder<S, V> {
             input_stored: false,
             handler_version: self.handler_version,
             adapter: self.adapter,
+            input_schema_version: self.input_schema_version,
+            output_schema: self.output_schema,
         };
         self.runtime.execute(spec, action, self.verifier).await
     }
@@ -505,6 +527,8 @@ impl<S: EffectStore, V> EffectBuilder<S, V> {
 
 /// Everything about an effect except its action and verifier.
 pub(crate) struct EffectSpec {
+    pub(crate) input_schema_version: u32,
+    pub(crate) output_schema: crate::PayloadSchema,
     pub(crate) handler_version: String,
     pub(crate) adapter: Option<String>,
     pub(crate) key: EffectKey,

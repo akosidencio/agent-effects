@@ -119,3 +119,49 @@ async fn migration_preserves_legacy_records_without_inventing_safety_guarantees(
         .unwrap();
     assert_eq!(replay, EffectOutcome::Committed(7));
 }
+
+#[tokio::test]
+async fn versioned_outputs_replay_after_reopening_with_a_new_schema() {
+    use agent_effects::{PayloadError, PayloadSchema};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("versioned.db");
+    let store = SqliteStore::open(&path).await.unwrap();
+    let rt = Runtime::new(store.clone());
+    rt.effect("versioned.op", "one")
+        .input_schema_version(3)
+        .output_schema(PayloadSchema::new(3))
+        .run(|_| async { Ok::<_, EffectFailure>(7_u64) })
+        .await
+        .unwrap();
+    store.pool().close().await;
+    drop(rt);
+    drop(store);
+    let store = SqliteStore::open(&path).await.unwrap();
+    let record = store
+        .list(agent_effects::store::ListQuery::statuses([]))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(
+        (record.input_schema_version, record.output_schema_version),
+        (3, 3)
+    );
+    let schema = PayloadSchema::new(4).migrate(|version, value| {
+        if version != 3 {
+            return Err(PayloadError::UnsupportedVersion {
+                stored: version,
+                current: 4,
+            });
+        }
+        Ok(serde_json::json!({ "result": value }))
+    });
+    let replay: EffectOutcome<serde_json::Value> = Runtime::new(store)
+        .wait_with_output_schema(record.id, std::time::Duration::ZERO, schema)
+        .await
+        .unwrap();
+    assert_eq!(
+        replay,
+        EffectOutcome::Committed(serde_json::json!({ "result": 7 }))
+    );
+}

@@ -1185,10 +1185,26 @@ Crates are added when their milestone starts, not as empty placeholders.
 
 ## Open questions
 
-- Cached outputs are deserialized into the caller's `T`. If `T` changes shape
-  between releases, old records stop deserializing. Should there be an output
-  version tag, or a documented "don't do that"?
 - A fenced worker whose action *succeeded* cannot record that, so the
   knowledge is lost and an operator resolves the effect blind. Should a fenced
   worker append a "late result" audit event, which leaves the status alone
   but gives the operator the evidence?
+
+## Payload schema compatibility
+
+Input and output schema versions are stored separately from the execution
+contract. JSON schema upgrades do not automatically change external execution
+semantics. New handlers declare `input_schema()` and `output_schema()`;
+closure effects can set `input_schema_version` and `output_schema`.
+Migrations transform copies of older JSON in memory and must be deterministic
+and free of external side effects. They never rewrite input fingerprints or
+historical JSON. Recovery uses the original fingerprint and schema identity.
+A direct submission under a new input schema must not attach to an old key;
+it returns `InputSchemaMismatch`, even if the raw JSON happens to match.
+
+Outputs are stamped with the writing handler's schema in the same transition.
+Replay migrates and deserializes without re-execution. Absent output is
+`OutputUnavailable`, separate from JSON null (a valid serialized unit value).
+Serialization failure after external success preserves `Committed` and a
+redacted audit note; the live caller still gets its result. An unreadable
+committed output must never be treated as an externally failed effect.

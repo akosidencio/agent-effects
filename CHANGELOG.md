@@ -19,6 +19,13 @@ break the API or storage format.
   records. Unresolved unattested records require reconciliation; settled
   legacy results remain replayable. See `docs/storage-migrations.md`.
 
+- Explicit input/output payload schema versions (legacy version 1),
+  `PayloadSchema` migration hooks, version-aware durable recovery and
+  compensation, `wait_with_output_schema`, and versioned operator output.
+- Missing committed output now returns `RuntimeError::OutputUnavailable`;
+  schema failures report the committed status explicitly and never rerun the
+  action. SQL migration 0003 preserves all existing payload interpretations.
+
 ### Compatibility
 
 - Adding `execution_contract` to public `NewEffect` and `EffectRecord`

@@ -98,7 +98,7 @@ const HISTORY: &str = "_sqlx_migrations";
 const COLUMNS: &str = "id, effect_name, logical_key, kind, status, input, input_fingerprint, \
      output, last_error, created_by, attempt_count, may_have_applied, compensation_attempts, \
      approved, next_attempt_at, attempt_started_at, attempt_ended_at, lease_owner, lease_epoch, \
-     lease_expires_at, version, created_at, updated_at, committed_at, execution_contract";
+     lease_expires_at, version, created_at, updated_at, committed_at, execution_contract, input_schema_version, output_schema_version";
 
 /// Whose clock the store trusts for leases and recorded times.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -331,7 +331,7 @@ impl Statements {
             lock: format!("SELECT {COLUMNS} FROM {effects} WHERE id = $1 FOR UPDATE").into(),
             insert: format!(
                 "INSERT INTO {effects} ({COLUMNS}) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
-                 $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25) \
+                 $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27) \
                  ON CONFLICT (effect_name, logical_key) DO NOTHING"
             )
             .into(),
@@ -345,8 +345,8 @@ impl Statements {
                  attempt_count = $4, may_have_applied = $5, compensation_attempts = $6, \
                  approved = $7, next_attempt_at = $8, attempt_started_at = $9, \
                  attempt_ended_at = $10, lease_owner = $11, lease_epoch = $12, \
-                 lease_expires_at = $13, version = $14, updated_at = $15, committed_at = $16 \
-                 WHERE id = $17 AND version = $18"
+                 lease_expires_at = $13, version = $14, updated_at = $15, committed_at = $16, output_schema_version = $17 \
+                 WHERE id = $18 AND version = $19"
             )
             .into(),
             insert_event: format!(
@@ -637,6 +637,7 @@ impl PostgresStore {
             .bind(to_i64(record.version)?)
             .bind(timestamp(record.updated_at))
             .bind(record.committed_at.map(timestamp))
+            .bind(i64::from(record.output_schema_version))
             .bind(*record.id.as_uuid())
             .bind(to_i64(read_version)?)
             .execute(&mut **tx)
@@ -691,6 +692,8 @@ impl EffectStore for PostgresStore {
             .bind(timestamp(record.updated_at))
             .bind(record.committed_at.map(timestamp))
             .bind(json(record.execution_contract.as_ref())?)
+            .bind(i64::from(record.input_schema_version))
+            .bind(i64::from(record.output_schema_version))
             .execute(&mut *session)
             .await
             .map_err(StoreError::backend)?
@@ -938,6 +941,10 @@ fn decode_record(row: &PgRow) -> Result<EffectRecord, StoreError> {
         execution_contract: get::<Option<Value>>(row, "execution_contract")?
             .map(serde_json::from_value)
             .transpose()
+            .map_err(StoreError::backend)?,
+        input_schema_version: u32::try_from(get::<i64>(row, "input_schema_version")?)
+            .map_err(StoreError::backend)?,
+        output_schema_version: u32::try_from(get::<i64>(row, "output_schema_version")?)
             .map_err(StoreError::backend)?,
         input: get(row, "input")?,
         input_fingerprint: get(row, "input_fingerprint")?,

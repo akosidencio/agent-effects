@@ -76,6 +76,7 @@ fn key(n: u32) -> EffectKey {
 
 fn new_effect(n: u32) -> NewEffect {
     NewEffect {
+        input_schema_version: 7,
         input: Some(json!({ "n": n, "nested": { "b": [1, 2], "a": null } })),
         input_fingerprint: Some(format!("fingerprint-{n}")),
         created_by: Some("agent:testkit".into()),
@@ -133,6 +134,8 @@ async fn insert_and_read_back<S: EffectStore>(store: S) {
     assert_eq!(record.input, new.input);
     assert_eq!(record.input_fingerprint, new.input_fingerprint);
     assert_eq!(record.execution_contract, new.execution_contract);
+    assert_eq!(record.input_schema_version, 7);
+    assert_eq!(record.output_schema_version, 1);
     assert_eq!(record.created_by, new.created_by);
     assert_eq!(
         (record.version, record.lease_epoch, record.attempt_count),
@@ -375,6 +378,7 @@ async fn transitions_persist_with_events<St: EffectStore>(store: St) {
     let mut verify =
         TransitionRequest::new(&record, Some(&lease), Transition::StartVerification, t(12));
     verify.output = Some(output.clone());
+    verify.output_schema_version = Some(11);
     let record = store.transition(verify).await.unwrap();
     let record = drive(
         &store,
@@ -388,6 +392,7 @@ async fn transitions_persist_with_events<St: EffectStore>(store: St) {
     let stored = reload(&store, record.id).await;
     assert_eq!(stored.status, EffectStatus::Committed);
     assert_eq!(stored.output, Some(output));
+    assert_eq!(stored.output_schema_version, 11);
     assert_eq!(stored.committed_at, Some(t(13)));
     assert_eq!((stored.attempt_count, stored.version), (2, 5));
     assert_eq!(stored.next_attempt_at, None);
