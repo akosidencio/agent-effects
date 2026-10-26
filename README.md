@@ -248,6 +248,12 @@ MSRV: Rust 1.90; `agent-effects-sqlite` and `agent-effects-postgres` need 1.94 (
 
 ## Development
 
+The reliability suites inject storage failures before and after real backend
+operations, cancel callers at execution boundaries, race operator decisions,
+and recover durable intents across processes and handler schema versions.
+They count external applications separately from retry attempts. PostgreSQL
+and PgBouncer tests require isolated test services and their environment flags.
+
 ```sh
 cargo test --workspace --all-features
 cargo clippy --workspace --all-targets --all-features

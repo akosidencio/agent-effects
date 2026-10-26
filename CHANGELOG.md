@@ -9,6 +9,12 @@ break the API or storage format.
 
 ### Added
 
+- Reliability regression matrices for store failures before/after durable
+  operations, cancelled callers and recovery passes, lease-renewal outages,
+  concurrent operator decisions, and multiprocess recovery on SQLite/PostgreSQL.
+- Cross-version subprocess recovery tests for contracts, payload migrations,
+  committed-output replay, and interrupted compensation.
+
 - Persisted versioned execution contracts across memory, SQLite, and
   PostgreSQL. Reattachment and durable recovery refuse changed idempotency,
   verification, handler semantics, adapter identity, approval requirements,
