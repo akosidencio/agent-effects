@@ -12,6 +12,21 @@ use crate::store::StoreError;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum RuntimeError {
+    /// Existing safety assumptions differ from this call. Nothing is run
+    /// or replayed; the authoritative record remains unchanged.
+    #[error("effect {id} has an incompatible execution contract")]
+    ContractMismatch {
+        /// The existing effect.
+        id: EffectId,
+    },
+
+    /// A pre-contract unresolved record needs explicit operator review.
+    /// Its original idempotency and verification assumptions are unknown.
+    #[error("effect {id} has no execution contract; reconcile the legacy effect before resuming")]
+    LegacyContract {
+        /// The existing effect.
+        id: EffectId,
+    },
     /// The effect name or logical key was invalid.
     #[error("invalid effect identity: {0}")]
     Identity(#[from] IdentityError),

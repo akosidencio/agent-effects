@@ -732,11 +732,13 @@ async fn a_crash_during_backoff_resumes_on_schedule() {
     let (store, rt, clock) = setup();
     // A worker failed its first attempt, scheduled a retry in 60 s, then died.
     let record = store
-        .insert_or_get(NewEffect::new(
-            key("resume"),
-            EffectKind::IrreversibleWrite,
-            clock.now(),
-        ))
+        .insert_or_get(
+            NewEffect::new(key("resume"), EffectKind::IrreversibleWrite, clock.now())
+                .with_contract(agent_effects::store::ExecutionContract::new(
+                    EffectKind::IrreversibleWrite,
+                    5,
+                )),
+        )
         .await
         .unwrap()
         .record;

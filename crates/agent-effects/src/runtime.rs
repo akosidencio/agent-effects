@@ -295,6 +295,18 @@ impl<S: EffectStore> Runtime<S> {
         self.inner.handlers.get(name).map(|r| Arc::clone(&r.resume))
     }
 
+    pub(crate) fn enforce_contract(
+        &self,
+        record: &EffectRecord,
+        mut requested: crate::store::ExecutionContract,
+        risk: crate::RiskLevel,
+    ) -> Result<(), RuntimeError> {
+        let required = self.inner.policy.requirements(risk, requested.kind);
+        requested.require_approval |= required.approval;
+        requested.automatic_retry &= !required.no_automatic_retry;
+        check_contract(record, &requested)
+    }
+
     /// The underlying store.
     pub fn store(&self) -> &S {
         &self.inner.store
@@ -564,6 +576,7 @@ impl<S: EffectStore> Runtime<S> {
                 id: EffectId::new(),
                 key: spec.key.clone(),
                 kind: spec.capabilities.kind,
+                execution_contract: Some(spec.contract()),
                 input: spec.input.clone(),
                 input_fingerprint: spec.fingerprint.clone(),
                 created_by: spec.actor.clone(),
@@ -1226,6 +1239,22 @@ fn check_matches(record: &EffectRecord, spec: &EffectSpec) -> Result<(), Runtime
     }
     if record.input_fingerprint != spec.fingerprint {
         return Err(RuntimeError::InputMismatch { id: record.id });
+    }
+    check_contract(record, &spec.contract())
+}
+
+fn check_contract(
+    record: &EffectRecord,
+    requested: &crate::store::ExecutionContract,
+) -> Result<(), RuntimeError> {
+    match &record.execution_contract {
+        Some(stored) if !stored.permits(requested) => {
+            return Err(RuntimeError::ContractMismatch { id: record.id });
+        }
+        None if !record.status.is_settled() => {
+            return Err(RuntimeError::LegacyContract { id: record.id });
+        }
+        _ => {}
     }
     Ok(())
 }

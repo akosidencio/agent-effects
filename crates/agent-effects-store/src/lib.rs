@@ -18,6 +18,7 @@ pub mod state;
 #[cfg(feature = "testkit")]
 pub mod testkit;
 
+mod contract;
 mod error;
 mod record;
 
@@ -27,6 +28,7 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub use contract::{ExecutionContract, VerificationContract};
 pub use error::StoreError;
 pub use failure::{Disposition, FailureClass};
 pub use id::{
@@ -130,6 +132,8 @@ pub struct NewEffect {
     pub key: EffectKey,
     /// The effect's kind.
     pub kind: EffectKind,
+    /// Immutable safety assumptions. `None` is a legacy, unattested record.
+    pub execution_contract: Option<ExecutionContract>,
     /// The input, already redacted for storage.
     pub input: Option<Value>,
     /// A stable hash of the unredacted input, used to reject a reused key
@@ -142,12 +146,21 @@ pub struct NewEffect {
 }
 
 impl NewEffect {
+    /// Records explicit execution assumptions on a new effect. This cannot
+    /// change an existing record returned by `insert_or_get`.
+    #[must_use]
+    pub fn with_contract(mut self, contract: ExecutionContract) -> Self {
+        self.execution_contract = Some(contract);
+        self
+    }
+
     /// A new effect with a fresh id and no input or actor.
     pub fn new(key: EffectKey, kind: EffectKind, now: SystemTime) -> Self {
         Self {
             id: EffectId::new(),
             key,
             kind,
+            execution_contract: None,
             input: None,
             input_fingerprint: None,
             created_by: None,

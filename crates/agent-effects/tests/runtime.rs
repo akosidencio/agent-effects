@@ -395,7 +395,10 @@ async fn crashed_attempt(
     kind: EffectKind,
 ) {
     let record = store
-        .insert_or_get(NewEffect::new(key.clone(), kind, clock.now()))
+        .insert_or_get(
+            NewEffect::new(key.clone(), kind, clock.now())
+                .with_contract(agent_effects::store::ExecutionContract::new(kind, 5)),
+        )
         .await
         .unwrap()
         .record;

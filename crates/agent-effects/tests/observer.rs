@@ -146,11 +146,11 @@ async fn recovery_and_operators_are_observed_including_time_spent_unknown() {
     let recorder = Recorder::default();
     // A worker died mid-attempt.
     let record = store
-        .insert_or_get(NewEffect::new(
-            key("dead"),
-            EffectKind::IrreversibleWrite,
-            clock.now(),
-        ))
+        .insert_or_get(
+            NewEffect::new(key("dead"), EffectKind::IrreversibleWrite, clock.now()).with_contract(
+                agent_effects::store::ExecutionContract::new(EffectKind::IrreversibleWrite, 5),
+            ),
+        )
         .await
         .unwrap()
         .record;

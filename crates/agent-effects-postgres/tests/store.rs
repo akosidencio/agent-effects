@@ -306,11 +306,17 @@ async fn a_worker_behind_the_database_clock_takes_over_an_expired_lease() {
     let Some(url) = url() else { return };
     let store = fresh(&url, ClockSource::Database).await;
     let record = store
-        .insert_or_get(NewEffect::new(
-            key("k"),
-            EffectKind::IrreversibleWrite,
-            SystemTime::UNIX_EPOCH,
-        ))
+        .insert_or_get(
+            NewEffect::new(
+                key("k"),
+                EffectKind::IrreversibleWrite,
+                SystemTime::UNIX_EPOCH,
+            )
+            .with_contract(agent_effects::store::ExecutionContract::new(
+                EffectKind::IrreversibleWrite,
+                5,
+            )),
+        )
         .await
         .unwrap()
         .record;
@@ -489,4 +495,54 @@ async fn the_runtime_runs_on_postgres_and_replays_across_connections() {
     assert_eq!(first, EffectOutcome::Committed("pi_1".into()));
     assert_eq!(second, first);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn migration_preserves_legacy_contracts_as_unattested() {
+    let Some(url) = url() else { return };
+    let schema = format!("legacy_{}", uuid_like());
+    let admin = sqlx::PgPool::connect(&url).await.unwrap();
+    admin
+        .execute(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+        .await
+        .unwrap();
+    let options: PgConnectOptions = url.parse().unwrap();
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options.options([("search_path", schema.as_str())]))
+        .await
+        .unwrap();
+    let old = Migrator::with_migrations(vec![Migration::new(
+        1,
+        "effects".into(),
+        MigrationType::Simple,
+        include_str!("../migrations/0001_effects.sql").into_sql_str(),
+        false,
+    )]);
+    old.run(&pool).await.unwrap();
+    let id = agent_effects::EffectId::new();
+    sqlx::query("INSERT INTO effects (id, effect_name, logical_key, kind, status, attempt_count, may_have_applied, compensation_attempts, approved, lease_epoch, version, created_at, updated_at) VALUES ($1, 'legacy.op', 'one', 'irreversible_write', 'pending', 0, false, 0, false, 0, 0, now(), now())")
+        .bind(*id.as_uuid()).execute(&pool).await.unwrap();
+    let store = PostgresStore::from_pool(pool).await.unwrap();
+    assert!(
+        store
+            .get(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .execution_contract
+            .is_none()
+    );
+    let result = Runtime::new(store)
+        .effect("legacy.op", "one")
+        .run(|_| async {
+            panic!("unattested legacy action ran");
+            #[allow(unreachable_code)]
+            Ok::<_, EffectFailure>(())
+        })
+        .await;
+    assert!(matches!(
+        result,
+        Err(agent_effects::RuntimeError::LegacyContract { .. })
+    ));
 }

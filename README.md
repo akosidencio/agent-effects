@@ -113,6 +113,9 @@ Pick the protection your remote system allows:
 
 ## Features
 
+- **Persisted safety contracts.** Recovery refuses incompatible changes to
+  idempotency, verification, handler semantics, approval, or retry ceilings.
+  See the [migration guide](docs/storage-migrations.md) before upgrading a store.
 - **Durable handlers.** Implement `EffectHandler`, `register` it, and
   `runtime.submit::<H>(key, input)`. Recovery then finishes the effect from
   its stored input even if the caller never comes back.

@@ -270,6 +270,8 @@ pub struct EffectBuilder<S, V = NoVerification> {
     risk: RiskLevel,
     verification: VerificationMode,
     verifier: V,
+    handler_version: String,
+    adapter: Option<String>,
 }
 
 impl<S: EffectStore> EffectBuilder<S> {
@@ -290,6 +292,8 @@ impl<S: EffectStore> EffectBuilder<S> {
             risk: RiskLevel::Low,
             verification: VerificationMode::None,
             verifier: NoVerification,
+            handler_version: "1".into(),
+            adapter: None,
         }
     }
 
@@ -343,11 +347,29 @@ impl<S: EffectStore> EffectBuilder<S> {
             risk: self.risk,
             verification: mode,
             verifier,
+            handler_version: self.handler_version,
+            adapter: self.adapter,
         }
     }
 }
 
 impl<S: EffectStore, V> EffectBuilder<S, V> {
+    /// Names the application's execution semantics (default `"1"`). Changing
+    /// it for an existing logical key returns a contract mismatch. Retain
+    /// it across releases only when execution assumptions stay compatible.
+    pub fn contract_version(mut self, version: impl Into<String>) -> Self {
+        self.handler_version = version.into();
+        self
+    }
+
+    /// Identifies a provider or adapter whose safety guarantees the effect
+    /// relies on. A change is incompatible for an existing logical key.
+    /// Keep credentials and tenant secrets out of this value.
+    pub fn adapter_identity(mut self, adapter: impl Into<String>) -> Self {
+        self.adapter = Some(adapter.into());
+        self
+    }
+
     /// The effect's kind. Defaults to [`EffectKind::IrreversibleWrite`], the
     /// most cautious choice.
     pub fn kind(mut self, kind: EffectKind) -> Self {
@@ -474,6 +496,8 @@ impl<S: EffectStore, V> EffectBuilder<S, V> {
             risk: self.risk,
             automatic_retry: true,
             input_stored: false,
+            handler_version: self.handler_version,
+            adapter: self.adapter,
         };
         self.runtime.execute(spec, action, self.verifier).await
     }
@@ -481,6 +505,8 @@ impl<S: EffectStore, V> EffectBuilder<S, V> {
 
 /// Everything about an effect except its action and verifier.
 pub(crate) struct EffectSpec {
+    pub(crate) handler_version: String,
+    pub(crate) adapter: Option<String>,
     pub(crate) key: EffectKey,
     pub(crate) capabilities: Capabilities,
     pub(crate) input: Option<Value>,
@@ -497,4 +523,27 @@ pub(crate) struct EffectSpec {
     /// The input comes from the store (a resumed effect): it is already
     /// redacted, and `fingerprint` is the stored one, used as is.
     pub(crate) input_stored: bool,
+}
+
+impl EffectSpec {
+    pub(crate) fn contract(&self) -> crate::store::ExecutionContract {
+        use crate::store::{ExecutionContract, VerificationContract};
+        ExecutionContract {
+            format_version: 1,
+            kind: self.capabilities.kind,
+            remote_idempotency: self.capabilities.remote_idempotency,
+            verification: match self.capabilities.verification {
+                VerificationMode::None => VerificationContract::None,
+                VerificationMode::Authoritative => VerificationContract::Authoritative,
+                VerificationMode::EventuallyConsistent { settle } => {
+                    VerificationContract::EventuallyConsistent { settle }
+                }
+            },
+            handler_version: self.handler_version.clone(),
+            adapter: self.adapter.clone(),
+            require_approval: self.require_approval,
+            automatic_retry: self.automatic_retry,
+            max_attempts: self.retry.max_attempts,
+        }
+    }
 }

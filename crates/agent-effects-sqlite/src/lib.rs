@@ -56,7 +56,7 @@ const COLUMNS: &str = "id, effect_name, logical_key, kind, status, input, input_
      output, last_error, created_by, attempt_count, may_have_applied, \
      compensation_attempts, approved, next_attempt_at, \
      attempt_started_at, attempt_ended_at, \
-     lease_owner, lease_epoch, lease_expires_at, version, created_at, updated_at, committed_at";
+     lease_owner, lease_epoch, lease_expires_at, version, created_at, updated_at, committed_at, execution_contract";
 
 /// An [`EffectStore`] in a SQLite database.
 ///
@@ -145,7 +145,7 @@ impl EffectStore for SqliteStore {
         let inserted = bind_record(
             sqlx::query(AssertSqlSafe(format!(
                 "INSERT INTO effects ({COLUMNS}) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
                  ON CONFLICT (effect_name, logical_key) DO NOTHING"
             ))),
             &record,
@@ -436,7 +436,8 @@ fn bind_record<'q>(query: Query<'q>, r: &EffectRecord) -> Result<Query<'q>, Stor
         .bind(to_i64(r.version)?)
         .bind(to_ms(r.created_at))
         .bind(to_ms(r.updated_at))
-        .bind(r.committed_at.map(to_ms)))
+        .bind(r.committed_at.map(to_ms))
+        .bind(json(r.execution_contract.as_ref())?))
 }
 
 fn decode_record(row: &SqliteRow) -> Result<EffectRecord, StoreError> {
@@ -451,6 +452,7 @@ fn decode_record(row: &SqliteRow) -> Result<EffectRecord, StoreError> {
         ),
         kind: EffectKind::parse(&kind).ok_or_else(|| corrupt("kind", &kind))?,
         status: EffectStatus::parse(&status).ok_or_else(|| corrupt("status", &status))?,
+        execution_contract: from_json(get(row, "execution_contract")?)?,
         input: from_json(get(row, "input")?)?,
         input_fingerprint: get(row, "input_fingerprint")?,
         output: from_json(get(row, "output")?)?,

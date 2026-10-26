@@ -21,6 +21,10 @@ pub struct EffectRecord {
     pub key: EffectKey,
     /// The effect's kind.
     pub kind: EffectKind,
+    /// Immutable safety assumptions; absent on records created before the
+    /// contract migration. Absence must never grant execution capabilities.
+    #[serde(default)]
+    pub execution_contract: Option<crate::ExecutionContract>,
     /// Current status.
     pub status: EffectStatus,
     /// The input, redacted for storage.
@@ -76,6 +80,7 @@ impl EffectRecord {
             id: new.id,
             key: new.key,
             kind: new.kind,
+            execution_contract: new.execution_contract,
             status: EffectStatus::Pending,
             input: new.input,
             input_fingerprint: new.input_fingerprint,

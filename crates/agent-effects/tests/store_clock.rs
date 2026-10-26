@@ -106,11 +106,11 @@ fn key(logical: &str) -> EffectKey {
 /// store's clock, right away.
 async fn abandoned(store: &OwnClock, key: EffectKey) -> EffectRecord {
     let record = store
-        .insert_or_get(NewEffect::new(
-            key,
-            EffectKind::IrreversibleWrite,
-            SystemTime::now(),
-        ))
+        .insert_or_get(
+            NewEffect::new(key, EffectKind::IrreversibleWrite, SystemTime::now()).with_contract(
+                agent_effects::store::ExecutionContract::new(EffectKind::IrreversibleWrite, 5),
+            ),
+        )
         .await
         .unwrap()
         .record;

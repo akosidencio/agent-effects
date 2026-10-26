@@ -228,7 +228,17 @@ async fn taking_over_a_stalled_worker_verifies_instead_of_duplicating() {
         let (remote, started, release) =
             (remote.clone(), stall.started.clone(), stall.release.clone());
         async move {
+            let lookup = remote.clone();
             a.effect("op", "stalled")
+                .verify(move |_| {
+                    let lookup = lookup.clone();
+                    async move {
+                        Ok::<_, EffectFailure>(match lookup.find(RES).await? {
+                            Some(id) => Verification::Confirmed(id),
+                            None => Verification::NotApplied,
+                        })
+                    }
+                })
                 .run(move |_| {
                     let (remote, started, release) =
                         (remote.clone(), started.clone(), release.clone());
@@ -251,7 +261,7 @@ async fn taking_over_a_stalled_worker_verifies_instead_of_duplicating() {
         .unwrap();
     assert_eq!(report.marked_unknown.len(), 1);
 
-    // A caller re-runs the effect on worker b, with verification.
+    // A caller reattaches on worker b with the same verification contract.
     let b = runtime(&store, Arc::clone(&clock), "b");
     let lookup = remote.clone();
     let taken_over = b

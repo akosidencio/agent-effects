@@ -157,6 +157,11 @@ irreversible writes. See [retry-idempotency.md](retry-idempotency.md).
 - **Closures need a caller.** Recovery can only mark closure effects
   `Unknown`. Finishing them takes a call with the same key, or an operator.
   Registered handlers do not have this limit.
+- **Execution assumptions must stay compatible.** New records persist an
+  execution contract. Changing idempotency, verification mode, handler semantic
+  version, adapter identity, effective approval/retry requirements, or the
+  attempt ceiling returns an explicit mismatch before re-execution. Legacy
+  unresolved effects have no attested contract and require reconciliation.
 - **Stored inputs must stay readable.** A handler's input is stored so
   recovery can rebuild the call. If the input type changes incompatibly, old
   effects land in `RecoveryReport::resume_errors` instead of running.

@@ -79,6 +79,15 @@ fn new_effect(n: u32) -> NewEffect {
         input: Some(json!({ "n": n, "nested": { "b": [1, 2], "a": null } })),
         input_fingerprint: Some(format!("fingerprint-{n}")),
         created_by: Some("agent:testkit".into()),
+        execution_contract: Some(crate::ExecutionContract {
+            remote_idempotency: true,
+            handler_version: "test-v2".into(),
+            adapter: Some("test-provider".into()),
+            verification: crate::VerificationContract::EventuallyConsistent {
+                settle: Duration::from_secs(17),
+            },
+            ..crate::ExecutionContract::new(EffectKind::IrreversibleWrite, 7)
+        }),
         ..NewEffect::new(key(n), EffectKind::IrreversibleWrite, t(0))
     }
 }
@@ -123,6 +132,7 @@ async fn insert_and_read_back<S: EffectStore>(store: S) {
     assert_eq!(record.status, EffectStatus::Pending);
     assert_eq!(record.input, new.input);
     assert_eq!(record.input_fingerprint, new.input_fingerprint);
+    assert_eq!(record.execution_contract, new.execution_contract);
     assert_eq!(record.created_by, new.created_by);
     assert_eq!(
         (record.version, record.lease_epoch, record.attempt_count),

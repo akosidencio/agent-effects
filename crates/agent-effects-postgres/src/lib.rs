@@ -98,7 +98,7 @@ const HISTORY: &str = "_sqlx_migrations";
 const COLUMNS: &str = "id, effect_name, logical_key, kind, status, input, input_fingerprint, \
      output, last_error, created_by, attempt_count, may_have_applied, compensation_attempts, \
      approved, next_attempt_at, attempt_started_at, attempt_ended_at, lease_owner, lease_epoch, \
-     lease_expires_at, version, created_at, updated_at, committed_at";
+     lease_expires_at, version, created_at, updated_at, committed_at, execution_contract";
 
 /// Whose clock the store trusts for leases and recorded times.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -331,7 +331,7 @@ impl Statements {
             lock: format!("SELECT {COLUMNS} FROM {effects} WHERE id = $1 FOR UPDATE").into(),
             insert: format!(
                 "INSERT INTO {effects} ({COLUMNS}) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
-                 $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24) \
+                 $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25) \
                  ON CONFLICT (effect_name, logical_key) DO NOTHING"
             )
             .into(),
@@ -690,6 +690,7 @@ impl EffectStore for PostgresStore {
             .bind(timestamp(record.created_at))
             .bind(timestamp(record.updated_at))
             .bind(record.committed_at.map(timestamp))
+            .bind(json(record.execution_contract.as_ref())?)
             .execute(&mut *session)
             .await
             .map_err(StoreError::backend)?
@@ -934,6 +935,10 @@ fn decode_record(row: &PgRow) -> Result<EffectRecord, StoreError> {
         ),
         kind: EffectKind::parse(&kind).ok_or_else(|| corrupt("kind", &kind))?,
         status: EffectStatus::parse(&status).ok_or_else(|| corrupt("status", &status))?,
+        execution_contract: get::<Option<Value>>(row, "execution_contract")?
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(StoreError::backend)?,
         input: get(row, "input")?,
         input_fingerprint: get(row, "input_fingerprint")?,
         output: get(row, "output")?,
@@ -994,8 +999,8 @@ fn corrupt(column: &str, value: &str) -> StoreError {
     ))
 }
 
-fn json(error: Option<&ErrorRecord>) -> Result<Option<Value>, StoreError> {
-    error
+fn json<T: serde::Serialize>(value: Option<&T>) -> Result<Option<Value>, StoreError> {
+    value
         .map(serde_json::to_value)
         .transpose()
         .map_err(StoreError::backend)

@@ -38,6 +38,31 @@ it reliable, not permitted.
 Names are ≤ 200 bytes, keys ≤ 512 bytes, neither empty nor containing control
 characters.
 
+### Persisted execution assumptions
+
+New runtime records carry `ExecutionContract` format 1. It records the kind,
+remote idempotency declaration, verification mode (including settle delay),
+application handler semantics version, optional adapter identity, effective
+approval and automatic retry requirements, and lifetime attempt ceiling.
+The runtime compares it before lease acquisition or replay; durable recovery
+also compares before decoding input, including compensation recovery.
+A mismatch produces `RuntimeError::ContractMismatch` without running code or
+changing authoritative state. `KindMismatch` and `InputMismatch` remain.
+
+Contract version `"1"` is the application default, independent of the crate
+release version. A compatible code deployment keeps this semantic version;
+changing external behavior requires a new version and explicit reconciliation
+of older keys. There is no automatic contract migration or capability upgrade.
+Retry backoff, jitter, and attempt timeout can change; the lifetime attempt
+ceiling cannot. Risk policy is applied before the contract is persisted or
+compared, preventing a deployment from silently removing approval or retry
+restrictions. Changing risk labels alone has no effect if requirements match.
+
+Legacy SQL records have NULL contracts. Unresolved records produce
+`LegacyContract`; settled legacy records can replay without re-execution.
+Never infer remote idempotency from new code. See
+[storage-migrations.md](storage-migrations.md) for rollout and rollback limits.
+
 ## 3. State machine
 
 Implemented in `agent-effects-store` (`state.rs`) as a pure function `EffectStatus::apply(Transition)`.

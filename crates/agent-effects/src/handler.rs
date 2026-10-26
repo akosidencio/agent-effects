@@ -114,6 +114,18 @@ pub trait EffectHandler: Send + Sync + 'static {
         false
     }
 
+    /// Application-defined execution semantics version. Keep it stable for
+    /// compatible releases; changes refuse existing keys before execution.
+    #[allow(clippy::unnecessary_literal_bound)] // Implementations may borrow configuration.
+    fn contract_version(&self) -> &str {
+        "1"
+    }
+
+    /// Optional trusted adapter/provider identity (never credentials).
+    fn adapter_identity(&self) -> Option<&str> {
+        None
+    }
+
     /// The retry policy; `None` uses the runtime's.
     fn retry_policy(&self) -> Option<RetryPolicy> {
         None
@@ -224,6 +236,24 @@ impl<H: EffectHandler> Clone for Handler<H> {
 }
 
 impl<H: EffectHandler> Handler<H> {
+    fn contract(&self, retry: RetryPolicy) -> crate::store::ExecutionContract {
+        use crate::store::{ExecutionContract, VerificationContract};
+        let effect = &self.effect;
+        let mut contract = ExecutionContract::new(effect.kind(), retry.max_attempts);
+        contract.remote_idempotency = effect.remote_idempotency();
+        contract.handler_version = effect.contract_version().into();
+        contract.adapter = effect.adapter_identity().map(str::to_owned);
+        contract.require_approval = effect.requires_approval();
+        contract.verification = match self.verify.as_ref().map(|(mode, _)| mode) {
+            None | Some(VerificationMode::None) => VerificationContract::None,
+            Some(VerificationMode::Authoritative) => VerificationContract::Authoritative,
+            Some(VerificationMode::EventuallyConsistent { settle }) => {
+                VerificationContract::EventuallyConsistent { settle: *settle }
+            }
+        };
+        contract
+    }
+
     /// Registers `handler` with no optional capabilities.
     pub fn new(handler: H) -> Self {
         Self {
@@ -368,6 +398,16 @@ async fn resume<S: EffectStore, H: EffectHandler>(
     record: EffectRecord,
 ) -> Result<EffectStatus, RuntimeError> {
     let id = record.id;
+    runtime.enforce_contract(
+        &record,
+        handler.contract(
+            handler
+                .effect
+                .retry_policy()
+                .unwrap_or_else(|| runtime.default_retry()),
+        ),
+        handler.effect.risk(),
+    )?;
     if record.status == EffectStatus::Compensating {
         let compensate = handler
             .compensate
@@ -442,6 +482,8 @@ async fn run<S: EffectStore, H: EffectHandler>(
         })
     };
     let spec = EffectSpec {
+        handler_version: effect.contract_version().into(),
+        adapter: effect.adapter_identity().map(str::to_owned),
         fingerprint: stored.fingerprint,
         input: Some(stored.json),
         key,
@@ -538,6 +580,24 @@ impl<'a, S: EffectStore, H: EffectHandler> IntoFuture for CompensationSubmission
                 retry: handler.effect.retry_policy(),
                 attempt_timeout: handler.effect.attempt_timeout(),
             };
+            let record = self
+                .runtime
+                .store()
+                .get_by_key(&spec.key)
+                .await?
+                .ok_or_else(|| RuntimeError::NoSuchEffect {
+                    key: spec.key.to_string(),
+                })?;
+            self.runtime.enforce_contract(
+                &record,
+                handler.contract(
+                    handler
+                        .effect
+                        .retry_policy()
+                        .unwrap_or_else(|| self.runtime.default_retry()),
+                ),
+                handler.effect.risk(),
+            )?;
             self.runtime.compensate_effect(spec, compensate).await
         })
     }

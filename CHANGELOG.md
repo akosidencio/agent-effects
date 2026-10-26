@@ -7,6 +7,26 @@ break the API or storage format.
 
 ## [Unreleased]
 
+### Added
+
+- Persisted versioned execution contracts across memory, SQLite, and
+  PostgreSQL. Reattachment and durable recovery refuse changed idempotency,
+  verification, handler semantics, adapter identity, approval requirements,
+  automatic retry policy, or lifetime attempt ceilings.
+- `EffectBuilder::{contract_version, adapter_identity}`, matching optional
+  `EffectHandler` methods, and explicit contract mismatch/legacy errors.
+- SQL migration 0002 adds a nullable contract without rewriting legacy
+  records. Unresolved unattested records require reconciliation; settled
+  legacy results remain replayable. See `docs/storage-migrations.md`.
+
+### Compatibility
+
+- Adding `execution_contract` to public `NewEffect` and `EffectRecord`
+  requires custom store implementations and struct literals to be updated.
+  `NewEffect::new` remains available, and `with_contract` supplies assumptions.
+- Retry timing and attempt timeouts may change across deployments; the
+  lifetime attempt ceiling and safety declarations must stay unchanged.
+
 ### Fixed
 
 - HTTP 408, 425, 429, and 503 now default to ambiguous outcomes, preventing
