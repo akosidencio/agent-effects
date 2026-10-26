@@ -20,6 +20,7 @@ pub mod testkit;
 
 mod contract;
 mod error;
+mod late;
 mod record;
 
 use std::future::Future;
@@ -35,6 +36,7 @@ pub use id::{
     EffectId, EffectKey, EffectName, IdempotencyKey, IdentityError, LogicalKey, WorkerId,
 };
 pub use kind::EffectKind;
+pub use late::{LateObservation, LateOutcome};
 pub use record::EffectRecord;
 pub use state::{EffectStatus, InvalidTransition, Transition};
 
@@ -49,6 +51,24 @@ pub use state::{EffectStatus, InvalidTransition, Transition};
 /// a lock), so concurrent callers can never interleave between the check and
 /// the write.
 pub trait EffectStore: Send + Sync + 'static {
+    /// Appends supplementary evidence without a lease. It must never modify
+    /// the effect record or authoritative transition history. Duplicate
+    /// observation ids leave the original observation unchanged. The effect
+    /// must exist; evidence is deleted atomically when that effect is pruned.
+    fn append_late_observation(
+        &self,
+        observation: LateObservation,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// Lists untrusted evidence by observation id, with bounded pagination.
+    /// Evidence is for operator investigation and never proof of commitment.
+    fn late_observations(
+        &self,
+        id: EffectId,
+        after: Option<EffectId>,
+        limit: usize,
+    ) -> impl Future<Output = Result<Vec<LateObservation>, StoreError>> + Send;
+
     /// Inserts a new effect, or returns the existing record with the same
     /// [`EffectKey`] untouched.
     ///

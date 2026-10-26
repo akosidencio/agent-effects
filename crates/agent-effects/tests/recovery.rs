@@ -293,6 +293,17 @@ async fn taking_over_a_stalled_worker_verifies_instead_of_duplicating() {
         "a's late result agrees and changes nothing"
     );
     assert_eq!(remote.applications(RES), 1, "created exactly once");
+    let record = store.get_by_key(&key("stalled")).await.unwrap().unwrap();
+    let evidence = store.late_observations(record.id, None, 10).await.unwrap();
+    assert_eq!(evidence.len(), 1);
+    assert_eq!(evidence[0].worker, WorkerId::new("a"));
+    assert_eq!(evidence[0].lease_epoch, 1);
+    assert_eq!(evidence[0].attempt, 1);
+    assert_eq!(
+        evidence[0].outcome,
+        agent_effects::store::LateOutcome::Succeeded
+    );
+    assert_eq!(record.status, EffectStatus::Committed);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -533,5 +544,67 @@ async fn resolve_refuses_settled_busy_and_unknown_ids() {
     assert!(
         matches!(err, RuntimeError::Store(StoreError::NotFound(_))),
         "{err}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_action_finishing_after_heartbeat_fencing_only_appends_evidence() {
+    let store = MemoryStore::new();
+    let clock = TokioClock::new();
+    let rt = runtime(&store, clock, "late-worker");
+    let started = Arc::new(Notify::new());
+    let finish = Arc::new(Notify::new());
+    let running = tokio::spawn({
+        let (started, finish) = (started.clone(), finish.clone());
+        async move {
+            rt.effect("op", "heartbeat-late")
+                .run(move |_| {
+                    let (started, finish) = (started.clone(), finish.clone());
+                    async move {
+                        started.notify_one();
+                        finish.notified().await;
+                        Ok::<_, EffectFailure>("sensitive remote result".to_string())
+                    }
+                })
+                .await
+                .unwrap()
+        }
+    });
+    started.notified().await;
+    tokio::time::advance(TTL).await;
+    let outcome = running.await.unwrap();
+    assert!(matches!(outcome, EffectOutcome::NeedsIntervention { .. }));
+    let before = record(&store, "heartbeat-late").await;
+    assert!(
+        store
+            .late_observations(before.id, None, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    finish.notify_one();
+    for _ in 0..50 {
+        if !store
+            .late_observations(before.id, None, 10)
+            .await
+            .unwrap()
+            .is_empty()
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let evidence = store.late_observations(before.id, None, 10).await.unwrap();
+    assert_eq!(evidence.len(), 1);
+    assert_eq!(
+        evidence[0].outcome,
+        agent_effects::store::LateOutcome::Succeeded
+    );
+    assert_eq!(evidence[0].lease_epoch, 1);
+    assert_eq!(store.get(before.id).await.unwrap().unwrap(), before);
+    assert!(
+        !serde_json::to_string(&evidence)
+            .unwrap()
+            .contains("sensitive remote result")
     );
 }

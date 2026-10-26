@@ -151,9 +151,15 @@ irreversible writes. See [retry-idempotency.md](retry-idempotency.md).
   effect may then be re-run under the rules above. Keep clocks synchronized
   (NTP) and the lease TTL far above the skew. `PostgresStore` uses the
   database's clock for leases by default, which removes this limit.
-- **A fenced worker's late success is not recorded.** If A's action
-  succeeds after B took over, A's result is refused. The operator resolving
-  the effect does not see it. This is an open design question.
+- **Late results are supplementary evidence.** A worker whose result cannot
+  be committed attempts to append metadata identifying its worker, original
+  attempt and fencing epoch, start/observation times, and observed outcome.
+  An action that outlives heartbeat fencing is monitored for its eventual
+  return. `EffectStore::late_observations` supports operator inspection.
+  Evidence never changes status, output, version, or transition history and
+  is not proof of remote application. No response bodies or error messages
+  are retained. Process death, database outage, or pruning before append can
+  still lose this evidence; authoritative recovery rules remain unchanged.
 - **Closures need a caller.** Recovery can only mark closure effects
   `Unknown`. Finishing them takes a call with the same key, or an operator.
   Registered handlers do not have this limit.

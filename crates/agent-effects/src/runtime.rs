@@ -377,6 +377,18 @@ impl<S: EffectStore> Runtime<S> {
         self.inner.retry
     }
 
+    async fn preserve_late_result(&self, observation: crate::store::LateObservation) {
+        let (effect_id, attempt, lease_epoch) = (
+            observation.effect_id,
+            observation.attempt,
+            observation.lease_epoch,
+        );
+        if let Err(error) = self.store().append_late_observation(observation).await {
+            warn!(effect.id = %effect_id, attempt, lease_epoch, error = %error,
+                "could not preserve supplementary late-result evidence");
+        }
+    }
+
     pub(crate) fn now(&self) -> SystemTime {
         self.inner.clock.now()
     }
@@ -820,25 +832,67 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
         Fut: Future<Output = Result<T, EffectFailure>> + Send + 'static,
         V: Verifier<T>,
     {
-        // A separate task, so a panicking action is caught as a JoinError.
-        // If the lease is lost while waiting, the handle is dropped and the
-        // task finishes detached: the request is already in flight.
+        // An in-flight action may outlive its lease. Keep its eventual
+        // outcome as supplementary evidence, never as an authoritative commit.
         let mut task = tokio::spawn((self.action)(context(&record)));
         self.rt.checkpoint(FaultPoint::AfterActionStarted);
-        let joined = match self.spec.attempt_timeout {
-            None => self.leased(&mut task).await?,
-            Some(limit) => match self.leased(tokio::time::timeout(limit, &mut task)).await? {
-                Ok(joined) => joined,
-                Err(_elapsed) => {
-                    task.abort();
-                    Ok(Err(EffectFailure::ambiguous(format!(
-                        "attempt timed out after {limit:?}"
-                    ))))
-                }
-            },
+        let waited = match self.spec.attempt_timeout {
+            None => self.leased(&mut task).await,
+            Some(limit) => self
+                .leased(tokio::time::timeout(limit, &mut task))
+                .await
+                .map(|timed| {
+                    timed.unwrap_or_else(|_| {
+                        task.abort();
+                        Ok(Err(EffectFailure::ambiguous(format!(
+                            "attempt timed out after {limit:?}"
+                        ))))
+                    })
+                }),
+        };
+        let joined = match waited {
+            Ok(joined) => joined,
+            Err(interrupt) => {
+                let runtime = self.rt.clone();
+                let mut observation = crate::store::LateObservation::new(
+                    &record,
+                    self.lease,
+                    crate::store::LateOutcome::Interrupted,
+                    self.rt.now(),
+                );
+                tokio::spawn(async move {
+                    let joined = task.await;
+                    observation.outcome = late_outcome(&joined);
+                    observation.observed_at = runtime.now();
+                    runtime.preserve_late_result(observation).await;
+                });
+                return Err(interrupt);
+            }
         };
         self.rt.checkpoint(FaultPoint::AfterActionReturned);
 
+        let observation = crate::store::LateObservation::new(
+            &record,
+            self.lease,
+            late_outcome(&joined),
+            self.rt.now(),
+        );
+        let advanced = self.record_result(record, joined).await;
+        if advanced.is_err() {
+            self.rt.preserve_late_result(observation).await;
+        }
+        advanced
+    }
+
+    async fn record_result<T>(
+        &self,
+        record: EffectRecord,
+        joined: Result<Result<T, EffectFailure>, tokio::task::JoinError>,
+    ) -> Result<(EffectRecord, Option<T>, bool), Interrupt>
+    where
+        T: Serialize + Send + 'static,
+        V: Verifier<T>,
+    {
         match joined {
             Ok(Ok(value)) if self.spec.capabilities.verification != VerificationMode::None => {
                 let (record, verified, exhausted) =
@@ -1209,6 +1263,17 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
     /// `attempts`: within budget, and not forbidden by the risk policy.
     fn may_retry(&self, attempts: u32) -> bool {
         self.spec.automatic_retry && self.retry().allows_another(attempts)
+    }
+}
+
+fn late_outcome<T>(
+    joined: &Result<Result<T, EffectFailure>, tokio::task::JoinError>,
+) -> crate::store::LateOutcome {
+    use crate::store::LateOutcome;
+    match joined {
+        Ok(Ok(_)) => LateOutcome::Succeeded,
+        Ok(Err(_)) => LateOutcome::Failed,
+        Err(_) => LateOutcome::Interrupted,
     }
 }
 

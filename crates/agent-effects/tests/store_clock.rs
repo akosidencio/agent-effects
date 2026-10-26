@@ -29,6 +29,22 @@ impl OwnClock {
 }
 
 impl EffectStore for OwnClock {
+    async fn append_late_observation(
+        &self,
+        observation: agent_effects::store::LateObservation,
+    ) -> Result<(), StoreError> {
+        self.inner.append_late_observation(observation).await
+    }
+
+    async fn late_observations(
+        &self,
+        id: EffectId,
+        after: Option<EffectId>,
+        limit: usize,
+    ) -> Result<Vec<agent_effects::store::LateObservation>, StoreError> {
+        self.inner.late_observations(id, after, limit).await
+    }
+
     async fn insert_or_get(&self, mut new: NewEffect) -> Result<InsertOutcome, StoreError> {
         new.now = self.now();
         self.inner.insert_or_get(new).await

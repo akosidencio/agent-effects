@@ -41,6 +41,7 @@ where
     Fut: Future<Output = S>,
 {
     insert_and_read_back(make_store().await).await;
+    supplementary_evidence_never_changes_authority(make_store().await).await;
     insert_is_idempotent_per_key(make_store().await).await;
     concurrent_inserts_converge(make_store().await).await;
     missing_records_are_reported(make_store().await).await;
@@ -58,6 +59,97 @@ where
     compensation_is_persisted(make_store().await).await;
     approval_is_persisted(make_store().await).await;
     pruning_removes_only_settled_idle_old_records(make_store().await).await;
+}
+
+async fn supplementary_evidence_never_changes_authority<S: EffectStore>(store: S) {
+    use crate::{LateObservation, LateOutcome};
+    let record = insert(&store, 1).await;
+    let old = store
+        .acquire_lease(record.id, &worker("old"), t(0), Duration::from_secs(1))
+        .await
+        .unwrap();
+    let executing = drive(
+        &store,
+        record,
+        Some(&old),
+        &[Transition::StartAttempt],
+        t(0),
+    )
+    .await;
+    let new = store
+        .acquire_lease(executing.id, &worker("new"), t(2), Duration::from_secs(30))
+        .await
+        .unwrap();
+    let before = reload(&store, executing.id).await;
+    let history = store.events(executing.id).await.unwrap();
+    let first = LateObservation::new(&executing, &old, LateOutcome::Succeeded, t(3));
+    let second = LateObservation::new(&executing, &old, LateOutcome::Failed, t(4));
+    store.append_late_observation(first.clone()).await.unwrap();
+    let mut conflicting = first.clone();
+    conflicting.outcome = LateOutcome::Failed;
+    store.append_late_observation(conflicting).await.unwrap();
+    store.append_late_observation(second.clone()).await.unwrap();
+    assert_eq!(
+        store.late_observations(before.id, None, 1).await.unwrap(),
+        std::slice::from_ref(&first)
+    );
+    assert_eq!(
+        store
+            .late_observations(before.id, Some(first.id), 10)
+            .await
+            .unwrap(),
+        [second]
+    );
+    assert!(
+        store
+            .late_observations(before.id, None, 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(reload(&store, before.id).await, before);
+    assert_eq!(store.events(before.id).await.unwrap(), history);
+    // Even evidence of success does not allow the stale worker to commit.
+    assert!(matches!(
+        store
+            .transition(TransitionRequest::new(
+                &before,
+                Some(&old),
+                Transition::Succeeded,
+                t(3)
+            ))
+            .await,
+        Err(StoreError::LeaseLost)
+    ));
+    let settled = drive(
+        &store,
+        before,
+        Some(&new),
+        &[
+            Transition::LeaseExpired,
+            Transition::StartVerification,
+            Transition::VerificationConfirmed,
+        ],
+        t(3),
+    )
+    .await;
+    store.release_lease(&new).await.unwrap();
+    assert_eq!(
+        store
+            .prune(PruneQuery::new(
+                EffectStatus::Committed,
+                Duration::from_secs(1),
+                t(100)
+            ))
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(store.get(settled.id).await.unwrap().is_none());
+    assert!(matches!(
+        store.late_observations(settled.id, None, 10).await,
+        Err(StoreError::NotFound(_))
+    ));
 }
 
 const TTL: Duration = Duration::from_secs(30);

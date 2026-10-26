@@ -139,6 +139,39 @@ impl SqliteStore {
 }
 
 impl EffectStore for SqliteStore {
+    async fn append_late_observation(
+        &self,
+        observation: agent_effects_store::LateObservation,
+    ) -> Result<(), StoreError> {
+        sqlx::query("INSERT INTO late_observations (id, effect_id, observation) VALUES (?, ?, ?) ON CONFLICT (id) DO NOTHING")
+            .bind(observation.id.to_string()).bind(observation.effect_id.to_string())
+            .bind(serde_json::to_string(&observation).map_err(StoreError::backend)?)
+            .execute(&self.pool).await.map_err(StoreError::backend)?;
+        Ok(())
+    }
+
+    async fn late_observations(
+        &self,
+        id: EffectId,
+        after: Option<EffectId>,
+        limit: usize,
+    ) -> Result<Vec<agent_effects_store::LateObservation>, StoreError> {
+        if self.get(id).await?.is_none() {
+            return Err(StoreError::NotFound(id));
+        }
+        let rows = sqlx::query("SELECT observation FROM late_observations WHERE effect_id = ? AND (? IS NULL OR id > ?) ORDER BY id LIMIT ?")
+            .bind(id.to_string()).bind(after.map(|id| id.to_string()))
+            .bind(after.map(|id| id.to_string()))
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .fetch_all(&self.pool).await.map_err(StoreError::backend)?;
+        rows.iter()
+            .map(|row| {
+                let json: String = get(row, "observation")?;
+                serde_json::from_str(&json).map_err(StoreError::backend)
+            })
+            .collect()
+    }
+
     async fn insert_or_get(&self, new: NewEffect) -> Result<InsertOutcome, StoreError> {
         let mut record = EffectRecord::new(new);
         normalize(&mut record);

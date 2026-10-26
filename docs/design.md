@@ -1037,6 +1037,11 @@ it something else), the same value on every attempt, worker and restart.
 The crate enables no reqwest features; TLS comes from the application's own
 `reqwest` dependency and the `Client` it passes in.
 
+Definite response failures and negative verification lookups require a client
+built without redirects and declared with `.client_follows_no_redirects()`.
+Otherwise even an unchanged final URL can conceal a redirect back to the
+original URL; every failure response stays ambiguous.
+
 Classification follows one rule: a failure is definite only when the
 request provably never reached the server, or the server's answer says it
 did not apply.
@@ -1185,10 +1190,6 @@ Crates are added when their milestone starts, not as empty placeholders.
 
 ## Open questions
 
-- A fenced worker whose action *succeeded* cannot record that, so the
-  knowledge is lost and an operator resolves the effect blind. Should a fenced
-  worker append a "late result" audit event, which leaves the status alone
-  but gives the operator the evidence?
 
 ## Payload schema compatibility
 
@@ -1208,3 +1209,29 @@ Replay migrates and deserializes without re-execution. Absent output is
 Serialization failure after external success preserves `Committed` and a
 redacted audit note; the live caller still gets its result. An unreadable
 committed output must never be treated as an externally failed effect.
+
+## Supplementary late-result evidence
+
+Migration 0004 adds a separate append-only `late_observations` table. The
+store exposes append and bounded, paginated inspection. Each observation
+records an id, effect id, worker, original lease epoch, action attempt,
+persisted attempt start, worker-reported observation time, and outcome category.
+It contains no response, input/output payload, or error message. Duplicate
+observation ids do not overwrite evidence. No live lease is required to append.
+
+The runtime attempts an append when a returned action result cannot be
+recorded authoritatively. If heartbeat fencing happens before the action
+returns, a monitor awaits that already-running task and appends its eventual
+outcome. An action still in flight may outlive the requesting caller. Evidence
+has no state transition and never invokes verification, grants a capability,
+changes committed output, or overrides a new lease holder. Operators must
+corroborate it with remote evidence before using `resolve`.
+
+A separate table preserves the authoritative transition sequence and fencing
+contract; an extra transition event would falsely suggest state advancement.
+Evidence writes are best effort: process termination, database failure, or a
+concurrent settled-record prune may prevent recording. No response values are
+kept, sacrificing details in exchange for bounded metadata and secret safety.
+Foreign-key cascades (and the memory-store equivalent) delete observations in
+the same pruning transaction as the settled effect. Unresolved effects and
+their observations remain protected by existing retention rules.

@@ -51,3 +51,9 @@ input schema at insertion; transitions store the output schema atomically
 with the output. SQL uses integer versions (PostgreSQL BIGINT supports the
 full Rust u32 range). Custom stores must persist these fields too. See the
 [payload guide](payload-schemas.md) before changing Rust data types.
+
+Migration 0004 adds the `late_observations` table and `(effect_id, id)` index.
+It stores supplementary metadata as JSON, with a foreign key that cascades
+when a settled effect is pruned. Application authorization must protect both
+effect and evidence retrieval. Custom stores implement append-only insertion
+and bounded listing without touching the record or transition events.

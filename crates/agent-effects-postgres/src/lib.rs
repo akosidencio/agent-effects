@@ -302,6 +302,7 @@ fn quote_ident(name: &str) -> String {
 /// The store's SQL, with its table names filled in.
 #[derive(Debug)]
 struct Statements {
+    late_observations: String,
     transaction_pooling: bool,
     history: String,
     effects: String,
@@ -327,6 +328,7 @@ impl Statements {
             qualify("effect_events"),
         );
         Self {
+            late_observations: qualify("late_observations"),
             transaction_pooling: options.transaction_pooling,
             lock: format!("SELECT {COLUMNS} FROM {effects} WHERE id = $1 FOR UPDATE").into(),
             insert: format!(
@@ -657,6 +659,43 @@ impl PostgresStore {
 }
 
 impl EffectStore for PostgresStore {
+    async fn append_late_observation(
+        &self,
+        observation: agent_effects_store::LateObservation,
+    ) -> Result<(), StoreError> {
+        let mut session = self.session().await?;
+        self.sql.query(format!("INSERT INTO {} (id, effect_id, observation) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING", self.sql.late_observations))
+            .bind(*observation.id.as_uuid()).bind(*observation.effect_id.as_uuid())
+            .bind(serde_json::to_value(&observation).map_err(StoreError::backend)?)
+            .execute(&mut *session).await.map_err(StoreError::backend)?;
+        session.finish().await
+    }
+
+    async fn late_observations(
+        &self,
+        id: EffectId,
+        after: Option<EffectId>,
+        limit: usize,
+    ) -> Result<Vec<agent_effects_store::LateObservation>, StoreError> {
+        let mut session = self.session().await?;
+        if self.fetch(&mut session, id).await?.is_none() {
+            return Err(StoreError::NotFound(id));
+        }
+        let rows = self.sql.query(format!("SELECT observation FROM {} WHERE effect_id = $1 AND ($2::UUID IS NULL OR id > $2) ORDER BY id LIMIT $3", self.sql.late_observations))
+            .bind(*id.as_uuid()).bind(after.map(|id| *id.as_uuid()))
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .fetch_all(&mut *session).await.map_err(StoreError::backend)?;
+        let observations = rows
+            .iter()
+            .map(|row| {
+                let json: Value = get(row, "observation")?;
+                serde_json::from_value(json).map_err(StoreError::backend)
+            })
+            .collect::<Result<_, _>>()?;
+        session.finish().await?;
+        Ok(observations)
+    }
+
     async fn insert_or_get(&self, mut new: NewEffect) -> Result<InsertOutcome, StoreError> {
         let mut session = self.session().await?;
         if self.clock == ClockSource::Database {
