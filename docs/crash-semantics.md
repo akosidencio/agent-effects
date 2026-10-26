@@ -125,6 +125,17 @@ From `Unknown`, a later call with the same key does one of these:
     fields and scrub error messages before they are written.
   - Redacted values cannot be replayed or resumed with their original value.
 
+## HTTP response safety
+
+HTTP 408, 425, 429, 500, 502, 503, and 504 are ambiguous by default.
+A write may already have applied before an application or gateway returns
+one of these statuses. `Retry-After` only delays an otherwise safe retry;
+its minimum time survives in the effect record. It does not authorize a
+retry. Verification can still confirm the write without waiting.
+Provider overrides must be grounded in an explicit contract proving that
+an operation was rejected before application. Keep redirects disabled for
+irreversible writes. See [retry-idempotency.md](retry-idempotency.md).
+
 ## Known limits
 
 - **A stalled request can outrun verification.** Suppose worker A stalls

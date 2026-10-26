@@ -892,3 +892,44 @@ async fn a_failed_retry_does_not_fail_an_effect_an_earlier_attempt_may_have_appl
         ]
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn ambiguous_retry_advice_delays_only_an_otherwise_safe_retry() {
+    for protected in [false, true] {
+        let (store, rt, clock) = setup();
+        let started = Instant::now();
+        let calls = Arc::new(AtomicU32::new(0));
+        let seen = Arc::clone(&calls);
+        let outcome = rt
+            .effect(NAME, "retry-advice")
+            .kind(EffectKind::IrreversibleWrite)
+            .remote_idempotency(protected)
+            .run(move |_| {
+                let call = seen.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if call == 0 {
+                        Err(EffectFailure::ambiguous("gateway response")
+                            .with_retry_after(Duration::from_secs(120)))
+                    } else {
+                        assert!(started.elapsed() >= Duration::from_secs(120));
+                        Ok("result".to_string())
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        let record = store
+            .get_by_key(&key("retry-advice"))
+            .await
+            .unwrap()
+            .unwrap();
+        if protected {
+            assert_eq!(outcome, EffectOutcome::Committed("result".into()));
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+        } else {
+            assert!(matches!(outcome, EffectOutcome::NeedsIntervention { .. }));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(record.next_attempt_at.unwrap() >= clock.now() + Duration::from_secs(120));
+        }
+    }
+}

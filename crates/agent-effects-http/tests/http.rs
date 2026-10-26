@@ -10,7 +10,7 @@ use agent_effects::{
     EffectKey, EffectKind, EffectName, EffectOutcome, FailureClass, LogicalKey, RetryPolicy,
     Runtime,
 };
-use agent_effects_http::HttpEffect;
+use agent_effects_http::{HttpEffect, StatusClass};
 use agent_effects_memory::MemoryStore;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -26,6 +26,8 @@ enum Reply {
     Status(u16, Headers, String),
     /// Apply the POST, then close the connection without answering.
     ApplyThenDrop,
+    /// Apply the POST, then return an error status.
+    ApplyThenStatus(u16, Headers),
     /// Apply the POST, then answer `303 See Other` to this location.
     ApplyThenRedirect(String),
     /// Never answer.
@@ -191,6 +193,10 @@ async fn handle(mut stream: TcpStream, state: Arc<Mutex<State>>) {
                     }
                     Some((code, extra, payload))
                 }
+                Some(Reply::ApplyThenStatus(status, extra)) => {
+                    apply(&mut state, key.as_ref());
+                    Some((status, extra, "applied but response failed".into()))
+                }
                 Some(Reply::ApplyThenDrop) => {
                     apply(&mut state, key.as_ref());
                     return; // drop the connection unanswered
@@ -309,19 +315,17 @@ async fn statuses_reach_the_runtime_as_failure_classes() {
         (401, vec![], FailureClass::Authentication),
         (403, vec![], FailureClass::Authorization),
         (404, vec![], FailureClass::Permanent),
-        (408, vec![], FailureClass::Transient),
+        (408, vec![], FailureClass::Ambiguous),
         (409, vec![], FailureClass::Ambiguous),
         (422, vec![], FailureClass::Validation),
         (
             429,
             vec![("retry-after", "7".to_owned())],
-            FailureClass::RateLimited {
-                retry_after: Some(Duration::from_secs(7)),
-            },
+            FailureClass::Ambiguous,
         ),
         (500, vec![], FailureClass::Ambiguous),
         (501, vec![], FailureClass::Permanent),
-        (503, vec![], FailureClass::Transient),
+        (503, vec![], FailureClass::Ambiguous),
         (504, vec![], FailureClass::Ambiguous),
     ];
     for (status, headers, class) in cases {
@@ -703,4 +707,162 @@ async fn an_endless_error_body_is_cut_short() {
     assert_eq!(error.class, Some(FailureClass::Ambiguous));
     assert!(error.message.len() < 600, "{}", error.message.len());
     assert!(error.message.ends_with('…'));
+}
+
+#[tokio::test]
+async fn applied_writes_with_error_responses_are_never_blindly_repeated() {
+    for status in [408, 425, 429, 500, 502, 503, 504] {
+        let server = Server::start([Reply::ApplyThenStatus(
+            status,
+            vec![("retry-after", "7".into())],
+        )])
+        .await;
+        let store = MemoryStore::new();
+        let rt = runtime(&store, NO_WAIT);
+        for _ in 0..2 {
+            let outcome = rt
+                .effect("http.call", status)
+                .kind(EffectKind::IrreversibleWrite)
+                .run(
+                    HttpEffect::post(&client_without_redirects(), server.url("/charges"))
+                        .client_follows_no_redirects()
+                        .send(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(outcome, EffectOutcome::NeedsIntervention { .. }),
+                "{status}: {outcome:?}"
+            );
+        }
+        assert_eq!(server.requests().len(), 1, "HTTP {status}");
+        assert_eq!(server.applied(), 1, "HTTP {status}");
+        assert_eq!(
+            last_error(&store, &status.to_string()).await.class,
+            Some(FailureClass::Ambiguous)
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_dropped_answer_without_protection_requires_intervention() {
+    let server = Server::start([Reply::ApplyThenDrop]).await;
+    let outcome = runtime(&MemoryStore::new(), NO_WAIT)
+        .effect("http.call", "drop-unprotected")
+        .kind(EffectKind::IrreversibleWrite)
+        .run(HttpEffect::post(&reqwest::Client::new(), server.url("/charges")).send())
+        .await
+        .unwrap();
+    assert!(matches!(outcome, EffectOutcome::NeedsIntervention { .. }));
+    assert_eq!((server.requests().len(), server.applied()), (1, 1));
+}
+
+#[tokio::test]
+async fn error_responses_can_be_safely_reexecuted_with_provider_idempotency() {
+    for status in [429, 500, 503] {
+        let server = Server::start([Reply::ApplyThenStatus(status, vec![])]).await;
+        let outcome = runtime(&MemoryStore::new(), NO_WAIT)
+            .effect("http.call", status)
+            .kind(EffectKind::IrreversibleWrite)
+            .remote_idempotency(true)
+            .run(
+                HttpEffect::post(&reqwest::Client::new(), server.url("/charges"))
+                    .idempotency_key_header()
+                    .send_json::<Payment>(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            EffectOutcome::Committed(Payment { id: "res#1".into() })
+        );
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].headers["idempotency-key"],
+            requests[1].headers["idempotency-key"]
+        );
+        assert_eq!(server.applied(), 1);
+    }
+}
+
+#[tokio::test]
+async fn verification_confirms_an_applied_write_after_a_503() {
+    let server = Server::start([Reply::ApplyThenStatus(503, vec![])]).await;
+    let client = reqwest::Client::new();
+    let outcome = runtime(&MemoryStore::new(), NO_WAIT)
+        .effect("http.call", "verified-503")
+        .kind(EffectKind::IrreversibleWrite)
+        .verify(HttpEffect::get(&client, server.url("/lookup")).verify_json::<Payment>())
+        .run(HttpEffect::post(&client, server.url("/charges")).send_json::<Payment>())
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        EffectOutcome::Committed(Payment { id: "res#1".into() })
+    );
+    assert_eq!(
+        server
+            .requests()
+            .iter()
+            .filter(|r| r.method == "POST")
+            .count(),
+        1
+    );
+    assert_eq!(server.applied(), 1);
+}
+
+#[tokio::test]
+async fn trusted_provider_can_override_a_documented_rejection() {
+    let server = Server::start([Reply::Status(
+        503,
+        vec![],
+        "rejected before execution".into(),
+    )])
+    .await;
+    let outcome = runtime(&MemoryStore::new(), NO_WAIT)
+        .effect("http.call", "provider-rejection")
+        .kind(EffectKind::IrreversibleWrite)
+        .run(
+            HttpEffect::post(&reqwest::Client::new(), server.url("/charges"))
+                .classify_status(|status, _| {
+                    (status.as_u16() == 503)
+                        .then_some(StatusClass::Failure(FailureClass::Transient))
+                })
+                .send_json::<Payment>(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        EffectOutcome::Committed(Payment { id: "res#1".into() })
+    );
+    assert_eq!((server.requests().len(), server.applied()), (2, 1));
+}
+
+#[tokio::test]
+async fn retry_after_on_an_ambiguous_response_delays_a_safe_retry() {
+    let server = Server::start([Reply::ApplyThenStatus(
+        429,
+        vec![("retry-after", "1".into())],
+    )])
+    .await;
+    let store = MemoryStore::new();
+    let started = std::time::Instant::now();
+    let outcome = runtime(&store, NO_WAIT)
+        .effect("http.call", "delayed-safe")
+        .remote_idempotency(true)
+        .run(
+            HttpEffect::post(&reqwest::Client::new(), server.url("/charges"))
+                .idempotency_key_header()
+                .send_json::<Payment>(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        EffectOutcome::Committed(Payment { id: "res#1".into() })
+    );
+    assert!(started.elapsed() >= Duration::from_secs(1));
+    assert_eq!((server.requests().len(), server.applied()), (2, 1));
 }

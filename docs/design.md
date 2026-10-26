@@ -1031,12 +1031,19 @@ cannot inspect the caller's `Client`, so the caller declares it:
 | timeout or connection lost after sending | Ambiguous |
 | 2xx with an unreadable or unparseable body | Ambiguous: it applied, the answer was lost |
 | 3xx (only seen when the client does not follow redirects) | Ambiguous |
-| 408, 425, 503 | Transient |
-| 429, or 503 with `Retry-After` | RateLimited, honouring `Retry-After` (seconds or HTTP date) |
+| 408, 425, 429, 503 (with or without `Retry-After`) | Ambiguous |
 | 400, 422 | Validation |
 | 401 / 403 | Authentication / Authorization |
 | 409, 500, 502, 504, other 5xx | Ambiguous |
 | 501, other 4xx | Permanent |
+
+`Retry-After` is scheduling advice, not evidence of non-application. The
+adapter carries it separately from the failure class; `OutcomeUnknown`
+persists a minimum `next_attempt_at`, and a safe re-execution honours it.
+Verification can confirm an effect immediately; the hint never grants
+permission to repeat a write. A provider override may use `Transient` or
+`RateLimited` only when its trusted response contract proves rejection
+before application. In particular, a 503 can follow an applied write.
 
 409 is ambiguous because idempotency-key providers answer it while a
 request with the same key is still in flight. 500, 502 and 504 may come

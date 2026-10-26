@@ -5,6 +5,17 @@ All notable changes are listed here, following
 [Semantic Versioning](https://semver.org/). Before 1.0, minor releases may
 break the API or storage format.
 
+## [Unreleased]
+
+### Fixed
+
+- HTTP 408, 425, 429, and 503 now default to ambiguous outcomes, preventing
+  blind retries of writes that may already have applied. Trusted provider
+  response semantics can still override classification.
+- Preserve `Retry-After` independently of failure classification, including
+  a durable minimum retry time for ambiguous outcomes. It never authorizes
+  a retry; verification, remote idempotency, or an idempotent kind must do so.
+
 ## [0.1.3]
 
 ### Changed

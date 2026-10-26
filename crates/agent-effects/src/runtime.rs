@@ -831,10 +831,17 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
             Ok(Err(failure)) => {
                 debug!(%failure, "action failed");
                 let class = failure.class();
+                let scheduling_class =
+                    failure
+                        .retry_after()
+                        .map_or(class, |delay| FailureClass::RateLimited {
+                            retry_after: Some(delay),
+                        });
                 let error = failure.to_record();
                 let record = match class.disposition() {
                     Disposition::Retry if self.may_retry(record.attempt_count) => {
-                        self.schedule_retry(&record, class, Some(error)).await?
+                        self.schedule_retry(&record, scheduling_class, Some(error))
+                            .await?
                     }
                     // This attempt definitely failed, but an earlier one may
                     // have applied the effect: that is not "Failed". Look
@@ -863,8 +870,12 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
                         .await?
                     }
                     Disposition::Unknown => {
+                        let not_before = failure
+                            .retry_after()
+                            .and_then(|delay| self.rt.now().checked_add(delay));
                         self.transition(&record, Transition::OutcomeUnknown, |r| {
                             r.error = Some(error);
+                            r.next_attempt_at = not_before;
                         })
                         .await?
                     }
@@ -1088,7 +1099,8 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
     ) -> Result<EffectRecord, Interrupt> {
         let retry = record.attempt_count.saturating_sub(1);
         let delay = self.retry().delay(retry, class, jitter_sample());
-        let at = self.rt.now() + delay;
+        let at =
+            (self.rt.now() + delay).max(record.next_attempt_at.unwrap_or(SystemTime::UNIX_EPOCH));
         debug!(?delay, ?class, "retry scheduled");
         self.transition(record, Transition::ScheduleRetry, |r| {
             r.next_attempt_at = Some(at);

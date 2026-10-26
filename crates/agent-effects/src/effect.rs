@@ -63,6 +63,7 @@ impl EffectContext {
 pub struct EffectFailure {
     class: FailureClass,
     request_sent: Option<bool>,
+    retry_after: Option<Duration>,
     source: Box<dyn Error + Send + Sync>,
 }
 
@@ -72,6 +73,7 @@ impl EffectFailure {
         Self {
             class,
             request_sent: None,
+            retry_after: None,
             source: source.into(),
         }
     }
@@ -120,6 +122,20 @@ impl EffectFailure {
     pub fn request_sent(mut self, sent: bool) -> Self {
         self.request_sent = Some(sent);
         self
+    }
+
+    /// Adds a minimum retry delay without changing whether the operation
+    /// may have applied. This is scheduling advice, never evidence that a
+    /// retry is safe. The runtime persists it for ambiguous outcomes too.
+    #[must_use]
+    pub fn with_retry_after(mut self, delay: Duration) -> Self {
+        self.retry_after = Some(delay);
+        self
+    }
+
+    /// The minimum retry delay, independent of the failure's disposition.
+    pub fn retry_after(&self) -> Option<Duration> {
+        self.retry_after.max(self.class().retry_after())
     }
 
     /// The classification after taking [`Self::request_sent`] into account.

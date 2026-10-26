@@ -239,6 +239,11 @@ impl EffectRecord {
         }
 
         match request.transition {
+            Transition::OutcomeUnknown => {
+                if request.next_attempt_at.is_some() {
+                    self.next_attempt_at = self.next_attempt_at.max(request.next_attempt_at);
+                }
+            }
             Transition::StartAttempt => {
                 self.attempt_count = self.attempt_count.saturating_add(1);
                 self.attempt_started_at = Some(now);

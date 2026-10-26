@@ -131,8 +131,9 @@ Pick the protection your remote system allows:
   `runtime.compensate::<H>(key)` undoes a committed effect durably, with
   retries and its own idempotency key.
 - **HTTP.** `agent-effects-http` turns a `reqwest` request into an action
-  that sends `Idempotency-Key` and classifies every failure (a timeout after
-  sending is ambiguous, not failed).
+  that sends `Idempotency-Key` and classifies failures. Timeouts, 429 and
+  503 responses are ambiguous; `Retry-After` delays safe retries without
+  authorizing them. See the [retry guide](docs/retry-idempotency.md).
 - **Retention.** `.retention(RetentionPolicy::settled(age))` prunes settled
   records once old enough; anything unresolved is kept. A pruned key is
   new again.

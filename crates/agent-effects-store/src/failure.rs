@@ -69,8 +69,8 @@ impl FailureClass {
     /// Knowing the request was never sent (`Some(false)`, e.g. a refused
     /// connection or a DNS failure) turns [`Self::Ambiguous`] into
     /// [`Self::Transient`], because nothing can have been applied. Nothing
-    /// else changes: a sent request that got a definitive answer, such as a
-    /// 503, is still whatever its class says.
+    /// else changes: a sent request is still whatever its class says.
+    /// An HTTP 503 alone does not prove a write did not apply.
     #[must_use]
     pub const fn with_request_sent(self, request_sent: Option<bool>) -> Self {
         match (self, request_sent) {
