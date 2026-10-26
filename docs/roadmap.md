@@ -24,7 +24,7 @@ at every additional checkpoint, simultaneous recovery stress, operator/approval
 races, subprocess schema upgrades, and randomized contract/payload deployment
 changes. Passing existing suites is not evidence that every new matrix was added.
 
-## Operations: not started by this branch
+## Operations: implementation pending
 
 Implement in dependency order after correctness review:
 
@@ -44,7 +44,9 @@ Implement in dependency order after correctness review:
    actual 100/1,000/10,000-effect measurements, and environment documentation.
 9. RustSec/dependency policy and secret scanning in CI, pinned action review,
    release/provenance hardening, repeatable fuzz targets, and documented manual
-   GitHub environment/protection settings. A local dependency check is not CI.
+   GitHub environment/protection settings. Local RustSec checks identified
+   `ctutils`/Tokio advisories and patched versions are included in this branch;
+   CI automation and the remaining security work are still unimplemented.
 
 ## Integrations: not started by this branch
 

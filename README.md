@@ -64,8 +64,8 @@ Add the runtime and a SQLite store to your Rust application:
 
 ```toml
 [dependencies]
-agent-effects = "0.1"
-agent-effects-sqlite = "0.1"
+agent-effects = "0.2"
+agent-effects-sqlite = "0.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
