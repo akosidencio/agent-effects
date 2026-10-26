@@ -1,4 +1,6 @@
 [package]
+# This matrix shares workspace-only test fixtures; keep package tests self-contained.
+exclude = ["tests/reliability_matrix.rs"]
 name = "agent-effects-postgres"
 description = "PostgreSQL store for agent-effects: database-clock leases, many workers on one database"
 keywords = ["agents", "idempotency", "side-effects", "postgres"]
@@ -23,7 +25,7 @@ time.workspace = true
 [dev-dependencies]
 agent-effects = { workspace = true, features = ["testkit"] }
 agent-effects-store = { workspace = true, features = ["testkit"] }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
 
 [lints]
 workspace = true

@@ -1,4 +1,6 @@
 [package]
+# This matrix shares workspace-only test fixtures; keep package tests self-contained.
+exclude = ["tests/reliability_matrix.rs"]
 name = "agent-effects-sqlite"
 description = "SQLite store for agent-effects"
 keywords = ["agents", "idempotency", "side-effects", "sqlite"]
@@ -24,7 +26,7 @@ uuid.workspace = true
 agent-effects = { workspace = true, features = ["testkit", "fault-injection"] }
 agent-effects-store = { workspace = true, features = ["testkit"] }
 tempfile.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
 
 [lints]
 workspace = true
