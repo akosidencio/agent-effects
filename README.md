@@ -115,10 +115,10 @@ Pick the protection your remote system allows:
 
 - **Versioned payloads.** Declare durable input/output schema versions and
   optional JSON migrations across deployments. Unreadable output preserves
-  the committed effect. See [payload schemas](docs/payload-schemas.md).
+  the committed effect.
 - **Persisted safety contracts.** Recovery refuses incompatible changes to
   idempotency, verification, handler semantics, approval, or retry ceilings.
-  See the [migration guide](docs/storage-migrations.md) before upgrading a store.
+  Reconcile legacy unresolved effects and stop older workers before upgrading.
 - **Durable handlers.** Implement `EffectHandler`, `register` it, and
   `runtime.submit::<H>(key, input)`. Recovery then finishes the effect from
   its stored input even if the caller never comes back.
@@ -139,7 +139,7 @@ Pick the protection your remote system allows:
 - **HTTP.** `agent-effects-http` turns a `reqwest` request into an action
   that sends `Idempotency-Key` and classifies failures. Timeouts, 429 and
   503 responses are ambiguous; `Retry-After` delays safe retries without
-  authorizing them. See the [retry guide](docs/retry-idempotency.md).
+  authorizing them.
 - **Retention.** `.retention(RetentionPolicy::settled(age))` prunes settled
   records once old enough; anything unresolved is kept. A pruned key is
   new again.
@@ -176,9 +176,8 @@ cargo run --example agent_tool
   many times agents, workers or restarts ask for it.
 - An effect is only marked failed when it definitely did not apply.
 - A retry that could duplicate an effect is never made automatically.
-- Every crash point has a tested recovery path, in-process and with real
-  process death. See [docs/crash-semantics.md](docs/crash-semantics.md),
-  including the known limits.
+- Crash recovery is tested in-process and with real process death. In-flight
+  requests can outlive a lease; remote idempotency remains the strongest protection.
 
 `agent-effects` does **not** provide exactly-once side effects. Nothing can
 without cooperation from the target system. Targets that honour an
@@ -210,11 +209,7 @@ MSRV: Rust 1.90; `agent-effects-sqlite` and `agent-effects-postgres` need 1.94 (
 
 ## Documentation
 
-- [Crash recovery and production guidance](docs/crash-semantics.md): the contract when things fail,
-  and how to run it in production
-- [Runtime design and state machine](docs/design.md): failure model, store contract,
-  decisions log
-- [Integration roadmap](docs/roadmap.md): planned adapters and effect groups
+- [Rust API documentation](https://docs.rs/agent-effects)
 - [Release changelog](CHANGELOG.md)
 
 ## Development

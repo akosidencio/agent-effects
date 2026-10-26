@@ -17,7 +17,7 @@ break the API or storage format.
   `EffectHandler` methods, and explicit contract mismatch/legacy errors.
 - SQL migration 0002 adds a nullable contract without rewriting legacy
   records. Unresolved unattested records require reconciliation; settled
-  legacy results remain replayable. See `docs/storage-migrations.md`.
+  legacy results remain replayable. Stop older workers before upgrading.
 
 - Explicit input/output payload schema versions (legacy version 1),
   `PayloadSchema` migration hooks, version-aware durable recovery and
