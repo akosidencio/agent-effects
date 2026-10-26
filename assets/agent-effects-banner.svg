@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1600" height="540" viewBox="0 0 1600 540" role="img" aria-labelledby="title desc">
+<title id="title">Agent Effects: reliable agent actions in Rust</title><desc id="desc">Dark blue banner with a graph flowing from intent, to execution, to verified results, highlighting durable records, safe retries and crash recovery.</desc>
+<defs>
+  <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#080F22"/><stop offset=".58" stop-color="#0C1832"/><stop offset="1" stop-color="#15204A"/></linearGradient>
+  <linearGradient id="violet" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#9F7BFF"/><stop offset="1" stop-color="#5874FF"/></linearGradient>
+  <linearGradient id="cyan" x1="0" y1="0" x2="1" y2="0"><stop stop-color="#3BDBFA"/><stop offset="1" stop-color="#6F8EFF"/></linearGradient>
+  <linearGradient id="mint" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#5EEAD4"/><stop offset="1" stop-color="#2AC9B1"/></linearGradient>
+  <radialGradient id="halo"><stop stop-color="#5869F6" stop-opacity=".20"/><stop offset="1" stop-color="#5869F6" stop-opacity="0"/></radialGradient>
+  <pattern id="grid" width="42" height="42" patternUnits="userSpaceOnUse"><path d="M42 0H0V42" fill="none" stroke="#6F94CB" stroke-opacity=".085" stroke-width="1"/></pattern>
+  <filter id="glow" x="-60%" y="-60%" width="220%" height="220%"><feGaussianBlur stdDeviation="9"/></filter>
+  <filter id="shadow" x="-40%" y="-60%" width="200%" height="240%"><feDropShadow dx="0" dy="12" stdDeviation="15" flood-color="#00091A" flood-opacity=".36"/></filter>
+  <marker id="tip" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto"><path d="M1 1L5 3L1 5" stroke="#65DCF4" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></marker>
+</defs>
+<rect width="1600" height="540" fill="url(#bg)"/>
+<rect width="1600" height="540" fill="url(#grid)"/>
+<ellipse cx="1380" cy="150" rx="560" ry="420" fill="url(#halo)"/>
+<ellipse cx="170" cy="400" rx="450" ry="390" fill="url(#halo)" opacity=".45"/>
+<path d="M0 440 C430 340 640 490 940 380 S1390 300 1600 420" stroke="#566FE9" stroke-opacity=".16" stroke-width="2" fill="none"/>
+<path d="M0 467 C350 370 670 530 970 410 S1360 345 1600 450" stroke="#49D8EF" stroke-opacity=".11" stroke-width="2" fill="none"/>
+<rect x="84" y="104" width="93" height="93" rx="27" fill="#152B52" stroke="#5C80EC" stroke-width="1.5" filter="url(#shadow)"/>
+<circle cx="114" cy="133" r="9" fill="#8C86FF"/><circle cx="146" cy="149" r="9" fill="#40D5EB"/><circle cx="114" cy="172" r="9" fill="#5EEAD4"/>
+<path d="M122 136L138 146L122 167" stroke="#D6E9FF" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+<text x="200" y="144" font-size="67" fill="#F3F7FF" font-weight="760" letter-spacing="-1.7">AGENT EFFECTS</text>
+<text x="90" y="260" font-size="38" fill="#D9E7FF" font-weight="600" letter-spacing="-.6">Reliable side effects for AI agents</text>
+<text x="90" y="308" font-size="25" fill="#9BB4D7" font-weight="480">Persist intent. Resolve uncertainty. Recover safely.</text>
+<rect x="90" y="383" width="218" height="49" rx="24" fill="#121E38" stroke="#2F4267" stroke-width="1" />
+<circle cx="110" cy="407" r="5" fill="#8E99FF"/>
+<text x="124" y="414" font-size="15" fill="#DFE9FC" font-weight="670" letter-spacing=".5">DURABLE EXECUTION</text>
+<rect x="324" y="383" width="196" height="49" rx="24" fill="#121E38" stroke="#2F4267" stroke-width="1" />
+<circle cx="344" cy="407" r="5" fill="#57D1ED"/>
+<text x="358" y="414" font-size="15" fill="#DFE9FC" font-weight="670" letter-spacing=".5">SAFE RETRIES</text>
+<rect x="536" y="383" width="219" height="49" rx="24" fill="#121E38" stroke="#2F4267" stroke-width="1" />
+<circle cx="556" cy="407" r="5" fill="#57DDBF"/>
+<text x="570" y="414" font-size="15" fill="#DFE9FC" font-weight="670" letter-spacing=".5">CRASH RECOVERY</text>
+<rect x="830" y="108" width="678" height="324" rx="30" fill="#0D1830" stroke="#34476E" stroke-width="1.5" filter="url(#shadow)"/>
+<text x="860" y="150" font-size="15" fill="#91A8CE" font-weight="750" letter-spacing="2">EFFECT LIFECYCLE</text>
+<text x="1474" y="150" font-size="14" fill="#88AACB" font-weight="650" text-anchor="end" letter-spacing="1.3">RUST LIBRARY</text>
+<rect x="855" y="206" width="178" height="119" rx="18" fill="#121F3B" stroke="#8176FA" stroke-width="1.3" />
+<circle cx="878" cy="233" r="7" fill="#8176FA"/>
+<text x="895" y="239" font-size="17" fill="#ECF6FF" font-weight="760">01  INTENT</text>
+<text x="876" y="284" font-size="17" fill="#AEC2E3" font-weight="510">Persist first</text>
+<path d="M 876 303 L 1010 303" fill="none" stroke="#8176FA" stroke-width="2" stroke-linecap="round" opacity="0.38" />
+<rect x="1060" y="206" width="178" height="119" rx="18" fill="#121F3B" stroke="#3BC7F0" stroke-width="1.3" />
+<circle cx="1083" cy="233" r="7" fill="#3BC7F0"/>
+<text x="1100" y="239" font-size="17" fill="#ECF6FF" font-weight="760">02  EXECUTE</text>
+<text x="1081" y="284" font-size="17" fill="#AEC2E3" font-weight="510">Lease + act</text>
+<path d="M 1081 303 L 1215 303" fill="none" stroke="#3BC7F0" stroke-width="2" stroke-linecap="round" opacity="0.38" />
+<rect x="1265" y="206" width="215" height="119" rx="18" fill="#121F3B" stroke="#52DEBD" stroke-width="1.3" />
+<circle cx="1288" cy="233" r="7" fill="#52DEBD"/>
+<text x="1305" y="239" font-size="17" fill="#ECF6FF" font-weight="760">03  RECONCILE</text>
+<text x="1286" y="284" font-size="17" fill="#AEC2E3" font-weight="510">Verify / retry</text>
+<path d="M 1286 303 L 1457 303" fill="none" stroke="#52DEBD" stroke-width="2" stroke-linecap="round" opacity="0.38" />
+<path d="M 1036 266 L 1052 266" fill="none" stroke="#64C9F6" stroke-width="3" stroke-linecap="round" opacity="1"  marker-end="url(#tip)"/>
+<path d="M 1240 266 L 1257 266" fill="none" stroke="#64C9F6" stroke-width="3" stroke-linecap="round" opacity="1"  marker-end="url(#tip)"/>
+<rect x="920" y="358" width="482" height="43" rx="20" fill="#152543" stroke="#365271" stroke-width="1" />
+<circle cx="940" cy="379" r="6" fill="#F7B85B"/>
+<text x="959" y="386" font-size="14" fill="#D3E4FB" font-weight="630" letter-spacing=".35">UNKNOWN  /  VERIFY OR SAFE RETRY  /  INTERVENTION</text>
+</svg>
