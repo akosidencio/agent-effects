@@ -41,6 +41,7 @@ where
     Fut: Future<Output = S>,
 {
     insert_and_read_back(make_store().await).await;
+    supplementary_evidence_never_changes_authority(make_store().await).await;
     insert_is_idempotent_per_key(make_store().await).await;
     concurrent_inserts_converge(make_store().await).await;
     missing_records_are_reported(make_store().await).await;
@@ -60,6 +61,97 @@ where
     pruning_removes_only_settled_idle_old_records(make_store().await).await;
 }
 
+async fn supplementary_evidence_never_changes_authority<S: EffectStore>(store: S) {
+    use crate::{LateObservation, LateOutcome};
+    let record = insert(&store, 1).await;
+    let old = store
+        .acquire_lease(record.id, &worker("old"), t(0), Duration::from_secs(1))
+        .await
+        .unwrap();
+    let executing = drive(
+        &store,
+        record,
+        Some(&old),
+        &[Transition::StartAttempt],
+        t(0),
+    )
+    .await;
+    let new = store
+        .acquire_lease(executing.id, &worker("new"), t(2), Duration::from_secs(30))
+        .await
+        .unwrap();
+    let before = reload(&store, executing.id).await;
+    let history = store.events(executing.id).await.unwrap();
+    let first = LateObservation::new(&executing, &old, LateOutcome::Succeeded, t(3));
+    let second = LateObservation::new(&executing, &old, LateOutcome::Failed, t(4));
+    store.append_late_observation(first.clone()).await.unwrap();
+    let mut conflicting = first.clone();
+    conflicting.outcome = LateOutcome::Failed;
+    store.append_late_observation(conflicting).await.unwrap();
+    store.append_late_observation(second.clone()).await.unwrap();
+    assert_eq!(
+        store.late_observations(before.id, None, 1).await.unwrap(),
+        std::slice::from_ref(&first)
+    );
+    assert_eq!(
+        store
+            .late_observations(before.id, Some(first.id), 10)
+            .await
+            .unwrap(),
+        [second]
+    );
+    assert!(
+        store
+            .late_observations(before.id, None, 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(reload(&store, before.id).await, before);
+    assert_eq!(store.events(before.id).await.unwrap(), history);
+    // Even evidence of success does not allow the stale worker to commit.
+    assert!(matches!(
+        store
+            .transition(TransitionRequest::new(
+                &before,
+                Some(&old),
+                Transition::Succeeded,
+                t(3)
+            ))
+            .await,
+        Err(StoreError::LeaseLost)
+    ));
+    let settled = drive(
+        &store,
+        before,
+        Some(&new),
+        &[
+            Transition::LeaseExpired,
+            Transition::StartVerification,
+            Transition::VerificationConfirmed,
+        ],
+        t(3),
+    )
+    .await;
+    store.release_lease(&new).await.unwrap();
+    assert_eq!(
+        store
+            .prune(PruneQuery::new(
+                EffectStatus::Committed,
+                Duration::from_secs(1),
+                t(100)
+            ))
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(store.get(settled.id).await.unwrap().is_none());
+    assert!(matches!(
+        store.late_observations(settled.id, None, 10).await,
+        Err(StoreError::NotFound(_))
+    ));
+}
+
 const TTL: Duration = Duration::from_secs(30);
 
 /// Test time `secs` seconds after a fixed base, at millisecond precision.
@@ -76,9 +168,19 @@ fn key(n: u32) -> EffectKey {
 
 fn new_effect(n: u32) -> NewEffect {
     NewEffect {
+        input_schema_version: 7,
         input: Some(json!({ "n": n, "nested": { "b": [1, 2], "a": null } })),
         input_fingerprint: Some(format!("fingerprint-{n}")),
         created_by: Some("agent:testkit".into()),
+        execution_contract: Some(crate::ExecutionContract {
+            remote_idempotency: true,
+            handler_version: "test-v2".into(),
+            adapter: Some("test-provider".into()),
+            verification: crate::VerificationContract::EventuallyConsistent {
+                settle: Duration::from_secs(17),
+            },
+            ..crate::ExecutionContract::new(EffectKind::IrreversibleWrite, 7)
+        }),
         ..NewEffect::new(key(n), EffectKind::IrreversibleWrite, t(0))
     }
 }
@@ -123,6 +225,9 @@ async fn insert_and_read_back<S: EffectStore>(store: S) {
     assert_eq!(record.status, EffectStatus::Pending);
     assert_eq!(record.input, new.input);
     assert_eq!(record.input_fingerprint, new.input_fingerprint);
+    assert_eq!(record.execution_contract, new.execution_contract);
+    assert_eq!(record.input_schema_version, 7);
+    assert_eq!(record.output_schema_version, 1);
     assert_eq!(record.created_by, new.created_by);
     assert_eq!(
         (record.version, record.lease_epoch, record.attempt_count),
@@ -365,6 +470,7 @@ async fn transitions_persist_with_events<St: EffectStore>(store: St) {
     let mut verify =
         TransitionRequest::new(&record, Some(&lease), Transition::StartVerification, t(12));
     verify.output = Some(output.clone());
+    verify.output_schema_version = Some(11);
     let record = store.transition(verify).await.unwrap();
     let record = drive(
         &store,
@@ -378,6 +484,7 @@ async fn transitions_persist_with_events<St: EffectStore>(store: St) {
     let stored = reload(&store, record.id).await;
     assert_eq!(stored.status, EffectStatus::Committed);
     assert_eq!(stored.output, Some(output));
+    assert_eq!(stored.output_schema_version, 11);
     assert_eq!(stored.committed_at, Some(t(13)));
     assert_eq!((stored.attempt_count, stored.version), (2, 5));
     assert_eq!(stored.next_attempt_at, None);

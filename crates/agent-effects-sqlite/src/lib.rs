@@ -56,7 +56,7 @@ const COLUMNS: &str = "id, effect_name, logical_key, kind, status, input, input_
      output, last_error, created_by, attempt_count, may_have_applied, \
      compensation_attempts, approved, next_attempt_at, \
      attempt_started_at, attempt_ended_at, \
-     lease_owner, lease_epoch, lease_expires_at, version, created_at, updated_at, committed_at";
+     lease_owner, lease_epoch, lease_expires_at, version, created_at, updated_at, committed_at, execution_contract, input_schema_version, output_schema_version";
 
 /// An [`EffectStore`] in a SQLite database.
 ///
@@ -139,13 +139,46 @@ impl SqliteStore {
 }
 
 impl EffectStore for SqliteStore {
+    async fn append_late_observation(
+        &self,
+        observation: agent_effects_store::LateObservation,
+    ) -> Result<(), StoreError> {
+        sqlx::query("INSERT INTO late_observations (id, effect_id, observation) VALUES (?, ?, ?) ON CONFLICT (id) DO NOTHING")
+            .bind(observation.id.to_string()).bind(observation.effect_id.to_string())
+            .bind(serde_json::to_string(&observation).map_err(StoreError::backend)?)
+            .execute(&self.pool).await.map_err(StoreError::backend)?;
+        Ok(())
+    }
+
+    async fn late_observations(
+        &self,
+        id: EffectId,
+        after: Option<EffectId>,
+        limit: usize,
+    ) -> Result<Vec<agent_effects_store::LateObservation>, StoreError> {
+        if self.get(id).await?.is_none() {
+            return Err(StoreError::NotFound(id));
+        }
+        let rows = sqlx::query("SELECT observation FROM late_observations WHERE effect_id = ? AND (? IS NULL OR id > ?) ORDER BY id LIMIT ?")
+            .bind(id.to_string()).bind(after.map(|id| id.to_string()))
+            .bind(after.map(|id| id.to_string()))
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .fetch_all(&self.pool).await.map_err(StoreError::backend)?;
+        rows.iter()
+            .map(|row| {
+                let json: String = get(row, "observation")?;
+                serde_json::from_str(&json).map_err(StoreError::backend)
+            })
+            .collect()
+    }
+
     async fn insert_or_get(&self, new: NewEffect) -> Result<InsertOutcome, StoreError> {
         let mut record = EffectRecord::new(new);
         normalize(&mut record);
         let inserted = bind_record(
             sqlx::query(AssertSqlSafe(format!(
                 "INSERT INTO effects ({COLUMNS}) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
                  ON CONFLICT (effect_name, logical_key) DO NOTHING"
             ))),
             &record,
@@ -373,7 +406,7 @@ async fn save(
          may_have_applied = ?, compensation_attempts = ?, approved = ?, \
          next_attempt_at = ?, attempt_started_at = ?, attempt_ended_at = ?, \
          lease_owner = ?, lease_epoch = ?, \
-         lease_expires_at = ?, version = ?, updated_at = ?, committed_at = ? \
+         lease_expires_at = ?, version = ?, updated_at = ?, committed_at = ?, output_schema_version = ? \
          WHERE id = ? AND version = ?",
     )
     .bind(record.status.as_str())
@@ -392,6 +425,7 @@ async fn save(
     .bind(to_i64(record.version)?)
     .bind(to_ms(record.updated_at))
     .bind(record.committed_at.map(to_ms))
+    .bind(i64::from(record.output_schema_version))
     .bind(record.id.to_string())
     .bind(to_i64(read_version)?)
     .execute(&mut **tx)
@@ -436,7 +470,10 @@ fn bind_record<'q>(query: Query<'q>, r: &EffectRecord) -> Result<Query<'q>, Stor
         .bind(to_i64(r.version)?)
         .bind(to_ms(r.created_at))
         .bind(to_ms(r.updated_at))
-        .bind(r.committed_at.map(to_ms)))
+        .bind(r.committed_at.map(to_ms))
+        .bind(json(r.execution_contract.as_ref())?)
+        .bind(i64::from(r.input_schema_version))
+        .bind(i64::from(r.output_schema_version)))
 }
 
 fn decode_record(row: &SqliteRow) -> Result<EffectRecord, StoreError> {
@@ -451,6 +488,11 @@ fn decode_record(row: &SqliteRow) -> Result<EffectRecord, StoreError> {
         ),
         kind: EffectKind::parse(&kind).ok_or_else(|| corrupt("kind", &kind))?,
         status: EffectStatus::parse(&status).ok_or_else(|| corrupt("status", &status))?,
+        execution_contract: from_json(get(row, "execution_contract")?)?,
+        input_schema_version: u32::try_from(get::<i64>(row, "input_schema_version")?)
+            .map_err(StoreError::backend)?,
+        output_schema_version: u32::try_from(get::<i64>(row, "output_schema_version")?)
+            .map_err(StoreError::backend)?,
         input: from_json(get(row, "input")?)?,
         input_fingerprint: get(row, "input_fingerprint")?,
         output: from_json(get(row, "output")?)?,

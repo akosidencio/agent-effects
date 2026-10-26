@@ -38,6 +38,31 @@ it reliable, not permitted.
 Names are ≤ 200 bytes, keys ≤ 512 bytes, neither empty nor containing control
 characters.
 
+### Persisted execution assumptions
+
+New runtime records carry `ExecutionContract` format 1. It records the kind,
+remote idempotency declaration, verification mode (including settle delay),
+application handler semantics version, optional adapter identity, effective
+approval and automatic retry requirements, and lifetime attempt ceiling.
+The runtime compares it before lease acquisition or replay; durable recovery
+also compares before decoding input, including compensation recovery.
+A mismatch produces `RuntimeError::ContractMismatch` without running code or
+changing authoritative state. `KindMismatch` and `InputMismatch` remain.
+
+Contract version `"1"` is the application default, independent of the crate
+release version. A compatible code deployment keeps this semantic version;
+changing external behavior requires a new version and explicit reconciliation
+of older keys. There is no automatic contract migration or capability upgrade.
+Retry backoff, jitter, and attempt timeout can change; the lifetime attempt
+ceiling cannot. Risk policy is applied before the contract is persisted or
+compared, preventing a deployment from silently removing approval or retry
+restrictions. Changing risk labels alone has no effect if requirements match.
+
+Legacy SQL records have NULL contracts. Unresolved records produce
+`LegacyContract`; settled legacy records can replay without re-execution.
+Never infer remote idempotency from new code. See
+[storage-migrations.md](storage-migrations.md) for rollout and rollback limits.
+
 ## 3. State machine
 
 Implemented in `agent-effects-store` (`state.rs`) as a pure function `EffectStatus::apply(Transition)`.
@@ -1012,6 +1037,11 @@ it something else), the same value on every attempt, worker and restart.
 The crate enables no reqwest features; TLS comes from the application's own
 `reqwest` dependency and the `Client` it passes in.
 
+Definite response failures and negative verification lookups require a client
+built without redirects and declared with `.client_follows_no_redirects()`.
+Otherwise even an unchanged final URL can conceal a redirect back to the
+original URL; every failure response stays ambiguous.
+
 Classification follows one rule: a failure is definite only when the
 request provably never reached the server, or the server's answer says it
 did not apply.
@@ -1031,12 +1061,19 @@ cannot inspect the caller's `Client`, so the caller declares it:
 | timeout or connection lost after sending | Ambiguous |
 | 2xx with an unreadable or unparseable body | Ambiguous: it applied, the answer was lost |
 | 3xx (only seen when the client does not follow redirects) | Ambiguous |
-| 408, 425, 503 | Transient |
-| 429, or 503 with `Retry-After` | RateLimited, honouring `Retry-After` (seconds or HTTP date) |
+| 408, 425, 429, 503 (with or without `Retry-After`) | Ambiguous |
 | 400, 422 | Validation |
 | 401 / 403 | Authentication / Authorization |
 | 409, 500, 502, 504, other 5xx | Ambiguous |
 | 501, other 4xx | Permanent |
+
+`Retry-After` is scheduling advice, not evidence of non-application. The
+adapter carries it separately from the failure class; `OutcomeUnknown`
+persists a minimum `next_attempt_at`, and a safe re-execution honours it.
+Verification can confirm an effect immediately; the hint never grants
+permission to repeat a write. A provider override may use `Transient` or
+`RateLimited` only when its trusted response contract proves rejection
+before application. In particular, a 503 can follow an applied write.
 
 409 is ambiguous because idempotency-key providers answer it while a
 request with the same key is still in flight. 500, 502 and 504 may come
@@ -1153,10 +1190,48 @@ Crates are added when their milestone starts, not as empty placeholders.
 
 ## Open questions
 
-- Cached outputs are deserialized into the caller's `T`. If `T` changes shape
-  between releases, old records stop deserializing. Should there be an output
-  version tag, or a documented "don't do that"?
-- A fenced worker whose action *succeeded* cannot record that, so the
-  knowledge is lost and an operator resolves the effect blind. Should a fenced
-  worker append a "late result" audit event, which leaves the status alone
-  but gives the operator the evidence?
+
+## Payload schema compatibility
+
+Input and output schema versions are stored separately from the execution
+contract. JSON schema upgrades do not automatically change external execution
+semantics. New handlers declare `input_schema()` and `output_schema()`;
+closure effects can set `input_schema_version` and `output_schema`.
+Migrations transform copies of older JSON in memory and must be deterministic
+and free of external side effects. They never rewrite input fingerprints or
+historical JSON. Recovery uses the original fingerprint and schema identity.
+A direct submission under a new input schema must not attach to an old key;
+it returns `InputSchemaMismatch`, even if the raw JSON happens to match.
+
+Outputs are stamped with the writing handler's schema in the same transition.
+Replay migrates and deserializes without re-execution. Absent output is
+`OutputUnavailable`, separate from JSON null (a valid serialized unit value).
+Serialization failure after external success preserves `Committed` and a
+redacted audit note; the live caller still gets its result. An unreadable
+committed output must never be treated as an externally failed effect.
+
+## Supplementary late-result evidence
+
+Migration 0004 adds a separate append-only `late_observations` table. The
+store exposes append and bounded, paginated inspection. Each observation
+records an id, effect id, worker, original lease epoch, action attempt,
+persisted attempt start, worker-reported observation time, and outcome category.
+It contains no response, input/output payload, or error message. Duplicate
+observation ids do not overwrite evidence. No live lease is required to append.
+
+The runtime attempts an append when a returned action result cannot be
+recorded authoritatively. If heartbeat fencing happens before the action
+returns, a monitor awaits that already-running task and appends its eventual
+outcome. An action still in flight may outlive the requesting caller. Evidence
+has no state transition and never invokes verification, grants a capability,
+changes committed output, or overrides a new lease holder. Operators must
+corroborate it with remote evidence before using `resolve`.
+
+A separate table preserves the authoritative transition sequence and fencing
+contract; an extra transition event would falsely suggest state advancement.
+Evidence writes are best effort: process termination, database failure, or a
+concurrent settled-record prune may prevent recording. No response values are
+kept, sacrificing details in exchange for bounded metadata and secret safety.
+Foreign-key cascades (and the memory-store equivalent) delete observations in
+the same pruning transaction as the settled effect. Unresolved effects and
+their observations remain protected by existing retention rules.

@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use agent_effects_store::{
-    EffectEvent, EffectId, EffectKey, EffectRecord, EffectStore, InsertOutcome, Lease, ListQuery,
-    NewEffect, PruneQuery, StoreError, TransitionRequest, WorkerId,
+    EffectEvent, EffectId, EffectKey, EffectRecord, EffectStore, InsertOutcome, LateObservation,
+    Lease, ListQuery, NewEffect, PruneQuery, StoreError, TransitionRequest, WorkerId,
 };
 
 /// An in-process store for tests, examples and development.
@@ -26,6 +26,7 @@ struct Inner {
     records: BTreeMap<EffectId, EffectRecord>,
     by_key: HashMap<EffectKey, EffectId>,
     events: HashMap<EffectId, Vec<EffectEvent>>,
+    late: BTreeMap<EffectId, LateObservation>,
 }
 
 impl MemoryStore {
@@ -69,6 +70,38 @@ impl MemoryStore {
 // `async` only to satisfy the trait.
 #[allow(unknown_lints, clippy::unused_async_trait_impl)]
 impl EffectStore for MemoryStore {
+    async fn append_late_observation(
+        &self,
+        observation: LateObservation,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.lock();
+        if !inner.records.contains_key(&observation.effect_id) {
+            return Err(StoreError::NotFound(observation.effect_id));
+        }
+        inner.late.entry(observation.id).or_insert(observation);
+        Ok(())
+    }
+
+    async fn late_observations(
+        &self,
+        id: EffectId,
+        after: Option<EffectId>,
+        limit: usize,
+    ) -> Result<Vec<LateObservation>, StoreError> {
+        let inner = self.lock();
+        if !inner.records.contains_key(&id) {
+            return Err(StoreError::NotFound(id));
+        }
+        Ok(inner
+            .late
+            .values()
+            .filter(|observation| {
+                observation.effect_id == id && after.is_none_or(|after| observation.id > after)
+            })
+            .take(limit)
+            .cloned()
+            .collect())
+    }
     async fn insert_or_get(&self, new: NewEffect) -> Result<InsertOutcome, StoreError> {
         let mut inner = self.lock();
         if let Some(id) = inner.by_key.get(&new.key) {
@@ -167,6 +200,9 @@ impl EffectStore for MemoryStore {
                 inner.by_key.remove(&record.key);
             }
             inner.events.remove(id);
+            inner
+                .late
+                .retain(|_, observation| observation.effect_id != *id);
         }
         Ok(doomed.len() as u64)
     }

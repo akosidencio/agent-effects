@@ -295,6 +295,18 @@ impl<S: EffectStore> Runtime<S> {
         self.inner.handlers.get(name).map(|r| Arc::clone(&r.resume))
     }
 
+    pub(crate) fn enforce_contract(
+        &self,
+        record: &EffectRecord,
+        mut requested: crate::store::ExecutionContract,
+        risk: crate::RiskLevel,
+    ) -> Result<(), RuntimeError> {
+        let required = self.inner.policy.requirements(risk, requested.kind);
+        requested.require_approval |= required.approval;
+        requested.automatic_retry &= !required.no_automatic_retry;
+        check_contract(record, &requested)
+    }
+
     /// The underlying store.
     pub fn store(&self) -> &S {
         &self.inner.store
@@ -324,6 +336,22 @@ impl<S: EffectStore> Runtime<S> {
         id: EffectId,
         timeout: Duration,
     ) -> Result<EffectOutcome<T>, RuntimeError> {
+        self.wait_with_output_schema(id, timeout, crate::PayloadSchema::default())
+            .await
+    }
+
+    /// Like [`Self::wait`], with a version-aware output schema and optional
+    /// migration. Unsupported or missing outputs leave committed state intact.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::wait`], plus payload version or migration errors.
+    pub async fn wait_with_output_schema<T: DeserializeOwned>(
+        &self,
+        id: EffectId,
+        timeout: Duration,
+        schema: crate::PayloadSchema,
+    ) -> Result<EffectOutcome<T>, RuntimeError> {
         let deadline = tokio::time::Instant::now() + timeout;
         let mut pause = Duration::from_millis(10);
         loop {
@@ -335,7 +363,7 @@ impl<S: EffectStore> Runtime<S> {
             let busy = !settled(record.status) && record.live_lease_owner(self.now()).is_some();
             let now = tokio::time::Instant::now();
             if !busy {
-                return report(&record, None);
+                return report(&record, None, &schema);
             }
             if now >= deadline {
                 return Ok(EffectOutcome::InProgress { id });
@@ -347,6 +375,18 @@ impl<S: EffectStore> Runtime<S> {
 
     pub(crate) fn default_retry(&self) -> RetryPolicy {
         self.inner.retry
+    }
+
+    async fn preserve_late_result(&self, observation: crate::store::LateObservation) {
+        let (effect_id, attempt, lease_epoch) = (
+            observation.effect_id,
+            observation.attempt,
+            observation.lease_epoch,
+        );
+        if let Err(error) = self.store().append_late_observation(observation).await {
+            warn!(effect.id = %effect_id, attempt, lease_epoch, error = %error,
+                "could not preserve supplementary late-result evidence");
+        }
     }
 
     pub(crate) fn now(&self) -> SystemTime {
@@ -564,6 +604,8 @@ impl<S: EffectStore> Runtime<S> {
                 id: EffectId::new(),
                 key: spec.key.clone(),
                 kind: spec.capabilities.kind,
+                execution_contract: Some(spec.contract()),
+                input_schema_version: spec.input_schema_version,
                 input: spec.input.clone(),
                 input_fingerprint: spec.fingerprint.clone(),
                 created_by: spec.actor.clone(),
@@ -584,7 +626,7 @@ impl<S: EffectStore> Runtime<S> {
         // lease it goes through: the budget is per call.
         let checks_made = AtomicU32::new(0);
         for _ in 0..MAX_ROUNDS {
-            if let Some(outcome) = observe(&record)? {
+            if let Some(outcome) = observe(&record, &spec.output_schema)? {
                 return Ok(outcome);
             }
             let lease = match store
@@ -622,7 +664,7 @@ impl<S: EffectStore> Runtime<S> {
             match advanced {
                 Ok((settled, output)) => {
                     Span::current().record("effect.status", settled.status.as_str());
-                    return report(&settled, output);
+                    return report(&settled, output, &spec.output_schema);
                 }
                 Err(Interrupt::LeaseLost) => {
                     warn!("lease lost mid-effect; re-reading the record");
@@ -646,9 +688,10 @@ impl<S: EffectStore> Runtime<S> {
 /// clock could disagree.
 fn observe<T: DeserializeOwned>(
     record: &EffectRecord,
+    schema: &crate::PayloadSchema,
 ) -> Result<Option<EffectOutcome<T>>, RuntimeError> {
     match record.status {
-        status if settled(status) => report(record, None).map(Some),
+        status if settled(status) => report(record, None, schema).map(Some),
         EffectStatus::Pending
         | EffectStatus::AwaitingApproval
         | EffectStatus::Executing
@@ -789,25 +832,67 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
         Fut: Future<Output = Result<T, EffectFailure>> + Send + 'static,
         V: Verifier<T>,
     {
-        // A separate task, so a panicking action is caught as a JoinError.
-        // If the lease is lost while waiting, the handle is dropped and the
-        // task finishes detached: the request is already in flight.
+        // An in-flight action may outlive its lease. Keep its eventual
+        // outcome as supplementary evidence, never as an authoritative commit.
         let mut task = tokio::spawn((self.action)(context(&record)));
         self.rt.checkpoint(FaultPoint::AfterActionStarted);
-        let joined = match self.spec.attempt_timeout {
-            None => self.leased(&mut task).await?,
-            Some(limit) => match self.leased(tokio::time::timeout(limit, &mut task)).await? {
-                Ok(joined) => joined,
-                Err(_elapsed) => {
-                    task.abort();
-                    Ok(Err(EffectFailure::ambiguous(format!(
-                        "attempt timed out after {limit:?}"
-                    ))))
-                }
-            },
+        let waited = match self.spec.attempt_timeout {
+            None => self.leased(&mut task).await,
+            Some(limit) => self
+                .leased(tokio::time::timeout(limit, &mut task))
+                .await
+                .map(|timed| {
+                    timed.unwrap_or_else(|_| {
+                        task.abort();
+                        Ok(Err(EffectFailure::ambiguous(format!(
+                            "attempt timed out after {limit:?}"
+                        ))))
+                    })
+                }),
+        };
+        let joined = match waited {
+            Ok(joined) => joined,
+            Err(interrupt) => {
+                let runtime = self.rt.clone();
+                let mut observation = crate::store::LateObservation::new(
+                    &record,
+                    self.lease,
+                    crate::store::LateOutcome::Interrupted,
+                    self.rt.now(),
+                );
+                tokio::spawn(async move {
+                    let joined = task.await;
+                    observation.outcome = late_outcome(&joined);
+                    observation.observed_at = runtime.now();
+                    runtime.preserve_late_result(observation).await;
+                });
+                return Err(interrupt);
+            }
         };
         self.rt.checkpoint(FaultPoint::AfterActionReturned);
 
+        let observation = crate::store::LateObservation::new(
+            &record,
+            self.lease,
+            late_outcome(&joined),
+            self.rt.now(),
+        );
+        let advanced = self.record_result(record, joined).await;
+        if advanced.is_err() {
+            self.rt.preserve_late_result(observation).await;
+        }
+        advanced
+    }
+
+    async fn record_result<T>(
+        &self,
+        record: EffectRecord,
+        joined: Result<Result<T, EffectFailure>, tokio::task::JoinError>,
+    ) -> Result<(EffectRecord, Option<T>, bool), Interrupt>
+    where
+        T: Serialize + Send + 'static,
+        V: Verifier<T>,
+    {
         match joined {
             Ok(Ok(value)) if self.spec.capabilities.verification != VerificationMode::None => {
                 let (record, verified, exhausted) =
@@ -831,10 +916,17 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
             Ok(Err(failure)) => {
                 debug!(%failure, "action failed");
                 let class = failure.class();
+                let scheduling_class =
+                    failure
+                        .retry_after()
+                        .map_or(class, |delay| FailureClass::RateLimited {
+                            retry_after: Some(delay),
+                        });
                 let error = failure.to_record();
                 let record = match class.disposition() {
                     Disposition::Retry if self.may_retry(record.attempt_count) => {
-                        self.schedule_retry(&record, class, Some(error)).await?
+                        self.schedule_retry(&record, scheduling_class, Some(error))
+                            .await?
                     }
                     // This attempt definitely failed, but an earlier one may
                     // have applied the effect: that is not "Failed". Look
@@ -863,8 +955,12 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
                         .await?
                     }
                     Disposition::Unknown => {
+                        let not_before = failure
+                            .retry_after()
+                            .and_then(|delay| self.rt.now().checked_add(delay));
                         self.transition(&record, Transition::OutcomeUnknown, |r| {
                             r.error = Some(error);
+                            r.next_attempt_at = not_before;
                         })
                         .await?
                     }
@@ -1088,7 +1184,8 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
     ) -> Result<EffectRecord, Interrupt> {
         let retry = record.attempt_count.saturating_sub(1);
         let delay = self.retry().delay(retry, class, jitter_sample());
-        let at = self.rt.now() + delay;
+        let at =
+            (self.rt.now() + delay).max(record.next_attempt_at.unwrap_or(SystemTime::UNIX_EPOCH));
         debug!(?delay, ?class, "retry scheduled");
         self.transition(record, Transition::ScheduleRetry, |r| {
             r.next_attempt_at = Some(at);
@@ -1148,7 +1245,12 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
                 self.lease,
                 self.spec.actor.as_deref(),
                 transition,
-                customize,
+                |request| {
+                    customize(request);
+                    if request.output.is_some() {
+                        request.output_schema_version = Some(self.spec.output_schema.version());
+                    }
+                },
             )
             .await
     }
@@ -1161,6 +1263,17 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
     /// `attempts`: within budget, and not forbidden by the risk policy.
     fn may_retry(&self, attempts: u32) -> bool {
         self.spec.automatic_retry && self.retry().allows_another(attempts)
+    }
+}
+
+fn late_outcome<T>(
+    joined: &Result<Result<T, EffectFailure>, tokio::task::JoinError>,
+) -> crate::store::LateOutcome {
+    use crate::store::LateOutcome;
+    match joined {
+        Ok(Ok(_)) => LateOutcome::Succeeded,
+        Ok(Err(_)) => LateOutcome::Failed,
+        Err(_) => LateOutcome::Interrupted,
     }
 }
 
@@ -1205,6 +1318,13 @@ fn settled(status: EffectStatus) -> bool {
 }
 
 fn check_matches(record: &EffectRecord, spec: &EffectSpec) -> Result<(), RuntimeError> {
+    if record.input_schema_version != spec.input_schema_version {
+        return Err(RuntimeError::InputSchemaMismatch {
+            id: record.id,
+            stored: record.input_schema_version,
+            requested: spec.input_schema_version,
+        });
+    }
     if record.kind != spec.capabilities.kind {
         return Err(RuntimeError::KindMismatch {
             id: record.id,
@@ -1215,6 +1335,22 @@ fn check_matches(record: &EffectRecord, spec: &EffectSpec) -> Result<(), Runtime
     if record.input_fingerprint != spec.fingerprint {
         return Err(RuntimeError::InputMismatch { id: record.id });
     }
+    check_contract(record, &spec.contract())
+}
+
+fn check_contract(
+    record: &EffectRecord,
+    requested: &crate::store::ExecutionContract,
+) -> Result<(), RuntimeError> {
+    match &record.execution_contract {
+        Some(stored) if !stored.permits(requested) => {
+            return Err(RuntimeError::ContractMismatch { id: record.id });
+        }
+        None if !record.status.is_settled() => {
+            return Err(RuntimeError::LegacyContract { id: record.id });
+        }
+        _ => {}
+    }
     Ok(())
 }
 
@@ -1223,16 +1359,27 @@ fn check_matches(record: &EffectRecord, spec: &EffectSpec) -> Result<(), Runtime
 fn report<T: DeserializeOwned>(
     record: &EffectRecord,
     fresh: Option<T>,
+    schema: &crate::PayloadSchema,
 ) -> Result<EffectOutcome<T>, RuntimeError> {
     let id = record.id;
     Ok(match record.status {
-        EffectStatus::Committed => match fresh {
-            Some(value) => EffectOutcome::Committed(value),
-            None => EffectOutcome::Committed(
-                serde_json::from_value(record.output.clone().unwrap_or(Value::Null))
-                    .map_err(|source| RuntimeError::Output { id, source })?,
-            ),
-        },
+        EffectStatus::Committed => {
+            if let Some(value) = fresh {
+                EffectOutcome::Committed(value)
+            } else {
+                let stored = record
+                    .output
+                    .clone()
+                    .ok_or(RuntimeError::OutputUnavailable { id })?;
+                let migrated = schema
+                    .decode(record.output_schema_version, stored)
+                    .map_err(|source| RuntimeError::OutputPayload { id, source })?;
+                EffectOutcome::Committed(
+                    serde_json::from_value(migrated)
+                        .map_err(|source| RuntimeError::Output { id, source })?,
+                )
+            }
+        }
         EffectStatus::Failed => EffectOutcome::Failed(last_error(record)),
         EffectStatus::Rejected => EffectOutcome::Rejected(last_error(record)),
         // A failed compensation also waits for an operator.

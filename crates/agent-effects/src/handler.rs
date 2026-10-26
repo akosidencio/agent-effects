@@ -114,6 +114,28 @@ pub trait EffectHandler: Send + Sync + 'static {
         false
     }
 
+    /// Application-defined execution semantics version. Keep it stable for
+    /// compatible releases; changes refuse existing keys before execution.
+    #[allow(clippy::unnecessary_literal_bound)] // Implementations may borrow configuration.
+    fn contract_version(&self) -> &str {
+        "1"
+    }
+
+    /// Optional trusted adapter/provider identity (never credentials).
+    fn adapter_identity(&self) -> Option<&str> {
+        None
+    }
+
+    /// Schema written for new durable inputs and migrations used by recovery.
+    fn input_schema(&self) -> crate::PayloadSchema {
+        crate::PayloadSchema::default()
+    }
+
+    /// Schema written for outputs and migrations used on committed replay.
+    fn output_schema(&self) -> crate::PayloadSchema {
+        crate::PayloadSchema::default()
+    }
+
     /// The retry policy; `None` uses the runtime's.
     fn retry_policy(&self) -> Option<RetryPolicy> {
         None
@@ -224,6 +246,24 @@ impl<H: EffectHandler> Clone for Handler<H> {
 }
 
 impl<H: EffectHandler> Handler<H> {
+    fn contract(&self, retry: RetryPolicy) -> crate::store::ExecutionContract {
+        use crate::store::{ExecutionContract, VerificationContract};
+        let effect = &self.effect;
+        let mut contract = ExecutionContract::new(effect.kind(), retry.max_attempts);
+        contract.remote_idempotency = effect.remote_idempotency();
+        contract.handler_version = effect.contract_version().into();
+        contract.adapter = effect.adapter_identity().map(str::to_owned);
+        contract.require_approval = effect.requires_approval();
+        contract.verification = match self.verify.as_ref().map(|(mode, _)| mode) {
+            None | Some(VerificationMode::None) => VerificationContract::None,
+            Some(VerificationMode::Authoritative) => VerificationContract::Authoritative,
+            Some(VerificationMode::EventuallyConsistent { settle }) => {
+                VerificationContract::EventuallyConsistent { settle: *settle }
+            }
+        };
+        contract
+    }
+
     /// Registers `handler` with no optional capabilities.
     pub fn new(handler: H) -> Self {
         Self {
@@ -245,12 +285,22 @@ impl<H: CompensableEffect> Handler<H> {
         self.compensate = Some(Arc::new(move |ctx, input, output| {
             let handler = Arc::clone(&handler);
             Box::pin(async move {
-                let input: H::Input = serde_json::from_value(input.unwrap_or(Value::Null))
-                    .map_err(|e| {
-                        EffectFailure::permanent(format!("stored input does not match: {e}"))
-                    })?;
+                let input = handler
+                    .input_schema()
+                    .decode(ctx.input_schema_version(), input.unwrap_or(Value::Null))
+                    .map_err(|e| EffectFailure::permanent(e.to_string()))?;
+                let input: H::Input = serde_json::from_value(input).map_err(|e| {
+                    EffectFailure::permanent(format!("stored input does not match: {e}"))
+                })?;
                 let output: Option<H::Output> = output
-                    .map(serde_json::from_value)
+                    .map(|output| {
+                        let migrated = handler
+                            .output_schema()
+                            .decode(ctx.output_schema_version(), output)
+                            .map_err(|e| EffectFailure::permanent(e.to_string()))?;
+                        serde_json::from_value(migrated)
+                            .map_err(|e| EffectFailure::permanent(e.to_string()))
+                    })
                     .transpose()
                     .map_err(|e| {
                         EffectFailure::permanent(format!("stored output does not match: {e}"))
@@ -349,6 +399,7 @@ impl<'a, S: EffectStore, H: EffectHandler> IntoFuture for Submission<'a, S, H> {
             let key = EffectKey::new(EffectName::new(H::NAME)?, LogicalKey::new(self.key)?);
             let json = serde_json::to_value(&self.input).map_err(RuntimeError::Input)?;
             let stored = Stored {
+                schema_version: handler.effect.input_schema().version(),
                 // Computed by the runtime, after redaction.
                 fingerprint: None,
                 json,
@@ -368,6 +419,16 @@ async fn resume<S: EffectStore, H: EffectHandler>(
     record: EffectRecord,
 ) -> Result<EffectStatus, RuntimeError> {
     let id = record.id;
+    runtime.enforce_contract(
+        &record,
+        handler.contract(
+            handler
+                .effect
+                .retry_policy()
+                .unwrap_or_else(|| runtime.default_retry()),
+        ),
+        handler.effect.risk(),
+    )?;
     if record.status == EffectStatus::Compensating {
         let compensate = handler
             .compensate
@@ -389,12 +450,18 @@ async fn resume<S: EffectStore, H: EffectHandler>(
         return Ok(settled.status);
     }
     let json = record.input.clone().unwrap_or(Value::Null);
-    let input: H::Input = serde_json::from_value(json.clone())
+    let migrated = handler
+        .effect
+        .input_schema()
+        .decode(record.input_schema_version, json.clone())
+        .map_err(|source| RuntimeError::InputPayload { id, source })?;
+    let input: H::Input = serde_json::from_value(migrated)
         .map_err(|source| RuntimeError::StoredInput { id, source })?;
     // Rebuilt from the record itself, so it is the same effect by
     // definition: reuse its fingerprint rather than recompute it, which
     // would refuse every older record if canonicalization ever changed.
     let stored = Stored {
+        schema_version: record.input_schema_version,
         json,
         fingerprint: record.input_fingerprint.clone(),
         actor: record.created_by.clone(),
@@ -418,6 +485,7 @@ async fn resume<S: EffectStore, H: EffectHandler>(
 
 /// What is recorded about an effect besides its key.
 struct Stored {
+    schema_version: u32,
     json: Value,
     fingerprint: Option<String>,
     actor: Option<String>,
@@ -442,6 +510,10 @@ async fn run<S: EffectStore, H: EffectHandler>(
         })
     };
     let spec = EffectSpec {
+        input_schema_version: stored.schema_version,
+        output_schema: effect.output_schema(),
+        handler_version: effect.contract_version().into(),
+        adapter: effect.adapter_identity().map(str::to_owned),
         fingerprint: stored.fingerprint,
         input: Some(stored.json),
         key,
@@ -538,6 +610,27 @@ impl<'a, S: EffectStore, H: EffectHandler> IntoFuture for CompensationSubmission
                 retry: handler.effect.retry_policy(),
                 attempt_timeout: handler.effect.attempt_timeout(),
             };
+            let record = self
+                .runtime
+                .store()
+                .get_by_key(&spec.key)
+                .await?
+                .ok_or_else(|| RuntimeError::NoSuchEffect {
+                    key: spec.key.to_string(),
+                })?;
+            if record.execution_contract.is_none() {
+                return Err(RuntimeError::LegacyContract { id: record.id });
+            }
+            self.runtime.enforce_contract(
+                &record,
+                handler.contract(
+                    handler
+                        .effect
+                        .retry_policy()
+                        .unwrap_or_else(|| self.runtime.default_retry()),
+                ),
+                handler.effect.risk(),
+            )?;
             self.runtime.compensate_effect(spec, compensate).await
         })
     }

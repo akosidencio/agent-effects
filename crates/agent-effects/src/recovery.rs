@@ -267,6 +267,25 @@ impl<S: EffectStore> Runtime<S> {
         actor: impl Into<String>,
         note: impl Into<String>,
     ) -> Result<EffectRecord, RuntimeError> {
+        self.resolve_with_output_schema(id, resolution, 1, actor, note)
+            .await
+    }
+
+    /// Like [`Self::resolve`], recording `output_schema_version` when an
+    /// operator supplies an applied result. The caller must authorize the
+    /// operator and validate the output; actor text is an audit label only.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::resolve`].
+    pub async fn resolve_with_output_schema(
+        &self,
+        id: EffectId,
+        resolution: Resolution,
+        output_schema_version: u32,
+        actor: impl Into<String>,
+        note: impl Into<String>,
+    ) -> Result<EffectRecord, RuntimeError> {
         let record = self
             .store()
             .get(id)
@@ -283,7 +302,10 @@ impl<S: EffectStore> Runtime<S> {
         request.actor = Some(actor.into());
         request.payload = Some(json!({ "note": note }));
         match resolution {
-            Resolution::Applied { output } => request.output = output,
+            Resolution::Applied { output } => {
+                request.output = output;
+                request.output_schema_version = Some(output_schema_version);
+            }
             Resolution::NotApplied => {
                 request.error = Some(ErrorRecord {
                     class: None,

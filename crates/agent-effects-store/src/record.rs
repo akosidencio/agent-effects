@@ -21,6 +21,16 @@ pub struct EffectRecord {
     pub key: EffectKey,
     /// The effect's kind.
     pub kind: EffectKind,
+    /// Immutable safety assumptions; absent on records created before the
+    /// contract migration. Absence must never grant execution capabilities.
+    #[serde(default)]
+    pub execution_contract: Option<crate::ExecutionContract>,
+    /// Schema of the immutable stored input. Legacy records use version 1.
+    #[serde(default = "initial_schema_version")]
+    pub input_schema_version: u32,
+    /// Schema of the latest stored output. Legacy records use version 1.
+    #[serde(default = "initial_schema_version")]
+    pub output_schema_version: u32,
     /// Current status.
     pub status: EffectStatus,
     /// The input, redacted for storage.
@@ -76,6 +86,9 @@ impl EffectRecord {
             id: new.id,
             key: new.key,
             kind: new.kind,
+            execution_contract: new.execution_contract,
+            input_schema_version: new.input_schema_version,
+            output_schema_version: 1,
             status: EffectStatus::Pending,
             input: new.input,
             input_fingerprint: new.input_fingerprint,
@@ -239,6 +252,11 @@ impl EffectRecord {
         }
 
         match request.transition {
+            Transition::OutcomeUnknown => {
+                if request.next_attempt_at.is_some() {
+                    self.next_attempt_at = self.next_attempt_at.max(request.next_attempt_at);
+                }
+            }
             Transition::StartAttempt => {
                 self.attempt_count = self.attempt_count.saturating_add(1);
                 self.attempt_started_at = Some(now);
@@ -281,6 +299,7 @@ impl EffectRecord {
         }
         if let Some(output) = request.output {
             self.output = Some(output);
+            self.output_schema_version = request.output_schema_version.unwrap_or(1);
         }
         if let Some(error) = request.error {
             self.last_error = Some(error);
@@ -315,6 +334,10 @@ impl EffectRecord {
             Err(StoreError::LeaseLost)
         }
     }
+}
+
+fn initial_schema_version() -> u32 {
+    1
 }
 
 /// `now + ttl`. An overflowing TTL yields an already-expired lease, which

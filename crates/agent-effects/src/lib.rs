@@ -59,6 +59,7 @@ pub mod error;
 pub mod fault;
 pub mod handler;
 pub mod observer;
+pub mod payload;
 pub mod policy;
 pub mod recovery;
 pub mod redaction;
@@ -88,6 +89,7 @@ pub use handler::{
     CompensableEffect, CompensationSubmission, EffectHandler, Handler, Submission, VerifiableEffect,
 };
 pub use observer::{EffectObserver, Observation};
+pub use payload::{PayloadError, PayloadSchema};
 pub use policy::{Capabilities, PolicyBuilder, Requirements, RiskLevel, RiskPolicy, UnknownPlan};
 pub use recovery::{RecoveryReport, Resolution};
 pub use redaction::{RedactKeys, Redactor, Secret};

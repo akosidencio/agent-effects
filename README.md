@@ -1,10 +1,10 @@
-# agent-effects: Reliable side effects for AI agents in Rust
+# Agent Effects — The Rust-native reliability layer for AI agent actions
 
 <div align="center">
 
 [![crates.io](https://img.shields.io/crates/v/agent-effects.svg)](https://crates.io/crates/agent-effects)
 [![docs.rs](https://img.shields.io/docsrs/agent-effects)](https://docs.rs/agent-effects)
-[![Version: 0.1.3](https://img.shields.io/badge/Version-v0.1.3-blue)](CHANGELOG.md)
+[![Version: 0.2.0 (unreleased)](https://img.shields.io/badge/Version-v0.2.0--unreleased-blue)](CHANGELOG.md)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT_OR_Apache--2.0-blue.svg)](#license)
 [![Rust: 2024 Edition](https://img.shields.io/badge/Rust-2024_Edition-orange?logo=rust)](Cargo.toml)
 [![MSRV: Rust 1.90](https://img.shields.io/badge/MSRV-1.90%2B-orange?logo=rust)](#rust-crates-and-storage-backends)
@@ -64,8 +64,8 @@ Add the runtime and a SQLite store to your Rust application:
 
 ```toml
 [dependencies]
-agent-effects = "0.1"
-agent-effects-sqlite = "0.1"
+agent-effects = "0.2"
+agent-effects-sqlite = "0.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -113,6 +113,12 @@ Pick the protection your remote system allows:
 
 ## Features
 
+- **Versioned payloads.** Declare durable input/output schema versions and
+  optional JSON migrations across deployments. Unreadable output preserves
+  the committed effect. See [payload schemas](docs/payload-schemas.md).
+- **Persisted safety contracts.** Recovery refuses incompatible changes to
+  idempotency, verification, handler semantics, approval, or retry ceilings.
+  See the [migration guide](docs/storage-migrations.md) before upgrading a store.
 - **Durable handlers.** Implement `EffectHandler`, `register` it, and
   `runtime.submit::<H>(key, input)`. Recovery then finishes the effect from
   its stored input even if the caller never comes back.
@@ -131,8 +137,9 @@ Pick the protection your remote system allows:
   `runtime.compensate::<H>(key)` undoes a committed effect durably, with
   retries and its own idempotency key.
 - **HTTP.** `agent-effects-http` turns a `reqwest` request into an action
-  that sends `Idempotency-Key` and classifies every failure (a timeout after
-  sending is ambiguous, not failed).
+  that sends `Idempotency-Key` and classifies failures. Timeouts, 429 and
+  503 responses are ambiguous; `Retry-After` delays safe retries without
+  authorizing them. See the [retry guide](docs/retry-idempotency.md).
 - **Retention.** `.retention(RetentionPolicy::settled(age))` prunes settled
   records once old enough; anything unresolved is kept. A pruned key is
   new again.
@@ -181,6 +188,11 @@ key for every effect.
 It is not a workflow engine, a job queue or an agent framework, and it does
 not decide whether an agent is *allowed* to act. Application authorization
 still applies.
+
+Use a workflow engine when you need durable branching processes, scheduling,
+signals, or orchestration across a large business workflow. Embed Agent Effects
+when your existing application needs a focused reliability boundary around
+consequential actions. It does not supply application authorization.
 
 ## Rust crates and storage backends
 

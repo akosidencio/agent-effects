@@ -125,6 +125,17 @@ From `Unknown`, a later call with the same key does one of these:
     fields and scrub error messages before they are written.
   - Redacted values cannot be replayed or resumed with their original value.
 
+## HTTP response safety
+
+HTTP 408, 425, 429, 500, 502, 503, and 504 are ambiguous by default.
+A write may already have applied before an application or gateway returns
+one of these statuses. `Retry-After` only delays an otherwise safe retry;
+its minimum time survives in the effect record. It does not authorize a
+retry. Verification can still confirm the write without waiting.
+Provider overrides must be grounded in an explicit contract proving that
+an operation was rejected before application. Keep redirects disabled for
+irreversible writes. See [retry-idempotency.md](retry-idempotency.md).
+
 ## Known limits
 
 - **A stalled request can outrun verification.** Suppose worker A stalls
@@ -140,23 +151,38 @@ From `Unknown`, a later call with the same key does one of these:
   effect may then be re-run under the rules above. Keep clocks synchronized
   (NTP) and the lease TTL far above the skew. `PostgresStore` uses the
   database's clock for leases by default, which removes this limit.
-- **A fenced worker's late success is not recorded.** If A's action
-  succeeds after B took over, A's result is refused. The operator resolving
-  the effect does not see it. This is an open design question.
+- **Late results are supplementary evidence.** A worker whose result cannot
+  be committed attempts to append metadata identifying its worker, original
+  attempt and fencing epoch, start/observation times, and observed outcome.
+  An action that outlives heartbeat fencing is monitored for its eventual
+  return. `EffectStore::late_observations` supports operator inspection.
+  Evidence never changes status, output, version, or transition history and
+  is not proof of remote application. No response bodies or error messages
+  are retained. Process death, database outage, or pruning before append can
+  still lose this evidence; authoritative recovery rules remain unchanged.
 - **Closures need a caller.** Recovery can only mark closure effects
   `Unknown`. Finishing them takes a call with the same key, or an operator.
   Registered handlers do not have this limit.
-- **Stored inputs must stay readable.** A handler's input is stored so
-  recovery can rebuild the call. If the input type changes incompatibly, old
-  effects land in `RecoveryReport::resume_errors` instead of running.
+- **Execution assumptions must stay compatible.** New records persist an
+  execution contract. Changing idempotency, verification mode, handler semantic
+  version, adapter identity, effective approval/retry requirements, or the
+  attempt ceiling returns an explicit mismatch before re-execution. Legacy
+  unresolved effects have no attested contract and require reconciliation.
+- **Stored inputs must stay readable.** Payloads carry schema versions.
+  Handler `input_schema()` can migrate older JSON during recovery, preserving
+  historical input and fingerprint. Unsupported or malformed payloads appear
+  in `RecoveryReport::resume_errors` without running the handler.
 - **Pruning forgets.** Once a settled record is pruned, its key is new
   again: a late retry runs the effect a second time unless the remote
   system's own idempotency key still holds, and a pruned committed effect
   can no longer be compensated. Only settled records idle under no lease
   are pruned; anything in doubt is kept.
-- **Outputs are replayed as stored.** If the output type changes between
-  releases, replaying an old result fails with `RuntimeError::Output`
-  instead of returning wrong data.
+- **Output replay preserves committed state.** `output_schema()` can migrate
+  older JSON for replay. Unsupported versions yield `OutputPayload`, malformed
+  typed output yields `Output`, and absent output yields `OutputUnavailable`.
+  Each explicitly reports a committed effect; none authorizes re-execution.
+  A fresh unserializable success still returns `Committed(value)` and stores
+  an audit note. See [payload-schemas.md](payload-schemas.md).
 
 ## How this is tested
 

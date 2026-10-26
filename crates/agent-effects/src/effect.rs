@@ -63,6 +63,7 @@ impl EffectContext {
 pub struct EffectFailure {
     class: FailureClass,
     request_sent: Option<bool>,
+    retry_after: Option<Duration>,
     source: Box<dyn Error + Send + Sync>,
 }
 
@@ -72,6 +73,7 @@ impl EffectFailure {
         Self {
             class,
             request_sent: None,
+            retry_after: None,
             source: source.into(),
         }
     }
@@ -120,6 +122,20 @@ impl EffectFailure {
     pub fn request_sent(mut self, sent: bool) -> Self {
         self.request_sent = Some(sent);
         self
+    }
+
+    /// Adds a minimum retry delay without changing whether the operation
+    /// may have applied. This is scheduling advice, never evidence that a
+    /// retry is safe. The runtime persists it for ambiguous outcomes too.
+    #[must_use]
+    pub fn with_retry_after(mut self, delay: Duration) -> Self {
+        self.retry_after = Some(delay);
+        self
+    }
+
+    /// The minimum retry delay, independent of the failure's disposition.
+    pub fn retry_after(&self) -> Option<Duration> {
+        self.retry_after.max(self.class().retry_after())
     }
 
     /// The classification after taking [`Self::request_sent`] into account.
@@ -254,6 +270,10 @@ pub struct EffectBuilder<S, V = NoVerification> {
     risk: RiskLevel,
     verification: VerificationMode,
     verifier: V,
+    handler_version: String,
+    adapter: Option<String>,
+    input_schema_version: u32,
+    output_schema: crate::PayloadSchema,
 }
 
 impl<S: EffectStore> EffectBuilder<S> {
@@ -274,6 +294,10 @@ impl<S: EffectStore> EffectBuilder<S> {
             risk: RiskLevel::Low,
             verification: VerificationMode::None,
             verifier: NoVerification,
+            handler_version: "1".into(),
+            adapter: None,
+            input_schema_version: 1,
+            output_schema: crate::PayloadSchema::default(),
         }
     }
 
@@ -327,11 +351,45 @@ impl<S: EffectStore> EffectBuilder<S> {
             risk: self.risk,
             verification: mode,
             verifier,
+            handler_version: self.handler_version,
+            adapter: self.adapter,
+            input_schema_version: self.input_schema_version,
+            output_schema: self.output_schema,
         }
     }
 }
 
 impl<S: EffectStore, V> EffectBuilder<S, V> {
+    /// Versions the stored input (default 1). Reattachment must use the
+    /// recorded input schema; durable input migrations belong on handlers.
+    pub fn input_schema_version(mut self, version: u32) -> Self {
+        self.input_schema_version = version;
+        self
+    }
+
+    /// Versions new outputs and optionally migrates older outputs on replay.
+    /// A replay error leaves a committed effect committed and never re-runs it.
+    pub fn output_schema(mut self, schema: crate::PayloadSchema) -> Self {
+        self.output_schema = schema;
+        self
+    }
+
+    /// Names the application's execution semantics (default `"1"`). Changing
+    /// it for an existing logical key returns a contract mismatch. Retain
+    /// it across releases only when execution assumptions stay compatible.
+    pub fn contract_version(mut self, version: impl Into<String>) -> Self {
+        self.handler_version = version.into();
+        self
+    }
+
+    /// Identifies a provider or adapter whose safety guarantees the effect
+    /// relies on. A change is incompatible for an existing logical key.
+    /// Keep credentials and tenant secrets out of this value.
+    pub fn adapter_identity(mut self, adapter: impl Into<String>) -> Self {
+        self.adapter = Some(adapter.into());
+        self
+    }
+
     /// The effect's kind. Defaults to [`EffectKind::IrreversibleWrite`], the
     /// most cautious choice.
     pub fn kind(mut self, kind: EffectKind) -> Self {
@@ -458,6 +516,10 @@ impl<S: EffectStore, V> EffectBuilder<S, V> {
             risk: self.risk,
             automatic_retry: true,
             input_stored: false,
+            handler_version: self.handler_version,
+            adapter: self.adapter,
+            input_schema_version: self.input_schema_version,
+            output_schema: self.output_schema,
         };
         self.runtime.execute(spec, action, self.verifier).await
     }
@@ -465,6 +527,10 @@ impl<S: EffectStore, V> EffectBuilder<S, V> {
 
 /// Everything about an effect except its action and verifier.
 pub(crate) struct EffectSpec {
+    pub(crate) input_schema_version: u32,
+    pub(crate) output_schema: crate::PayloadSchema,
+    pub(crate) handler_version: String,
+    pub(crate) adapter: Option<String>,
     pub(crate) key: EffectKey,
     pub(crate) capabilities: Capabilities,
     pub(crate) input: Option<Value>,
@@ -481,4 +547,27 @@ pub(crate) struct EffectSpec {
     /// The input comes from the store (a resumed effect): it is already
     /// redacted, and `fingerprint` is the stored one, used as is.
     pub(crate) input_stored: bool,
+}
+
+impl EffectSpec {
+    pub(crate) fn contract(&self) -> crate::store::ExecutionContract {
+        use crate::store::{ExecutionContract, VerificationContract};
+        ExecutionContract {
+            format_version: 1,
+            kind: self.capabilities.kind,
+            remote_idempotency: self.capabilities.remote_idempotency,
+            verification: match self.capabilities.verification {
+                VerificationMode::None => VerificationContract::None,
+                VerificationMode::Authoritative => VerificationContract::Authoritative,
+                VerificationMode::EventuallyConsistent { settle } => {
+                    VerificationContract::EventuallyConsistent { settle }
+                }
+            },
+            handler_version: self.handler_version.clone(),
+            adapter: self.adapter.clone(),
+            require_approval: self.require_approval,
+            automatic_retry: self.automatic_retry,
+            max_attempts: self.retry.max_attempts,
+        }
+    }
 }

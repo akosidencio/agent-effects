@@ -344,6 +344,10 @@ async fn recovery_waits_for_a_scheduled_retry_to_fall_due() {
     let remote = FakeRemote::new(clock);
     // A worker failed its first attempt, scheduled a retry in 60 s, died.
     let mut new = NewEffect::new(key("later"), EffectKind::IrreversibleWrite, clock.now());
+    new.execution_contract = Some(agent_effects::store::ExecutionContract::new(
+        EffectKind::IrreversibleWrite,
+        5,
+    ));
     new.input = Some(json!("res"));
     new.input_fingerprint = None;
     let record = store.insert_or_get(new).await.unwrap().record;

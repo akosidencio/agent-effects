@@ -12,6 +12,59 @@ use crate::store::StoreError;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum RuntimeError {
+    /// The effect committed externally but no replayable output was stored.
+    /// This does not mean the external action failed.
+    #[error("effect {id} committed, but its output is unavailable for replay")]
+    OutputUnavailable {
+        /// The committed effect.
+        id: EffectId,
+    },
+
+    /// An older committed output needs an unsupported or failing migration.
+    #[error("effect {id} committed, but its output schema cannot be read: {source}")]
+    OutputPayload {
+        /// The committed effect.
+        id: EffectId,
+        /// The schema or migration problem.
+        #[source]
+        source: crate::PayloadError,
+    },
+
+    /// Recovery cannot safely interpret the stored input schema.
+    #[error("effect {id}'s input schema cannot be read: {source}")]
+    InputPayload {
+        /// The existing effect.
+        id: EffectId,
+        /// The schema or migration problem.
+        #[source]
+        source: crate::PayloadError,
+    },
+
+    /// A caller supplied a different input schema for an existing key.
+    #[error("effect {id} was recorded with input schema {stored}, not {requested}")]
+    InputSchemaMismatch {
+        /// The existing effect.
+        id: EffectId,
+        /// The recorded schema.
+        stored: u32,
+        /// The caller's schema.
+        requested: u32,
+    },
+    /// Existing safety assumptions differ from this call. Nothing is run
+    /// or replayed; the authoritative record remains unchanged.
+    #[error("effect {id} has an incompatible execution contract")]
+    ContractMismatch {
+        /// The existing effect.
+        id: EffectId,
+    },
+
+    /// A pre-contract unresolved record needs explicit operator review.
+    /// Its original idempotency and verification assumptions are unknown.
+    #[error("effect {id} has no execution contract; reconcile the legacy effect before resuming")]
+    LegacyContract {
+        /// The existing effect.
+        id: EffectId,
+    },
     /// The effect name or logical key was invalid.
     #[error("invalid effect identity: {0}")]
     Identity(#[from] IdentityError),

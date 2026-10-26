@@ -18,7 +18,9 @@ pub mod state;
 #[cfg(feature = "testkit")]
 pub mod testkit;
 
+mod contract;
 mod error;
+mod late;
 mod record;
 
 use std::future::Future;
@@ -27,12 +29,14 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub use contract::{ExecutionContract, VerificationContract};
 pub use error::StoreError;
 pub use failure::{Disposition, FailureClass};
 pub use id::{
     EffectId, EffectKey, EffectName, IdempotencyKey, IdentityError, LogicalKey, WorkerId,
 };
 pub use kind::EffectKind;
+pub use late::{LateObservation, LateOutcome};
 pub use record::EffectRecord;
 pub use state::{EffectStatus, InvalidTransition, Transition};
 
@@ -47,6 +51,24 @@ pub use state::{EffectStatus, InvalidTransition, Transition};
 /// a lock), so concurrent callers can never interleave between the check and
 /// the write.
 pub trait EffectStore: Send + Sync + 'static {
+    /// Appends supplementary evidence without a lease. It must never modify
+    /// the effect record or authoritative transition history. Duplicate
+    /// observation ids leave the original observation unchanged. The effect
+    /// must exist; evidence is deleted atomically when that effect is pruned.
+    fn append_late_observation(
+        &self,
+        observation: LateObservation,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// Lists untrusted evidence by observation id, with bounded pagination.
+    /// Evidence is for operator investigation and never proof of commitment.
+    fn late_observations(
+        &self,
+        id: EffectId,
+        after: Option<EffectId>,
+        limit: usize,
+    ) -> impl Future<Output = Result<Vec<LateObservation>, StoreError>> + Send;
+
     /// Inserts a new effect, or returns the existing record with the same
     /// [`EffectKey`] untouched.
     ///
@@ -130,6 +152,10 @@ pub struct NewEffect {
     pub key: EffectKey,
     /// The effect's kind.
     pub kind: EffectKind,
+    /// Immutable safety assumptions. `None` is a legacy, unattested record.
+    pub execution_contract: Option<ExecutionContract>,
+    /// Schema of the stored input. Legacy payloads use version 1.
+    pub input_schema_version: u32,
     /// The input, already redacted for storage.
     pub input: Option<Value>,
     /// A stable hash of the unredacted input, used to reject a reused key
@@ -142,12 +168,22 @@ pub struct NewEffect {
 }
 
 impl NewEffect {
+    /// Records explicit execution assumptions on a new effect. This cannot
+    /// change an existing record returned by `insert_or_get`.
+    #[must_use]
+    pub fn with_contract(mut self, contract: ExecutionContract) -> Self {
+        self.execution_contract = Some(contract);
+        self
+    }
+
     /// A new effect with a fresh id and no input or actor.
     pub fn new(key: EffectKey, kind: EffectKind, now: SystemTime) -> Self {
         Self {
             id: EffectId::new(),
             key,
             kind,
+            execution_contract: None,
+            input_schema_version: 1,
             input: None,
             input_fingerprint: None,
             created_by: None,
@@ -200,6 +236,8 @@ pub struct TransitionRequest {
     pub now: SystemTime,
     /// The action's result, stored when present.
     pub output: Option<Value>,
+    /// Schema of `output`; omitted operator outputs use legacy version 1.
+    pub output_schema_version: Option<u32>,
     /// A failure to record as the effect's last error.
     pub error: Option<ErrorRecord>,
     /// For [`Transition::ScheduleRetry`] and [`Transition::ResolvedRetry`]:
@@ -226,6 +264,7 @@ impl TransitionRequest {
             transition,
             now,
             output: None,
+            output_schema_version: None,
             error: None,
             next_attempt_at: None,
             actor: None,

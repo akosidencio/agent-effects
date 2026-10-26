@@ -29,6 +29,22 @@ impl OwnClock {
 }
 
 impl EffectStore for OwnClock {
+    async fn append_late_observation(
+        &self,
+        observation: agent_effects::store::LateObservation,
+    ) -> Result<(), StoreError> {
+        self.inner.append_late_observation(observation).await
+    }
+
+    async fn late_observations(
+        &self,
+        id: EffectId,
+        after: Option<EffectId>,
+        limit: usize,
+    ) -> Result<Vec<agent_effects::store::LateObservation>, StoreError> {
+        self.inner.late_observations(id, after, limit).await
+    }
+
     async fn insert_or_get(&self, mut new: NewEffect) -> Result<InsertOutcome, StoreError> {
         new.now = self.now();
         self.inner.insert_or_get(new).await
@@ -106,11 +122,11 @@ fn key(logical: &str) -> EffectKey {
 /// store's clock, right away.
 async fn abandoned(store: &OwnClock, key: EffectKey) -> EffectRecord {
     let record = store
-        .insert_or_get(NewEffect::new(
-            key,
-            EffectKind::IrreversibleWrite,
-            SystemTime::now(),
-        ))
+        .insert_or_get(
+            NewEffect::new(key, EffectKind::IrreversibleWrite, SystemTime::now()).with_contract(
+                agent_effects::store::ExecutionContract::new(EffectKind::IrreversibleWrite, 5),
+            ),
+        )
         .await
         .unwrap()
         .record;

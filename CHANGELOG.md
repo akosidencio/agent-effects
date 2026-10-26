@@ -5,6 +5,59 @@ All notable changes are listed here, following
 [Semantic Versioning](https://semver.org/). Before 1.0, minor releases may
 break the API or storage format.
 
+## [Unreleased — 0.2.0]
+
+### Added
+
+- Persisted versioned execution contracts across memory, SQLite, and
+  PostgreSQL. Reattachment and durable recovery refuse changed idempotency,
+  verification, handler semantics, adapter identity, approval requirements,
+  automatic retry policy, or lifetime attempt ceilings.
+- `EffectBuilder::{contract_version, adapter_identity}`, matching optional
+  `EffectHandler` methods, and explicit contract mismatch/legacy errors.
+- SQL migration 0002 adds a nullable contract without rewriting legacy
+  records. Unresolved unattested records require reconciliation; settled
+  legacy results remain replayable. See `docs/storage-migrations.md`.
+
+- Explicit input/output payload schema versions (legacy version 1),
+  `PayloadSchema` migration hooks, version-aware durable recovery and
+  compensation, `wait_with_output_schema`, and versioned operator output.
+- Missing committed output now returns `RuntimeError::OutputUnavailable`;
+  schema failures report the committed status explicitly and never rerun the
+  action. SQL migration 0003 preserves all existing payload interpretations.
+
+- Append-only late-result metadata for fenced or unrecordable action results,
+  with paginated store inspection and SQL migration 0004. Evidence records no
+  response bodies or errors and never changes authoritative state.
+
+### Compatibility
+
+- Adding `execution_contract` to public `NewEffect` and `EffectRecord`
+  requires custom store implementations and struct literals to be updated.
+  Custom stores must also implement append/list methods for late observations.
+  `NewEffect::new` remains available, and `with_contract` supplies assumptions.
+- Retry timing and attempt timeouts may change across deployments; the
+  lifetime attempt ceiling and safety declarations must stay unchanged.
+
+### Security
+
+- Raise Tokio's minimum to 1.53.3 for RUSTSEC-2026-0386 and update the lockfile's
+  transitive `ctutils` to 0.4.4 for RUSTSEC-2026-0385. Downstream applications
+  must audit/update their own lockfiles; a library lockfile does not constrain
+  a downstream application's transitive resolution.
+
+### Fixed
+
+- HTTP 408, 425, 429, and 503 now default to ambiguous outcomes, preventing
+  blind retries of writes that may already have applied. Trusted provider
+  response semantics can still override classification.
+- Failure responses and negative verification remain ambiguous for clients
+  that may follow redirects, including redirects back to the original URL.
+  Declare a client with redirects disabled to trust rejection/absence responses.
+- Preserve `Retry-After` independently of failure classification, including
+  a durable minimum retry time for ambiguous outcomes. It never authorizes
+  a retry; verification, remote idempotency, or an idempotent kind must do so.
+
 ## [0.1.3]
 
 ### Changed

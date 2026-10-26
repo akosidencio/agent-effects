@@ -42,6 +42,9 @@
 //! between is ambiguous, and the runtime then verifies, re-runs only if
 //! safe, or escalates.
 //!
+//! With a declared no-redirect client, response statuses map as follows.
+//! Otherwise every failure response is ambiguous.
+//!
 //! | Outcome | Class |
 //! |---|---|
 //! | connect, DNS or TLS failure | `Ambiguous`; `Transient` (never sent) only with [`HttpEffect::client_follows_no_redirects`] |
@@ -50,15 +53,18 @@
 //! | 2xx with an unreadable or unparseable body | `Ambiguous` (it applied, the answer was lost) |
 //! | 3xx (seen only when the client does not follow redirects) | `Ambiguous` |
 //! | any failing status after the client followed a redirect | `Ambiguous` (it answers for the redirect's target) |
-//! | 408, 425, 503 | `Transient` |
-//! | 429, or 503 with `Retry-After` | `RateLimited`, honouring `Retry-After` |
+//! | 408, 425, 429, 503 (including `Retry-After`) | `Ambiguous` |
 //! | 400, 422 | `Validation` |
 //! | 401 | `Authentication` |
 //! | 403 | `Authorization` |
 //! | 409, 500, 502, 504, other 5xx | `Ambiguous` |
 //! | 501, other 4xx | `Permanent` |
 //!
-//! Override per request with [`HttpEffect::classify_status`].
+//! `Retry-After` is a minimum delay for an otherwise safe retry, never proof
+//! of non-application. Provider-specific response semantics must establish
+//! that a write was rejected before application before an override can
+//! classify it as `Transient` or `RateLimited`. Override per request with
+//! [`HttpEffect::classify_status`].
 //!
 //! A client that follows redirects (reqwest's default) can fail to connect
 //! to a redirect's target after the original request applied, and reqwest
@@ -70,10 +76,11 @@
 //!
 //! The same goes for statuses: after a redirect, the status is the
 //! target's, so a failing one says nothing about the original request and
-//! is ambiguous. reqwest keeps no redirect history, so a redirect is seen
-//! by the response's URL differing from the request's; one that leads back
-//! to the same URL (`POST /orders` → `303` → `GET /orders`) is not seen.
-//! For irreversible writes, use a client that does not follow redirects.
+//! is ambiguous. reqwest keeps no redirect history: comparing URLs cannot
+//! detect a redirect back to the original URL. Consequently every failing
+//! response remains ambiguous unless the application declares a client that
+//! follows no redirects. The status table's definite failures and negative
+//! verification lookups require that declaration too.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -102,22 +109,15 @@ pub enum StatusClass {
 }
 
 /// The default meaning of `status`; see the [crate docs](crate).
-pub fn classify_status(status: StatusCode, headers: &HeaderMap) -> StatusClass {
+pub fn classify_status(status: StatusCode, _headers: &HeaderMap) -> StatusClass {
     let failure = match status.as_u16() {
         200..=299 => return StatusClass::Success,
         // A redirect the client did not follow: whether the request
         // applied before it is unknown.
         300..=399 => FailureClass::Ambiguous,
-        408 | 425 => FailureClass::Transient,
-        429 => FailureClass::RateLimited {
-            retry_after: retry_after(headers),
-        },
-        503 => match retry_after(headers) {
-            Some(after) => FailureClass::RateLimited {
-                retry_after: Some(after),
-            },
-            None => FailureClass::Transient,
-        },
+        // A gateway or application can return these after a write. Neither
+        // the status nor Retry-After proves non-application.
+        408 | 425 | 429 | 503 => FailureClass::Ambiguous,
         400 | 422 => FailureClass::Validation,
         401 => FailureClass::Authentication,
         403 => FailureClass::Authorization,
@@ -301,6 +301,8 @@ impl HttpEffect {
     /// `None` to fall back to [`classify_status`]. For APIs with their own
     /// conventions, e.g. a 409 that means "already done". A failure after
     /// a followed redirect is still ambiguous (see the [crate docs](crate)).
+    /// `Transient`, `RateLimited`, and definitive failure classes assert
+    /// that the operation did not apply: use only trusted provider semantics.
     pub fn classify_status(
         mut self,
         classify: impl Fn(StatusCode, &HeaderMap) -> Option<StatusClass> + Send + Sync + 'static,
@@ -346,7 +348,8 @@ impl HttpEffect {
 
     /// A verification: a lookup whose 2xx response, parsed as JSON `T`,
     /// confirms the effect, and whose 404 or 410 (only those) says it did not
-    /// apply. Any other status or error is a failed check, which the runtime
+    /// apply when a no-redirect client is declared with
+    /// [`Self::client_follows_no_redirects`]. Any other status or error is a failed check, which the runtime
     /// treats as inconclusive: a broken lookup must never be read as "not
     /// applied". Pass it to `.verify(..)` if the lookup reads its own
     /// writes, else to `.verify_eventually(settle, ..)`.
@@ -362,7 +365,10 @@ impl HttpEffect {
                 // Only "not found" proves the effect did not apply; every
                 // other failure is a check that could not tell. So is a
                 // "not found" for a redirect's target.
-                if matches!(status.as_u16(), 404 | 410) && !request.redirected(&response) {
+                if matches!(status.as_u16(), 404 | 410)
+                    && request.no_redirects
+                    && !request.redirected(&response)
+                {
                     return Ok(Verification::NotApplied);
                 }
                 let body = request.success_body(response).await?;
@@ -425,12 +431,13 @@ impl HttpEffect {
     /// The body of a successful response, or the classified failure.
     async fn success_body(&self, response: reqwest::Response) -> Result<Vec<u8>, EffectFailure> {
         let status = response.status();
+        let retry_delay = retry_after(response.headers());
         let verdict = self
             .classify
             .as_ref()
             .and_then(|classify| classify(status, response.headers()))
             .unwrap_or_else(|| classify_status(status, response.headers()));
-        let redirected = self.redirected(&response);
+        let redirected = !self.no_redirects || self.redirected(&response);
         match verdict {
             StatusClass::Success => {
                 // It applied; losing the body now makes the answer unknown.
@@ -444,18 +451,28 @@ impl HttpEffect {
             // The request may have applied before the redirect.
             StatusClass::Failure(_) if redirected => {
                 let snippet = error_snippet(response).await;
-                Err(EffectFailure::ambiguous(format!(
-                    "HTTP {status} after following a redirect: {snippet}"
-                )))
+                Err(with_delay(
+                    EffectFailure::ambiguous(format!(
+                        "HTTP {status} after following or possibly following a redirect: {snippet}"
+                    )),
+                    retry_delay,
+                ))
             }
             StatusClass::Failure(class) => {
                 let snippet = error_snippet(response).await;
-                Err(EffectFailure::new(
-                    class,
-                    format!("HTTP {status}: {snippet}"),
+                Err(with_delay(
+                    EffectFailure::new(class, format!("HTTP {status}: {snippet}")),
+                    retry_delay,
                 ))
             }
         }
+    }
+}
+
+fn with_delay(failure: EffectFailure, delay: Option<Duration>) -> EffectFailure {
+    match delay {
+        Some(delay) => failure.with_retry_after(delay),
+        None => failure,
     }
 }
 
@@ -528,16 +545,16 @@ mod tests {
             (401, Failure(F::Authentication)),
             (403, Failure(F::Authorization)),
             (404, Failure(F::Permanent)),
-            (408, Failure(F::Transient)),
+            (408, Failure(F::Ambiguous)),
             (409, Failure(F::Ambiguous)),
             (418, Failure(F::Permanent)),
             (422, Failure(F::Validation)),
-            (425, Failure(F::Transient)),
-            (429, Failure(F::RateLimited { retry_after: None })),
+            (425, Failure(F::Ambiguous)),
+            (429, Failure(F::Ambiguous)),
             (500, Failure(F::Ambiguous)),
             (501, Failure(F::Permanent)),
             (502, Failure(F::Ambiguous)),
-            (503, Failure(F::Transient)),
+            (503, Failure(F::Ambiguous)),
             (504, Failure(F::Ambiguous)),
             (599, Failure(F::Ambiguous)),
         ];
@@ -548,23 +565,27 @@ mod tests {
 
     #[test]
     fn retry_after_is_honoured_in_seconds_and_as_a_date() {
-        let seven = Some(Duration::from_secs(7));
-        assert_eq!(
-            class(429, &[("retry-after", "7")]),
-            StatusClass::Failure(FailureClass::RateLimited { retry_after: seven })
-        );
-        assert_eq!(
-            class(503, &[("retry-after", "7")]),
-            StatusClass::Failure(FailureClass::RateLimited { retry_after: seven })
-        );
-        let in_a_minute = httpdate::fmt_http_date(SystemTime::now() + Duration::from_secs(60));
-        let StatusClass::Failure(FailureClass::RateLimited {
-            retry_after: Some(after),
-        }) = class(429, &[("retry-after", &in_a_minute)])
-        else {
-            panic!("expected a rate limit");
+        for status in [408, 425, 429, 500, 502, 503, 504] {
+            assert_eq!(
+                class(status, &[("retry-after", "7")]),
+                StatusClass::Failure(FailureClass::Ambiguous)
+            );
+        }
+        let headers = |value: &str| {
+            let mut map = HeaderMap::new();
+            map.insert(RETRY_AFTER, HeaderValue::try_from(value).unwrap());
+            map
         };
+        assert_eq!(retry_after(&headers("7")), Some(Duration::from_secs(7)));
+        let in_a_minute = httpdate::fmt_http_date(SystemTime::now() + Duration::from_secs(60));
+        let after = retry_after(&headers(&in_a_minute)).unwrap();
         assert!(after > Duration::from_secs(55) && after <= Duration::from_secs(60));
+        assert_eq!(retry_after(&headers("not a date")), None);
+        assert_eq!(retry_after(&headers("-1")), None);
+        assert_eq!(
+            retry_after(&headers("Thu, 01 Jan 1970 00:00:00 GMT")),
+            Some(Duration::ZERO)
+        );
     }
 
     #[test]
