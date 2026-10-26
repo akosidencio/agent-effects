@@ -1,3 +1,9 @@
+<div align="center">
+
+<img src="assets/agent-effects-banner.svg" alt="Agent Effects: reliable side effects for AI agents, with durable execution, safe retries and crash recovery" width="100%" />
+
+</div>
+
 # Agent Effects — The Rust-native reliability layer for AI agent actions
 
 <div align="center">
@@ -26,7 +32,7 @@ from unknown outcomes, and uses remote verification or idempotent retry to
 resolve uncertainty. Store effects in SQLite or PostgreSQL, and track their
 lifecycle with tracing and OpenTelemetry metrics.
 
-[Quick start](#quick-start) · [Features](#features) ·
+[Quick start](#quick-start) · [Architecture](#architecture) · [Features](#features) ·
 [Examples](#examples) · [Documentation](#documentation)
 
 ## Why agent tool calls need idempotency
@@ -57,6 +63,34 @@ Unknown ─┬─ verification available ─→ ask the provider what happened
   from durable storage after a worker restarts.
 - **Operations that need human oversight:** require approval, retain an
   audit trail and compensate committed effects.
+
+## Architecture
+
+![Agent Effects architecture: host application, Rust runtime, remote systems, durable stores, and recovery](assets/agent-effects-architecture.svg)
+
+Agent Effects sits **inside your Rust application**, between an authorized tool
+call and the external system it may change. It is a reliability boundary, not
+an agent framework, workflow orchestrator, or authorization service.
+
+1. **Identify and check.** The application supplies an effect name, stable key,
+   input and safety requirements. The runtime validates the identity and
+   fingerprint, applies risk policy, and checks persisted execution contracts.
+2. **Record before acting.** The selected `EffectStore` records intent, status,
+   attempts and an audit trail. Leases and fencing coordinate concurrent
+   workers before a closure or registered `EffectHandler` executes the action.
+3. **Reconcile outcomes.** A confirmed success is committed and replayed for
+   the same key. A definite non-application may fail; an ambiguous result is
+   `Unknown`, never automatically assumed to be a failure. The runtime prefers
+   verification, otherwise retries only when provably safe, or escalates to
+   `NeedsIntervention` for an operator.
+4. **Recover and observe.** Registered handlers can resume from stored input
+   after a restart. Closure-based effects need a caller to re-attach. Memory,
+   SQLite and PostgreSQL stores implement the persistence contract; tracing
+   and optional OpenTelemetry observers expose lifecycle activity.
+
+Remote idempotency keys provide the strongest protection when the provider
+honors them. No local runtime can guarantee exactly-once effects across an
+uncooperative external system. See [reliability guarantees and limits](#reliability-guarantees-and-limits).
 
 ## Quick start
 
