@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use agent_effects::store::{EffectStore, ErrorRecord, NewEffect, StoreError, TransitionRequest};
+use agent_effects::store::{
+    EffectStore, ErrorRecord, LateObservation, NewEffect, StoreError, TransitionRequest,
+};
 use agent_effects::testkit::FakeRemote;
 use agent_effects::{
     Clock, EffectFailure, EffectId, EffectKey, EffectKind, EffectName, EffectOutcome, EffectStatus,
@@ -575,12 +577,9 @@ async fn an_action_finishing_after_heartbeat_fencing_only_appends_evidence() {
     let outcome = running.await.unwrap();
     assert!(matches!(outcome, EffectOutcome::NeedsIntervention { .. }));
     let before = record(&store, "heartbeat-late").await;
-    assert!(
-        store
-            .late_observations(before.id, None, 10)
-            .await
-            .unwrap()
-            .is_empty()
+    assert_eq!(
+        store.late_observations(before.id, None, 10).await.unwrap(),
+        [] as [LateObservation; 0]
     );
     finish.notify_one();
     for _ in 0..50 {

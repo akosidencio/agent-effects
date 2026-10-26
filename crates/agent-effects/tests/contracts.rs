@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime};
 
 use agent_effects::handler::{EffectHandler, Handler, VerifiableEffect};
-use agent_effects::store::{ExecutionContract, NewEffect, VerificationContract};
+use agent_effects::store::{EffectEvent, ExecutionContract, NewEffect, VerificationContract};
 use agent_effects::{
     EffectContext, EffectFailure, EffectKey, EffectKind, EffectName, EffectOutcome, EffectStatus,
     EffectStore, LogicalKey, RetryPolicy, Runtime, RuntimeError, Verification,
@@ -82,12 +82,12 @@ async fn verification_modes_and_settle_delays_are_contractual() {
             matches!(result, Err(RuntimeError::ContractMismatch { .. })),
             "{mode:?}"
         );
-        assert!(
+        assert_eq!(
             store
                 .events(store.get_by_key(&key()).await.unwrap().unwrap().id)
                 .await
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            [] as [EffectEvent; 0]
         );
     }
 }
