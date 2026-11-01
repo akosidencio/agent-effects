@@ -67,6 +67,8 @@ struct Inner<S> {
     observers: Vec<Arc<dyn EffectObserver>>,
     retention: RetentionPolicy,
     recovery: RecoveryConfig,
+    /// Retry backoffs at least this long are waited out without the lease.
+    lease_free_backoff: Duration,
     #[cfg(feature = "fault-injection")]
     faults: Option<Arc<FaultInjector>>,
 }
@@ -94,6 +96,7 @@ pub struct RuntimeBuilder<S> {
     observers: Vec<Arc<dyn EffectObserver>>,
     retention: RetentionPolicy,
     recovery: RecoveryConfig,
+    lease_free_backoff: Option<Duration>,
     #[cfg(feature = "fault-injection")]
     faults: Option<Arc<FaultInjector>>,
 }
@@ -188,6 +191,26 @@ impl<S: EffectStore> RuntimeBuilder<S> {
         self
     }
 
+    /// Retry backoffs of at least `min_wait` are waited out without holding
+    /// the effect's lease. The retry's time is stored first; the lease is
+    /// then released, and taken again, with the record re-read, once the
+    /// retry is due. A caller still waits for the outcome, and a worker
+    /// that dies meanwhile holds nothing, so recovery can resume the retry
+    /// as soon as it is due. A recovery pass leaves such a retry for a later
+    /// pass rather than wait for it.
+    ///
+    /// Defaults to a third of the [lease TTL](Self::lease_ttl), the renewal
+    /// interval: a shorter wait costs no renewals. `Duration::MAX` keeps the
+    /// lease through every backoff, as 0.2.0 did.
+    ///
+    /// Releasing the lease never makes a retry safer or less safe: whether
+    /// an effect may run again is decided, and stored, before the backoff.
+    /// See [retry scheduling](crate::retry#scheduling).
+    pub fn lease_free_backoff(mut self, min_wait: Duration) -> Self {
+        self.lease_free_backoff = Some(min_wait);
+        self
+    }
+
     /// The retry policy for effects that do not set their own. Defaults to
     /// [`RetryPolicy::default`]: 5 attempts, 1 s to 30 s exponential backoff
     /// with jitter.
@@ -220,6 +243,7 @@ impl<S: EffectStore> RuntimeBuilder<S> {
                 observers: self.observers,
                 retention: self.retention,
                 recovery: self.recovery,
+                lease_free_backoff: self.lease_free_backoff.unwrap_or(self.lease_ttl / 3),
                 #[cfg(feature = "fault-injection")]
                 faults: self.faults,
             }),
@@ -231,6 +255,9 @@ impl<S: EffectStore> RuntimeBuilder<S> {
 pub(crate) enum Interrupt {
     /// Our lease expired or was taken over; re-read the record.
     LeaseLost,
+    /// A retry is stored for this time, far enough off to wait for it
+    /// without the lease; release it, then take it again when due.
+    Backoff(SystemTime),
     Error(RuntimeError),
 }
 
@@ -264,6 +291,7 @@ impl<S: EffectStore> Runtime<S> {
             observers: Vec::new(),
             retention: RetentionPolicy::KEEP_ALL,
             recovery: RecoveryConfig::SEQUENTIAL,
+            lease_free_backoff: None,
             #[cfg(feature = "fault-injection")]
             faults: None,
         }
@@ -335,8 +363,9 @@ impl<S: EffectStore> Runtime<S> {
     /// [`EffectOutcome::InProgress`].
     ///
     /// Returns `InProgress` if the effect is still being worked on at the
-    /// deadline, or if it is unsettled and nobody holds it (for example a
-    /// worker crashed while waiting to retry). Running the effect again then
+    /// deadline, or if it is unsettled and nobody holds it: a retry waiting
+    /// for its time (see [retry scheduling](crate::retry#scheduling)), or a
+    /// worker crashed while waiting to retry. Running the effect again then
     /// takes it over.
     ///
     /// # Errors
@@ -408,6 +437,28 @@ impl<S: EffectStore> Runtime<S> {
 
     pub(crate) fn retention(&self) -> RetentionPolicy {
         self.inner.retention
+    }
+
+    /// Whether a stored retry at `at` is far enough off to wait for it
+    /// without the lease.
+    pub(crate) fn lease_free_until(&self, at: SystemTime) -> Option<SystemTime> {
+        let wait = at.duration_since(self.now()).unwrap_or_default();
+        (!wait.is_zero() && wait >= self.inner.lease_free_backoff).then_some(at)
+    }
+
+    /// Waits without a lease until `at`, by this runtime's clock.
+    pub(crate) async fn sleep_until_due(&self, at: SystemTime) {
+        let wait = at.duration_since(self.now()).unwrap_or_default();
+        tokio::time::sleep(wait).await;
+    }
+
+    /// After a lease-free backoff someone else holds the lease: wait a
+    /// little, longer each time, before looking again.
+    pub(crate) async fn pause_for_holder(&self, pause: &mut Duration) {
+        tokio::time::sleep(*pause).await;
+        let cap =
+            (self.inner.lease_ttl / 3).clamp(Duration::from_millis(10), Duration::from_secs(1));
+        *pause = (*pause * 2).min(cap);
     }
 
     pub(crate) fn recovery_config(&self) -> RecoveryConfig {
@@ -642,7 +693,15 @@ impl<S: EffectStore> Runtime<S> {
         // Verification checks this call has made, across every attempt and
         // lease it goes through: the budget is per call.
         let checks_made = AtomicU32::new(0);
-        for _ in 0..MAX_ROUNDS {
+        // Rounds lost to a lease taken over; waiting out a backoff without
+        // the lease is not one.
+        let mut lost = 0;
+        // Set once this call has released the lease for a backoff: from then
+        // on another worker holding it is one that took over the retry, and
+        // this call waits for it instead of reporting "in progress".
+        let mut waited_out = false;
+        let mut pause = Duration::from_millis(10);
+        while lost < MAX_ROUNDS {
             if let Some(outcome) = observe(&record, &spec.output_schema)? {
                 return Ok(outcome);
             }
@@ -656,6 +715,14 @@ impl<S: EffectStore> Runtime<S> {
                 .await
             {
                 Ok(lease) => lease,
+                Err(StoreError::LeaseHeld { .. }) if waited_out => {
+                    self.pause_for_holder(&mut pause).await;
+                    record = store
+                        .get(record.id)
+                        .await?
+                        .ok_or(StoreError::NotFound(record.id))?;
+                    continue;
+                }
                 Err(StoreError::LeaseHeld { .. }) => {
                     return Ok(EffectOutcome::InProgress { id: record.id });
                 }
@@ -685,13 +752,27 @@ impl<S: EffectStore> Runtime<S> {
                 }
                 Err(Interrupt::LeaseLost) => {
                     warn!("lease lost mid-effect; re-reading the record");
-                    record = store
-                        .get(record.id)
-                        .await?
-                        .ok_or(StoreError::NotFound(record.id))?;
+                    lost += 1;
+                }
+                Err(Interrupt::Backoff(at)) => {
+                    // The retry and its time are stored; the lease is
+                    // released. Recovery leaves it for a later pass, a
+                    // caller waits for it.
+                    if spec.return_on_backoff {
+                        return Ok(EffectOutcome::InProgress { id: record.id });
+                    }
+                    self.checkpoint(FaultPoint::AfterBackoffLeaseReleased);
+                    debug!("waiting for a scheduled retry without the lease");
+                    self.sleep_until_due(at).await;
+                    waited_out = true;
+                    pause = Duration::from_millis(10);
                 }
                 Err(Interrupt::Error(e)) => return Err(e),
             }
+            record = store
+                .get(record.id)
+                .await?
+                .ok_or(StoreError::NotFound(record.id))?;
         }
         Ok(EffectOutcome::InProgress { id: record.id })
     }
@@ -749,6 +830,9 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
             match record.status {
                 EffectStatus::Pending => {
                     if let Some(at) = record.next_attempt_at {
+                        if let Some(due) = self.rt.lease_free_until(at) {
+                            return Err(Interrupt::Backoff(due));
+                        }
                         self.sleep_until(at).await?;
                     }
                     if record.attempt_count == 0
@@ -1204,13 +1288,17 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
         let at =
             (self.rt.now() + delay).max(record.next_attempt_at.unwrap_or(SystemTime::UNIX_EPOCH));
         debug!(?delay, ?class, "retry scheduled");
-        self.transition(record, Transition::ScheduleRetry, |r| {
-            r.next_attempt_at = Some(at);
-            r.error = error;
-            r.payload =
-                Some(json!({ "delay_ms": u64::try_from(delay.as_millis()).unwrap_or(u64::MAX) }));
-        })
-        .await
+        let scheduled = self
+            .transition(record, Transition::ScheduleRetry, |r| {
+                r.next_attempt_at = Some(at);
+                r.error = error;
+                r.payload = Some(
+                    json!({ "delay_ms": u64::try_from(delay.as_millis()).unwrap_or(u64::MAX) }),
+                );
+            })
+            .await?;
+        self.rt.checkpoint(FaultPoint::AfterRetryScheduled);
+        Ok(scheduled)
     }
 
     /// Asks the runtime's approval provider, on its own task and under the

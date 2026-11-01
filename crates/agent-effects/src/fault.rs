@@ -39,6 +39,12 @@ pub enum FaultPoint {
     AfterActionReturned,
     /// `StartVerification` is persisted (`Verifying`); no check has run.
     AfterVerificationStarted,
+    /// A retry is persisted (`ScheduleRetry` or
+    /// `ScheduleCompensationRetry`) with its time; the lease is still held.
+    AfterRetryScheduled,
+    /// The lease was released to wait for a scheduled retry that is not due
+    /// yet; nobody holds the effect.
+    AfterBackoffLeaseReleased,
     /// A compensation attempt is recorded (`Compensating`); the compensation
     /// was not called.
     AfterCompensationStarted,
