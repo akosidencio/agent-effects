@@ -271,9 +271,12 @@ pub async fn slow_handler_does_not_hold_up_others<S: EffectStore + Clone>(store:
         async move { rt.recover().await }
     });
 
-    eventually("every fast job commits", async || {
-        count(&store, EffectStatus::Committed).await == FAST as usize
-    })
+    eventually(
+        "every fast job commits while the slow one runs",
+        async || {
+            probe.runs(0) == 1 && count(&store, EffectStatus::Committed).await == FAST as usize
+        },
+    )
     .await;
     assert!(!pass.is_finished(), "the pass waits for the slow job");
     assert_eq!(probe.in_flight(), 1, "only the slow job is still running");
@@ -517,10 +520,13 @@ pub async fn lease_expiry_mid_pass<S: EffectStore + Clone>(store: S) {
         let rt = stalled.clone();
         async move { rt.recover().await }
     });
-    eventually("the other jobs commit", async || {
-        count(&store, EffectStatus::Committed).await == 4
+    // The stalled worker must have started job 0 itself before time moves
+    // on; otherwise the other worker could win the job and stall on it.
+    eventually("the other jobs commit and job 0 started", async || {
+        probe.runs(0) == 1 && count(&store, EffectStatus::Committed).await == 4
     })
     .await;
+    assert_eq!(probe.by_runner().get("stalled"), Some(&5));
 
     // The stalled worker cannot renew in time (its renewals are due every
     // TTL/3 of real time); by the store's clock its lease is gone.
