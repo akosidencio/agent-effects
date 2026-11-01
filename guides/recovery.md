@@ -96,6 +96,23 @@ rows another worker has locked, so workers split a backlog between them.
 A pass may report an effect as `skipped`, or resume it and find another
 worker already finished it; the next pass reconciles both.
 
+## Scheduled retries
+
+A retry is stored with the time it may start (`next_attempt_at`) before
+anyone waits for it. Backoffs of at least `lease_free_backoff` (a third of
+the lease TTL by default) are waited out without the lease, so:
+
+- a recovery pass stores the retry and moves on; the effect shows in
+  `report.not_due` until a later pass finds it due;
+- a worker that dies during a backoff holds nothing, and the retry is
+  resumed as soon as it is due rather than after a lease expiry;
+- several workers finding one due retry run it once: each takes the lease
+  and re-reads the record before starting it.
+
+A released lease never makes a retry more permissive: whether an effect may
+run again is decided under the lease before the wait. See the
+[`retry` module documentation](https://docs.rs/agent-effects/latest/agent_effects/retry/index.html#scheduling).
+
 ## Errors during a pass
 
 - **A store error while scanning** stops the pass from starting anything new.
