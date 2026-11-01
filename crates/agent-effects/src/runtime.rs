@@ -33,7 +33,7 @@ use crate::handler::{
 };
 use crate::id::{EffectId, EffectName, WorkerId};
 use crate::kind::EffectKind;
-use crate::observer::{EffectObserver, Observation};
+use crate::observer::{EffectObserver, Observation, RuntimeEvent};
 use crate::policy::{RiskPolicy, UnknownPlan};
 use crate::recovery::RecoveryConfig;
 use crate::redaction::{Field, Redactor};
@@ -199,9 +199,12 @@ impl<S: EffectStore> RuntimeBuilder<S> {
     /// as soon as it is due. A recovery pass leaves such a retry for a later
     /// pass rather than wait for it.
     ///
-    /// Defaults to a third of the [lease TTL](Self::lease_ttl), the renewal
-    /// interval: a shorter wait costs no renewals. `Duration::MAX` keeps the
-    /// lease through every backoff, as 0.2.0 did.
+    /// Defaults to the [lease TTL](Self::lease_ttl). Holding the lease costs
+    /// a renewal every third of the TTL, while releasing it costs a release,
+    /// a new acquisition and a re-read: for waits shorter than the TTL,
+    /// holding is the cheaper of the two, and a worker that dies holding it
+    /// delays the retry by less than a TTL. `Duration::MAX` keeps the lease
+    /// through every backoff, as 0.2.0 did.
     ///
     /// Releasing the lease never makes a retry safer or less safe: whether
     /// an effect may run again is decided, and stored, before the backoff.
@@ -243,7 +246,7 @@ impl<S: EffectStore> RuntimeBuilder<S> {
                 observers: self.observers,
                 retention: self.retention,
                 recovery: self.recovery,
-                lease_free_backoff: self.lease_free_backoff.unwrap_or(self.lease_ttl / 3),
+                lease_free_backoff: self.lease_free_backoff.unwrap_or(self.lease_ttl),
                 #[cfg(feature = "fault-injection")]
                 faults: self.faults,
             }),
@@ -485,7 +488,10 @@ impl<S: EffectStore> Runtime<S> {
                     match self.store().renew_lease(lease, self.now(), ttl).await {
                         Ok(_) => {}
                         Err(StoreError::LeaseLost) => return Err(Interrupt::LeaseLost),
-                        Err(e) => warn!(error = %e, "lease renewal failed; will retry"),
+                        Err(e) => {
+                            warn!(error = %e, "lease renewal failed; will retry");
+                            self.emit(&RuntimeEvent::LeaseRenewalFailed);
+                        }
                     }
                 }
             }
@@ -537,6 +543,13 @@ impl<S: EffectStore> Runtime<S> {
             self.notify(|observer| observer.on_transition(&observation));
         }
         Ok(after)
+    }
+
+    /// Tells the observers about something that is not a transition.
+    pub(crate) fn emit(&self, event: &RuntimeEvent<'_>) {
+        if !self.inner.observers.is_empty() {
+            self.notify(|observer| observer.on_event(event));
+        }
     }
 
     /// Calls every observer, containing panics: the write already happened.
@@ -665,30 +678,8 @@ impl<S: EffectStore> Runtime<S> {
         Fut: Future<Output = Result<T, EffectFailure>> + Send + 'static,
         V: Verifier<T>,
     {
-        self.checkpoint(FaultPoint::BeforeInsert);
         let store = self.store();
-        let inserted = store
-            .insert_or_get(NewEffect {
-                id: EffectId::new(),
-                key: spec.key.clone(),
-                kind: spec.capabilities.kind,
-                execution_contract: Some(spec.contract()),
-                input_schema_version: spec.input_schema_version,
-                input: spec.input.clone(),
-                input_fingerprint: spec.fingerprint.clone(),
-                created_by: spec.actor.clone(),
-                now: self.now(),
-            })
-            .await?;
-        let mut record = inserted.record;
-        if inserted.inserted {
-            self.notify(|observer| observer.on_created(&record));
-        }
-        Span::current().record("effect.id", field::display(record.id));
-        self.checkpoint(FaultPoint::AfterInsert);
-        if !inserted.inserted {
-            check_matches(&record, &spec)?;
-        }
+        let mut record = self.record_or_attach(&spec).await?;
 
         // Verification checks this call has made, across every attempt and
         // lease it goes through: the budget is per call.
@@ -700,6 +691,7 @@ impl<S: EffectStore> Runtime<S> {
         // on another worker holding it is one that took over the retry, and
         // this call waits for it instead of reporting "in progress".
         let mut waited_out = false;
+        let mut conflict_seen = false;
         let mut pause = Duration::from_millis(10);
         while lost < MAX_ROUNDS {
             if let Some(outcome) = observe(&record, &spec.output_schema)? {
@@ -716,6 +708,12 @@ impl<S: EffectStore> Runtime<S> {
             {
                 Ok(lease) => lease,
                 Err(StoreError::LeaseHeld { .. }) if waited_out => {
+                    if !conflict_seen {
+                        conflict_seen = true;
+                        self.emit(&RuntimeEvent::LeaseConflict {
+                            name: &spec.key.name,
+                        });
+                    }
                     self.pause_for_holder(&mut pause).await;
                     record = store
                         .get(record.id)
@@ -724,6 +722,9 @@ impl<S: EffectStore> Runtime<S> {
                     continue;
                 }
                 Err(StoreError::LeaseHeld { .. }) => {
+                    self.emit(&RuntimeEvent::LeaseConflict {
+                        name: &spec.key.name,
+                    });
                     return Ok(EffectOutcome::InProgress { id: record.id });
                 }
                 Err(e) => return Err(e.into()),
@@ -775,6 +776,38 @@ impl<S: EffectStore> Runtime<S> {
                 .ok_or(StoreError::NotFound(record.id))?;
         }
         Ok(EffectOutcome::InProgress { id: record.id })
+    }
+}
+
+impl<S: EffectStore> Runtime<S> {
+    /// Records the effect, or finds the existing record for its key and
+    /// checks that this call describes the same effect.
+    async fn record_or_attach(&self, spec: &EffectSpec) -> Result<EffectRecord, RuntimeError> {
+        self.checkpoint(FaultPoint::BeforeInsert);
+        let inserted = self
+            .store()
+            .insert_or_get(NewEffect {
+                id: EffectId::new(),
+                key: spec.key.clone(),
+                kind: spec.capabilities.kind,
+                execution_contract: Some(spec.contract()),
+                input_schema_version: spec.input_schema_version,
+                input: spec.input.clone(),
+                input_fingerprint: spec.fingerprint.clone(),
+                created_by: spec.actor.clone(),
+                now: self.now(),
+            })
+            .await?;
+        let record = inserted.record;
+        if inserted.inserted {
+            self.notify(|observer| observer.on_created(&record));
+        }
+        Span::current().record("effect.id", field::display(record.id));
+        self.checkpoint(FaultPoint::AfterInsert);
+        if !inserted.inserted {
+            check_matches(&record, spec)?;
+        }
+        Ok(record)
     }
 }
 

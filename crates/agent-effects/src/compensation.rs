@@ -334,6 +334,9 @@ impl<S: EffectStore> Runtime<S> {
                     continue;
                 }
                 Err(StoreError::LeaseHeld { .. }) => {
+                    self.emit(&crate::RuntimeEvent::LeaseConflict {
+                        name: &spec.key.name,
+                    });
                     return Ok(CompensationOutcome::InProgress { id: record.id });
                 }
                 Err(e) => return Err(e.into()),
