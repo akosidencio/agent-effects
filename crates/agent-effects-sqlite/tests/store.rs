@@ -165,3 +165,38 @@ async fn versioned_outputs_replay_after_reopening_with_a_new_schema() {
         EffectOutcome::Committed(serde_json::json!({ "result": 7 }))
     );
 }
+
+#[tokio::test]
+async fn attach_never_migrates_and_accepts_read_only_pools() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("attach.db");
+
+    // An empty database is refused, not migrated.
+    let empty = sqlx::SqlitePool::connect(&format!("sqlite://{}?mode=rwc", path.display()))
+        .await
+        .unwrap();
+    let error = SqliteStore::attach(empty.clone()).await.unwrap_err();
+    assert!(error.to_string().contains("migration history"), "{error}");
+    let tables: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE type = 'table'")
+        .fetch_one(&empty)
+        .await
+        .unwrap();
+    assert_eq!(tables, 0, "attach created nothing");
+    empty.close().await;
+
+    SqliteStore::open(&path).await.unwrap();
+    let read_only = sqlx::sqlite::SqlitePoolOptions::new()
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&path)
+                .read_only(true),
+        )
+        .await
+        .unwrap();
+    let store = SqliteStore::attach(read_only).await.unwrap();
+    let records = store
+        .list(agent_effects_store::ListQuery::statuses([]))
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 0, "reads work on a read-only pool");
+}

@@ -101,6 +101,53 @@ impl SqliteStore {
         Ok(Self { pool })
     }
 
+    /// Uses an existing pool without migrating, after checking that every
+    /// migration is applied. For tools that must never change the schema,
+    /// such as an operator CLI, or a pool opened read-only
+    /// (`?mode=ro`), where reads work and every write fails.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Backend`] if the database has no migration history, or
+    /// lacks or differs from one of this crate's migrations.
+    pub async fn attach(pool: SqlitePool) -> Result<Self, StoreError> {
+        let applied: Vec<(i64, Vec<u8>)> =
+            sqlx::query_as("SELECT version, checksum FROM _sqlx_migrations WHERE success")
+                .fetch_all(&pool)
+                .await
+                .map_err(|e| {
+                    StoreError::backend(format!(
+                        "no agent-effects migration history ({e}): open the database with \
+                         SqliteStore::open first"
+                    ))
+                })?;
+        for migration in MIGRATOR.iter() {
+            if migration.migration_type.is_down_migration() {
+                continue;
+            }
+            match applied
+                .iter()
+                .find(|(version, _)| *version == migration.version)
+            {
+                None => {
+                    return Err(StoreError::backend(format!(
+                        "migration {} ({}) is not applied: open the database with \
+                         SqliteStore::open first",
+                        migration.version, migration.description
+                    )));
+                }
+                Some((_, checksum)) if checksum.as_slice() != &*migration.checksum => {
+                    return Err(StoreError::backend(format!(
+                        "migration {} differs from agent-effects' own",
+                        migration.version
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
+        Ok(Self { pool })
+    }
+
     /// The underlying pool.
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
