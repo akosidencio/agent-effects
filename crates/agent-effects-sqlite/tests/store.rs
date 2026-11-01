@@ -200,3 +200,45 @@ async fn attach_never_migrates_and_accepts_read_only_pools() {
         .unwrap();
     assert_eq!(records.len(), 0, "reads work on a read-only pool");
 }
+
+/// Writers in one process take turns instead of racing SQLite's busy
+/// handler, which is not first-come-first-served: before they did, a writer
+/// could be starved past the busy timeout under contention and fail with
+/// "database is locked", leaving an effect whose action had succeeded
+/// unrecorded. A 50 ms busy timeout makes the race certain on any disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_writers_in_one_process_never_hit_the_busy_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("contended.db");
+    SqliteStore::open(&path).await.unwrap();
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(8)
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&path)
+                .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+                .synchronous(sqlx::sqlite::SqliteSynchronous::Full)
+                .busy_timeout(std::time::Duration::from_millis(50)),
+        )
+        .await
+        .unwrap();
+    let rt = Runtime::new(SqliteStore::attach(pool).await.unwrap());
+    let calls: Vec<_> = (0..32)
+        .map(|task| {
+            let rt = rt.clone();
+            tokio::spawn(async move {
+                for n in 0..25 {
+                    let outcome = rt
+                        .effect("contended.write", format!("{task}-{n}"))
+                        .run(|_| async { Ok::<_, EffectFailure>(()) })
+                        .await
+                        .expect("no store error under in-process contention");
+                    assert!(matches!(outcome, EffectOutcome::Committed(())));
+                }
+            })
+        })
+        .collect();
+    for call in calls {
+        call.await.unwrap();
+    }
+}
