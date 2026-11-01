@@ -238,7 +238,7 @@ consequential actions. It does not supply application authorization.
 | [`agent-effects`](crates/agent-effects) | The runtime; the crate applications depend on. Features: `testkit` (`FakeRemote`), `fault-injection` (`FaultInjector`). |
 | [`agent-effects-sqlite`](crates/agent-effects-sqlite) | SQLite store; several processes may share one file. |
 | [`agent-effects-http`](crates/agent-effects-http) | HTTP requests as effects (reqwest): failure classification, `Idempotency-Key`. |
-| [`agent-effects-otel`](crates/agent-effects-otel) | OpenTelemetry metrics through an `EffectObserver`. |
+| [`agent-effects-otel`](crates/agent-effects-otel) | OpenTelemetry metrics through an `EffectObserver`: outcomes, retries, verification, approvals, leases, recovery backlog and throughput. |
 | [`agent-effects-postgres`](crates/agent-effects-postgres) | PostgreSQL store for many workers on many hosts; leases use the database's clock. Can share an application's database, in a schema of its own, through PgBouncer in transaction mode. |
 | [`agent-effects-memory`](crates/agent-effects-memory) | In-memory store for tests and development. |
 | [`agent-effects-cli`](crates/agent-effects-cli) | Optional operator CLI (`agent-effects`): list, inspect, history, stats, approve, deny, resolve and retry effects in SQLite or PostgreSQL. |
@@ -251,6 +251,8 @@ MSRV: Rust 1.90; `agent-effects-sqlite`, `agent-effects-postgres` and `agent-eff
 - [Rust API documentation](https://docs.rs/agent-effects)
 - [Recovery configuration and worker lifecycle](guides/recovery.md)
 - [Operator CLI](crates/agent-effects-cli/README.md)
+- [Observability: metrics, alerts and traces](guides/observability.md)
+- [Benchmarks and how to reproduce them](guides/benchmarks.md)
 - [Release changelog](CHANGELOG.md)
 
 ## Development

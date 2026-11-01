@@ -99,8 +99,8 @@ worker already finished it; the next pass reconciles both.
 ## Scheduled retries
 
 A retry is stored with the time it may start (`next_attempt_at`) before
-anyone waits for it. Backoffs of at least `lease_free_backoff` (a third of
-the lease TTL by default) are waited out without the lease, so:
+anyone waits for it. Backoffs of at least `lease_free_backoff` (the lease
+TTL by default) are waited out without the lease, so:
 
 - a recovery pass stores the retry and moves on; the effect shows in
   `report.not_due` until a later pass finds it due;
