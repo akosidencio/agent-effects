@@ -5,6 +5,26 @@ All notable changes are listed here, following
 [Semantic Versioning](https://semver.org/). Before 1.0, minor releases may
 break the API or storage format.
 
+## [Unreleased]
+
+### Added
+
+- Bounded-concurrency recovery: `RecoveryConfig` (`max_concurrency`,
+  `batch_size`), `RuntimeBuilder::recovery` and `Runtime::recover_with`. A
+  slow handler no longer holds up unrelated effects in the same pass, and a
+  pass never has more than `max_concurrency` effects in flight or more than
+  one page of records in memory. The default stays sequential, as in 0.2.0.
+- `Runtime::run_recovery_until(interval, shutdown)`: a recovery worker that
+  stops at a signal, starting nothing new and waiting for the effects it
+  already started.
+- `RecoveryReport::not_due` (scheduled retries a pass left for later) and
+  `RecoveryReport::stopped` (the pass ended early for a shutdown).
+
+### Changed
+
+- A recovery pass that hits a store error now waits for the effects it
+  already started before returning the error.
+
 ## [0.2.0]
 
 ### Added

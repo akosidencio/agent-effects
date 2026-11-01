@@ -183,7 +183,9 @@ Pick the protection your remote system allows:
 - **Preconditions.** `.precondition(...)` rejects a stale decision before
   the first attempt.
 - **Recovery and operator tools.** `runtime.run_recovery(interval)` resumes
-  durable handlers; `runtime.pending(..)` lists unresolved effects and
+  durable handlers, several at once with a bounded `RecoveryConfig`, and
+  `run_recovery_until(interval, shutdown)` stops it gracefully;
+  `runtime.pending(..)` lists unresolved effects and
   `runtime.resolve(..)` records an operator's decision. Use
   `runtime.wait(id, timeout)` to wait for another caller's effect.
 
@@ -244,6 +246,7 @@ MSRV: Rust 1.90; `agent-effects-sqlite` and `agent-effects-postgres` need 1.94 (
 ## Documentation
 
 - [Rust API documentation](https://docs.rs/agent-effects)
+- [Recovery configuration and worker lifecycle](guides/recovery.md)
 - [Release changelog](CHANGELOG.md)
 
 ## Development
