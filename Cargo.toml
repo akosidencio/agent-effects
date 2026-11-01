@@ -13,6 +13,7 @@ authors = ["Dennis Paler"]
 
 [workspace.dependencies]
 agent-effects = { path = "crates/agent-effects", version = "0.2.0" }
+agent-effects-cli = { path = "crates/agent-effects-cli", version = "0.2.0" }
 agent-effects-http = { path = "crates/agent-effects-http", version = "0.2.0" }
 agent-effects-memory = { path = "crates/agent-effects-memory", version = "0.2.0" }
 agent-effects-otel = { path = "crates/agent-effects-otel", version = "0.2.0" }
