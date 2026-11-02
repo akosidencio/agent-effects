@@ -70,6 +70,8 @@ break the API or storage format.
 
 ### Fixed
 
+- CLI timestamp rendering handles stored dates beyond the calendar range
+  without panicking.
 - Retry jitter no longer panics when a very large duration rounds beyond
   the floating-point representation accepted by `Duration`. Found by fuzzing;
   normal delay rounding and retry authorization remain unchanged.
