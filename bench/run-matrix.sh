@@ -26,7 +26,8 @@ fi
 run() {
     echo "== $*" >&2
     "$bench" --runs "${RUNS:-3}" --warmup 1 \
-        --data-dir "${DATA_DIR:-target/bench-data}" --label "${LABEL:-}" "$@" >>"$out"
+        --data-dir "${DATA_DIR:-target/bench-data}" --label "${LABEL:-}" \
+        --backoff-ms "${BACKOFF_MS:-1000}" --lease-ms "${LEASE_MS:-30000}" "$@" >>"$out"
 }
 
 for store in "${stores[@]}"; do
@@ -48,10 +49,9 @@ for store in "${stores[@]}"; do
         done
     done
     # A one-second backoff per effect, lease-free versus holding the lease.
-    for n in ${SIZES:-100 1000}; do
-        [ "$n" -gt 1000 ] && continue
-        run --store "$store" --workload retry --effects "$n" --concurrency 100
-        run --store "$store" --workload retry-holding-leases --effects "$n" --concurrency 100
+    for n in ${SIZES:-100 1000 10000}; do
+        run --store "$store" --workload retry --effects "$n" --concurrency "${RETRY_CONCURRENCY:-100}"
+        run --store "$store" --workload retry-holding-leases --effects "$n" --concurrency "${RETRY_CONCURRENCY:-100}"
     done
 done
 
