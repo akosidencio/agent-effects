@@ -100,3 +100,18 @@ fn connection_errors_never_print_the_password() {
     let error: serde_json::Value = serde_json::from_str(&stderr).unwrap();
     assert_eq!(error["exit_code"], exit::CONNECTION);
 }
+
+#[test]
+fn malformed_connection_options_do_not_echo_secret_values() {
+    for url in [
+        "postgres://app:password@localhost/effects?sslmode=secret-query-value",
+        "postgres://app:secret-query-value/with/slash@localhost/effects",
+        "sqlite://effects.db?mode=secret-query-value",
+    ] {
+        let output = agent_effects(&["--database-url", url, "--format", "json", "stats"]);
+        assert_eq!(code(&output), exit::USAGE);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("secret-query-value"), "{stderr}");
+        assert!(!stderr.contains("password"), "{stderr}");
+    }
+}

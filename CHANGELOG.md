@@ -57,9 +57,23 @@ break the API or storage format.
   reproducible workloads for memory, SQLite and PostgreSQL; see
   `guides/benchmarks.md`.
 
+### Security
+
+- Automated RustSec audit, cargo-deny advisory/license/source checks, and
+  redacted secret scans. CI covers stacked PRs and pins external actions.
+- Fuzz targets for stored records/text, state transitions and retry delays.
+- Stored enum/JSON decoding errors omit potentially sensitive corrupt values;
+  CLI URL parsing errors omit credentials and query values.
+- Security disclosure policy and a production operations guide.
+- An unchanged v0.2.0 consumer/custom store and a SQLite database upgrade
+  fixture run in CI without modifying the release tag or migration history.
+
 ### Fixed
 
-- SQLite: writers in one process now take turns (a first-come, first-served
+- Retry jitter no longer panics when a very large duration rounds beyond
+  the floating-point representation accepted by `Duration`. Found by fuzzing;
+  normal delay rounding and retry authorization remain unchanged.
+- SQLite: writers sharing a store and its clones now take turns (a first-come, first-served
   queue) instead of racing SQLite's busy handler, which is not fair. Under
   write contention on storage with slow `fsync`, a writer could be starved
   past the 5 s busy timeout and fail with "database is locked", leaving an

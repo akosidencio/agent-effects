@@ -105,7 +105,12 @@ impl RetryPolicy {
             } else {
                 0.0
             };
-            backoff.mul_f64(0.5 + 0.5 * sample).min(backoff)
+            // Duration::MAX rounds up to 2^64 seconds as f64. Even a
+            // multiplier of 1 can then overflow mul_f64; retain the cap
+            // rather than panicking on a valid (very large) policy.
+            Duration::try_from_secs_f64(backoff.as_secs_f64() * (0.5 + 0.5 * sample))
+                .unwrap_or(backoff)
+                .min(backoff)
         } else {
             backoff
         };
@@ -156,6 +161,21 @@ mod tests {
         let policy = RetryPolicy::default();
         assert!(policy.allows_another(4));
         assert!(!policy.allows_another(5));
+    }
+
+    #[test]
+    fn jitter_at_the_duration_limit_does_not_overflow() {
+        let policy = RetryPolicy {
+            initial_delay: Duration::MAX,
+            max_delay: Duration::MAX,
+            ..RetryPolicy::default()
+        };
+        assert_eq!(policy.delay(0, FailureClass::Transient, 1.0), Duration::MAX);
+        for sample in [0.0, 0.5, 0.99, 1.0, f64::NAN, f64::INFINITY] {
+            let delay = policy.delay(u32::MAX, FailureClass::Transient, sample);
+            assert!(delay <= policy.max_delay);
+            assert!(delay >= policy.max_delay / 2);
+        }
     }
 
     proptest! {

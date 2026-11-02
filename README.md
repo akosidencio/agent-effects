@@ -10,7 +10,7 @@
 
 [![crates.io](https://img.shields.io/crates/v/agent-effects.svg)](https://crates.io/crates/agent-effects)
 [![docs.rs](https://img.shields.io/docsrs/agent-effects)](https://docs.rs/agent-effects)
-[![Version: 0.2.0 (unreleased)](https://img.shields.io/badge/Version-v0.2.0--unreleased-blue)](CHANGELOG.md)
+[![Version: 0.2.0](https://img.shields.io/badge/Version-v0.2.0-blue)](CHANGELOG.md)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT_OR_Apache--2.0-blue.svg)](#license)
 [![Rust: 2024 Edition](https://img.shields.io/badge/Rust-2024_Edition-orange?logo=rust)](Cargo.toml)
 [![MSRV: Rust 1.90](https://img.shields.io/badge/MSRV-1.90%2B-orange?logo=rust)](#rust-crates-and-storage-backends)
@@ -253,6 +253,8 @@ MSRV: Rust 1.90; `agent-effects-sqlite`, `agent-effects-postgres` and `agent-eff
 - [Operator CLI](crates/agent-effects-cli/README.md)
 - [Observability: metrics, alerts and traces](guides/observability.md)
 - [Benchmarks and how to reproduce them](guides/benchmarks.md)
+- [Production operations](guides/operations.md)
+- [Security disclosure policy](SECURITY.md)
 - [Release changelog](CHANGELOG.md)
 
 ## Development

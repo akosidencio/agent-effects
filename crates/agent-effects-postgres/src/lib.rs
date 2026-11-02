@@ -689,7 +689,7 @@ impl EffectStore for PostgresStore {
             .iter()
             .map(|row| {
                 let json: Value = get(row, "observation")?;
-                serde_json::from_value(json).map_err(StoreError::backend)
+                serde_json::from_value(json).map_err(|_| corrupt("late observation JSON", ""))
             })
             .collect::<Result<_, _>>()?;
         session.finish().await?;
@@ -980,7 +980,7 @@ fn decode_record(row: &PgRow) -> Result<EffectRecord, StoreError> {
         execution_contract: get::<Option<Value>>(row, "execution_contract")?
             .map(serde_json::from_value)
             .transpose()
-            .map_err(StoreError::backend)?,
+            .map_err(|_| corrupt("execution contract JSON", ""))?,
         input_schema_version: u32::try_from(get::<i64>(row, "input_schema_version")?)
             .map_err(StoreError::backend)?,
         output_schema_version: u32::try_from(get::<i64>(row, "output_schema_version")?)
@@ -991,7 +991,7 @@ fn decode_record(row: &PgRow) -> Result<EffectRecord, StoreError> {
         last_error: get::<Option<Value>>(row, "last_error")?
             .map(serde_json::from_value::<ErrorRecord>)
             .transpose()
-            .map_err(StoreError::backend)?,
+            .map_err(|_| corrupt("error JSON", ""))?,
         created_by: get(row, "created_by")?,
         attempt_count: to_u32(get(row, "attempt_count")?)?,
         may_have_applied: get(row, "may_have_applied")?,
@@ -1039,10 +1039,8 @@ where
     row.try_get(column).map_err(StoreError::backend)
 }
 
-fn corrupt(column: &str, value: &str) -> StoreError {
-    StoreError::backend(format!(
-        "unreadable {column} in effects database: {value:?}"
-    ))
+fn corrupt(column: &str, _value: &str) -> StoreError {
+    StoreError::backend(format!("unreadable {column} in effects database"))
 }
 
 fn json<T: serde::Serialize>(value: Option<&T>) -> Result<Option<Value>, StoreError> {

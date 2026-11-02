@@ -53,6 +53,57 @@ fn uuid_like() -> String {
     agent_effects::EffectId::new().to_string().replace('-', "")
 }
 
+#[tokio::test]
+async fn corrupt_stored_columns_fail_closed_without_echoing_their_contents() {
+    let Some(url) = url() else { return };
+    let store = fresh(&url, ClockSource::Database).await;
+    for (column, value) in [
+        ("status", "'secret-corrupt-value'"),
+        ("kind", "'secret-corrupt-value'"),
+        ("attempt_count", "-1"),
+        ("compensation_attempts", "-1"),
+        ("lease_epoch", "-1"),
+        ("version", "-1"),
+        ("input_schema_version", "-1"),
+        ("execution_contract", "'{}'::jsonb"),
+        ("last_error", "'{}'::jsonb"),
+        (
+            "last_error",
+            r#"'{"class":{"class":"secret-corrupt-value"},"message":"hidden"}'::jsonb"#,
+        ),
+    ] {
+        let key = EffectKey::new(
+            EffectName::new("corrupt.record").unwrap(),
+            LogicalKey::new(column).unwrap(),
+        );
+        let record = store
+            .insert_or_get(NewEffect::new(
+                key,
+                EffectKind::IrreversibleWrite,
+                SystemTime::now(),
+            ))
+            .await
+            .unwrap()
+            .record;
+        // Only fixed test identifiers and expressions are interpolated.
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE effects SET {column} = {value} WHERE id = $1"
+        )))
+        .bind(*record.id.as_uuid())
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let error = store.get(record.id).await.unwrap_err();
+        assert!(!error.to_string().contains("secret-corrupt-value"));
+        assert!(store.list(ListQuery::statuses([])).await.is_err());
+        sqlx::query("DELETE FROM effects WHERE id = $1")
+            .bind(*record.id.as_uuid())
+            .execute(store.pool())
+            .await
+            .unwrap();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn passes_the_conformance_suite() {
     let Some(url) = url() else { return };
