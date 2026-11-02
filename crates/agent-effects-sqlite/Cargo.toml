@@ -1,6 +1,6 @@
 [package]
 # This matrix shares workspace-only test fixtures; keep package tests self-contained.
-exclude = ["tests/reliability_matrix.rs"]
+exclude = ["tests/reliability_matrix.rs", "tests/concurrent_recovery.rs"]
 name = "agent-effects-sqlite"
 description = "SQLite store for agent-effects"
 keywords = ["agents", "idempotency", "side-effects", "sqlite"]

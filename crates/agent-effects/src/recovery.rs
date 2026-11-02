@@ -4,16 +4,54 @@
 //!   finishes every unsettled effect that has a registered
 //!   [handler](crate::handler) from its stored input. Closure effects are
 //!   not durable, so they wait for a caller to re-run them;
+//! - [`RecoveryConfig`] bounds how many effects one pass works on at once;
 //! - [`Runtime::pending`] lists the effects waiting for a caller or an
 //!   operator;
 //! - [`Runtime::resolve`] records an operator's decision.
+//!
+//! # Concurrency
+//!
+//! By default a pass works on one effect at a time, as v0.2.0 did, so one
+//! slow handler holds up every effect behind it.
+//! [`RecoveryConfig::max_concurrency`] lets a pass work on several at once:
+//!
+//! ```
+//! use agent_effects::{RecoveryConfig, Runtime};
+//! use agent_effects_memory::MemoryStore;
+//!
+//! let runtime = Runtime::builder(MemoryStore::new())
+//!     .recovery(RecoveryConfig::SEQUENTIAL.max_concurrency(8).batch_size(200))
+//!     .build();
+//! ```
+//!
+//! Concurrency changes how fast a backlog drains, never what happens to an
+//! effect: each one is still worked on only under its lease, so two passes,
+//! in one process or many, cannot both act on it. A pass never holds more
+//! than `max_concurrency` effects in flight or more than one page of
+//! `batch_size` records in memory. Every in-flight effect may use a store
+//! connection, and so may its lease renewals: keep `max_concurrency` below
+//! the store's connection pool size.
+//!
+//! # Shutdown
+//!
+//! [`Runtime::run_recovery_until`] stops at a signal: the pass under way
+//! starts nothing new and waits for the effects it already started. Each
+//! effect runs on a task of its own, so dropping a recovery future (or
+//! aborting its task) never interrupts an effect between its action and
+//! the record of its result; it only stops waiting for it. An effect cut
+//! short by the process exiting is recovered like any other crash.
 
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::{Pin, pin};
+use std::task::{Context, Waker};
 use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::{Value, json};
+use tokio::task::{JoinError, JoinSet};
 use tokio::time::MissedTickBehavior;
-use tracing::{info, warn};
+use tracing::{Instrument, Span, info, warn};
 
 use crate::error::RuntimeError;
 use crate::id::EffectId;
@@ -23,10 +61,60 @@ use crate::store::{
     EffectRecord, EffectStore, ErrorRecord, ListQuery, StoreError, TransitionRequest,
 };
 
-/// Page size for recovery scans.
-const PAGE: usize = 100;
+/// How a recovery pass schedules its work. See [concurrency](self#concurrency).
+///
+/// Set it with [`RuntimeBuilder::recovery`](crate::RuntimeBuilder::recovery)
+/// for [`Runtime::recover`] and [`Runtime::run_recovery`], or pass one to
+/// [`Runtime::recover_with`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecoveryConfig {
+    max_concurrency: usize,
+    batch_size: usize,
+}
+
+impl RecoveryConfig {
+    /// One effect at a time, scanning 100 records per page: the behavior of
+    /// v0.2.0, and the default.
+    pub const SEQUENTIAL: Self = Self {
+        max_concurrency: 1,
+        batch_size: 100,
+    };
+
+    /// Works on up to `max` effects at once. `0` is treated as `1`.
+    #[must_use]
+    pub const fn max_concurrency(mut self, max: usize) -> Self {
+        self.max_concurrency = if max == 0 { 1 } else { max };
+        self
+    }
+
+    /// Reads `size` records per store scan. `0` is treated as `1`.
+    #[must_use]
+    pub const fn batch_size(mut self, size: usize) -> Self {
+        self.batch_size = if size == 0 { 1 } else { size };
+        self
+    }
+
+    /// The most effects a pass works on at once.
+    pub const fn concurrency_limit(&self) -> usize {
+        self.max_concurrency
+    }
+
+    /// Records read per store scan.
+    pub const fn page_size(&self) -> usize {
+        self.batch_size
+    }
+}
+
+impl Default for RecoveryConfig {
+    fn default() -> Self {
+        Self::SEQUENTIAL
+    }
+}
 
 /// What one [`Runtime::recover`] pass did.
+///
+/// With [`RecoveryConfig::max_concurrency`] above 1, effects appear in the
+/// order they finished, not the order they were found.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RecoveryReport {
@@ -47,6 +135,13 @@ pub struct RecoveryReport {
     /// Effects whose handler could not be run, with the reason, e.g. a
     /// stored input that no longer deserializes.
     pub resume_errors: Vec<(EffectId, String)>,
+    /// Effects whose scheduled retry was not due yet. A later pass resumes
+    /// them once it is.
+    pub not_due: Vec<EffectId>,
+    /// The pass stopped early for a shutdown
+    /// ([`Runtime::run_recovery_until`]). Effects it did not reach are left
+    /// for a later pass.
+    pub stopped: bool,
 }
 
 /// An operator's decision about an effect the runtime could not resolve.
@@ -97,82 +192,149 @@ impl<S: EffectStore> Runtime<S> {
     ///    scheduled for later, are left alone. Unsettled closure effects are
     ///    reported as `unhandled`: only a caller can re-run them.
     ///
-    /// Effects are resumed one at a time, so a pass lasts as long as their
-    /// retries and verifications take. Safe to run from several workers at
-    /// once: every change happens under a lease.
+    /// The pass follows the runtime's [`RecoveryConfig`]: by default one
+    /// effect at a time, so a pass lasts as long as their retries and
+    /// verifications take. Safe to run from several workers at once: every
+    /// change happens under a lease.
     ///
     /// # Errors
     ///
     /// [`RuntimeError::Store`] if the store fails. Progress made before the
-    /// failure is kept. A handler that cannot run is reported in
+    /// failure is kept, and effects already started are waited for before
+    /// the error is returned. A handler that cannot run is reported in
     /// `resume_errors` instead.
     pub async fn recover(&self) -> Result<RecoveryReport, RuntimeError> {
+        self.recover_with(self.recovery_config()).await
+    }
+
+    /// [`Self::recover`] with `config` instead of the runtime's own.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::recover`].
+    pub async fn recover_with(
+        &self,
+        config: RecoveryConfig,
+    ) -> Result<RecoveryReport, RuntimeError> {
+        let never = pin!(std::future::pending::<()>());
+        self.recovery_pass(config, &mut Shutdown::new(never)).await
+    }
+
+    async fn recovery_pass<F: Future<Output = ()>>(
+        &self,
+        config: RecoveryConfig,
+        shutdown: &mut Shutdown<'_, F>,
+    ) -> Result<RecoveryReport, RuntimeError> {
         let mut report = RecoveryReport::default();
-        self.mark_abandoned(&mut report).await?;
-        self.resume_pending(&mut report).await?;
+        self.mark_abandoned(config, &mut report, shutdown).await?;
+        if !shutdown.fired() {
+            self.resume_pending(config, &mut report, shutdown).await?;
+        }
+        report.stopped = shutdown.fired();
         Ok(report)
     }
 
-    async fn mark_abandoned(&self, report: &mut RecoveryReport) -> Result<(), RuntimeError> {
+    async fn mark_abandoned<F: Future<Output = ()>>(
+        &self,
+        config: RecoveryConfig,
+        report: &mut RecoveryReport,
+        shutdown: &mut Shutdown<'_, F>,
+    ) -> Result<(), RuntimeError> {
+        let mut tasks = Tasks::new(config.max_concurrency);
+        let mut failure = None;
         let mut after = None;
-        loop {
-            let mut query = ListQuery::expired_leases(self.now()).limit(PAGE);
+        'scan: loop {
+            let mut query = ListQuery::expired_leases(self.now()).limit(config.batch_size);
             if let Some(id) = after {
                 query = query.after(id);
             }
-            let page = self.store().list(query).await?;
-            let full = page.len() == PAGE;
+            let page = match self.store().list(query).await {
+                Ok(page) => page,
+                Err(e) => {
+                    failure = Some(e.into());
+                    break;
+                }
+            };
+            let full = page.len() == config.batch_size;
             after = page.last().map(|record| record.id);
             for record in page {
-                if self.mark_unknown(record.id).await? {
-                    report.marked_unknown.push(record.id);
-                } else {
-                    report.skipped.push(record.id);
+                if !tasks
+                    .wait_for_slot(shutdown, |done| {
+                        note_marked(report, &mut failure, done);
+                    })
+                    .await
+                    || failure.is_some()
+                {
+                    break 'scan;
                 }
+                let runtime = self.clone();
+                let id = record.id;
+                tasks.spawn(id, async move { runtime.mark_unknown(id).await });
             }
-            if !full {
-                return Ok(());
+            if !full || shutdown.check() {
+                break;
             }
         }
+        while let Some(done) = tasks.next().await {
+            note_marked(report, &mut failure, done);
+        }
+        failure.map_or(Ok(()), Err)
     }
 
-    async fn resume_pending(&self, report: &mut RecoveryReport) -> Result<(), RuntimeError> {
+    async fn resume_pending<F: Future<Output = ()>>(
+        &self,
+        config: RecoveryConfig,
+        report: &mut RecoveryReport,
+        shutdown: &mut Shutdown<'_, F>,
+    ) -> Result<(), RuntimeError> {
+        let mut tasks = Tasks::new(config.max_concurrency);
+        let mut failure = None;
         let mut after = None;
-        loop {
-            let page = self.pending(after, PAGE).await?;
-            let full = page.len() == PAGE;
+        'scan: loop {
+            let page = match self.pending(after, config.batch_size).await {
+                Ok(page) => page,
+                Err(e) => {
+                    failure = Some(e);
+                    break;
+                }
+            };
+            let full = page.len() == config.batch_size;
             after = page.last().map(|record| record.id);
             for record in page {
                 let id = record.id;
-                let not_due = record.next_attempt_at.is_some_and(|at| at > self.now());
                 let operator = matches!(
                     record.status,
                     EffectStatus::NeedsIntervention
                         | EffectStatus::CompensationFailed
                         | EffectStatus::AwaitingApproval
                 );
-                if operator || not_due {
+                if operator {
+                    continue;
+                }
+                if record.next_attempt_at.is_some_and(|at| at > self.now()) {
+                    report.not_due.push(id);
                     continue;
                 }
                 let Some(resume) = self.resumer(record.key.name.as_str()) else {
                     report.unhandled.push(id);
                     continue;
                 };
-                match resume(self.clone(), record).await {
-                    Ok(status) => {
-                        info!(effect.id = %id, %status, "recovery resumed effect");
-                        report.resumed.push((id, status));
-                    }
-                    Err(e) => {
-                        warn!(effect.id = %id, error = %e, "recovery could not resume effect");
-                        report.resume_errors.push((id, e.to_string()));
-                    }
+                if !tasks
+                    .wait_for_slot(shutdown, |done| note_resumed(report, done))
+                    .await
+                {
+                    break 'scan;
                 }
+                tasks.spawn(id, resume(self.clone(), record));
             }
-            if !full {
-                return Ok(());
+            if !full || shutdown.check() {
+                break;
             }
         }
+        while let Some(done) = tasks.next().await {
+            note_resumed(report, done);
+        }
+        failure.map_or(Ok(()), Err)
     }
 
     /// Runs [`Self::recover`] every `interval`, forever, followed by
@@ -186,23 +348,70 @@ impl<S: EffectStore> Runtime<S> {
     /// });
     /// ```
     ///
-    /// A failed pass is logged and retried at the next tick.
+    /// A failed pass is logged and retried at the next tick. To stop it
+    /// cleanly, use [`Self::run_recovery_until`].
     pub async fn run_recovery(&self, interval: Duration) {
+        self.run_recovery_until(interval, std::future::pending())
+            .await;
+    }
+
+    /// [`Self::run_recovery`] until `shutdown` completes, for a graceful
+    /// stop. A pass under way when it does starts no further effects, waits
+    /// for those it started, and is the last; no pruning follows it. A
+    /// pass in a store's wait between ticks returns at once.
+    ///
+    /// ```ignore
+    /// let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    /// let worker = tokio::spawn({
+    ///     let runtime = runtime.clone();
+    ///     async move {
+    ///         runtime
+    ///             .run_recovery_until(Duration::from_secs(30), async {
+    ///                 let _ = stopped.await;
+    ///             })
+    ///             .await
+    ///     }
+    /// });
+    /// // On SIGTERM:
+    /// let _ = stop.send(());
+    /// worker.await?;
+    /// ```
+    ///
+    /// Waiting for started effects can take as long as their handlers do;
+    /// bound it with a timeout if needed. Dropping this future is still
+    /// safe: effects in flight finish on their own tasks.
+    pub async fn run_recovery_until(&self, interval: Duration, shutdown: impl Future<Output = ()>) {
+        let signal = pin!(shutdown);
+        let mut shutdown = Shutdown::new(signal);
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
-            ticker.tick().await;
-            match self.recover().await {
-                Ok(report) if !report.marked_unknown.is_empty() || !report.resumed.is_empty() => {
+            if shutdown.wait(ticker.tick()).await.is_none() {
+                return;
+            }
+            match self
+                .recovery_pass(self.recovery_config(), &mut shutdown)
+                .await
+            {
+                Ok(report)
+                    if !report.marked_unknown.is_empty()
+                        || !report.resumed.is_empty()
+                        || !report.resume_errors.is_empty() =>
+                {
                     info!(
                         marked_unknown = report.marked_unknown.len(),
                         resumed = report.resumed.len(),
+                        resume_errors = report.resume_errors.len(),
                         unhandled = report.unhandled.len(),
+                        not_due = report.not_due.len(),
                         "recovery pass"
                     );
                 }
                 Ok(_) => {}
                 Err(e) => warn!(error = %e, "recovery pass failed"),
+            }
+            if shutdown.fired() {
+                return;
             }
             match self.prune().await {
                 Ok(report) if report.total() > 0 => {
@@ -415,5 +624,138 @@ impl<S: EffectStore> Runtime<S> {
             warn!(error = %e, "could not release recovery lease; it will expire");
         }
         marked
+    }
+}
+
+fn note_marked(
+    report: &mut RecoveryReport,
+    failure: &mut Option<RuntimeError>,
+    (id, done): (EffectId, Result<Result<bool, RuntimeError>, JoinError>),
+) {
+    match done {
+        Ok(Ok(true)) => report.marked_unknown.push(id),
+        Ok(Ok(false)) => report.skipped.push(id),
+        Ok(Err(e)) => {
+            failure.get_or_insert(e);
+        }
+        Err(e) => {
+            failure.get_or_insert(RuntimeError::Internal(e.to_string()));
+        }
+    }
+}
+
+fn note_resumed(
+    report: &mut RecoveryReport,
+    (id, done): (
+        EffectId,
+        Result<Result<EffectStatus, RuntimeError>, JoinError>,
+    ),
+) {
+    match done.unwrap_or_else(|e| Err(RuntimeError::Internal(e.to_string()))) {
+        Ok(status) => {
+            info!(effect.id = %id, %status, "recovery resumed effect");
+            report.resumed.push((id, status));
+        }
+        Err(e) => {
+            warn!(effect.id = %id, error = %e, "recovery could not resume effect");
+            report.resume_errors.push((id, e.to_string()));
+        }
+    }
+}
+
+/// The effects a pass is working on, each on a task of its own, at most
+/// `limit` at once. Dropping it aborts the tasks, which only stops waiting:
+/// an effect's attempt runs on a task the runtime spawned beneath it.
+struct Tasks<T> {
+    set: JoinSet<T>,
+    ids: HashMap<tokio::task::Id, EffectId>,
+    limit: usize,
+}
+
+impl<T: Send + 'static> Tasks<T> {
+    fn new(limit: usize) -> Self {
+        Self {
+            set: JoinSet::new(),
+            ids: HashMap::new(),
+            limit,
+        }
+    }
+
+    fn spawn(&mut self, id: EffectId, task: impl Future<Output = T> + Send + 'static) {
+        let handle = self.set.spawn(task.instrument(Span::current()));
+        self.ids.insert(handle.id(), id);
+    }
+
+    /// The next task to finish, or `None` once none are left.
+    async fn next(&mut self) -> Option<(EffectId, Result<T, JoinError>)> {
+        let joined = self.set.join_next_with_id().await?;
+        let task = match &joined {
+            Ok((task, _)) => *task,
+            Err(e) => e.id(),
+        };
+        let id = self.ids.remove(&task)?;
+        Some((id, joined.map(|(_, output)| output)))
+    }
+
+    /// Waits, handing each finished task to `done`, until there is room for
+    /// another. Returns `false` if `shutdown` fired: start nothing more.
+    async fn wait_for_slot<F: Future<Output = ()>>(
+        &mut self,
+        shutdown: &mut Shutdown<'_, F>,
+        mut done: impl FnMut((EffectId, Result<T, JoinError>)),
+    ) -> bool {
+        while self.set.len() >= self.limit {
+            match shutdown.wait(self.next()).await {
+                Some(Some(finished)) => done(finished),
+                Some(None) => break,
+                None => return false,
+            }
+        }
+        !shutdown.check()
+    }
+}
+
+/// A shutdown signal that may be checked any number of times, also after
+/// it fired.
+struct Shutdown<'a, F> {
+    signal: Pin<&'a mut F>,
+    fired: bool,
+}
+
+impl<'a, F: Future<Output = ()>> Shutdown<'a, F> {
+    fn new(signal: Pin<&'a mut F>) -> Self {
+        Self {
+            signal,
+            fired: false,
+        }
+    }
+
+    fn fired(&self) -> bool {
+        self.fired
+    }
+
+    /// Whether the signal has fired, without waiting.
+    fn check(&mut self) -> bool {
+        if !self.fired {
+            let mut cx = Context::from_waker(Waker::noop());
+            self.fired = self.signal.as_mut().poll(&mut cx).is_ready();
+        }
+        self.fired
+    }
+
+    /// `work`'s output, or `None` if the signal fires first.
+    async fn wait<T>(&mut self, work: impl Future<Output = T>) -> Option<T> {
+        if self.fired {
+            return None;
+        }
+        let signal = &mut self.signal;
+        tokio::select! {
+            biased;
+            () = signal.as_mut() => {
+                self.fired = true;
+                None
+            }
+            output = work => Some(output),
+        }
     }
 }

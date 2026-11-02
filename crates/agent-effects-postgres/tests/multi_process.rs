@@ -14,7 +14,7 @@ use agent_effects::store::ListQuery;
 use agent_effects::store::{ExecutionContract, NewEffect};
 use agent_effects::{
     EffectContext, EffectFailure, EffectHandler, EffectKey, EffectKind, EffectName, EffectOutcome,
-    EffectStatus, EffectStore, Handler, LogicalKey, Runtime, WorkerId,
+    EffectStatus, EffectStore, Handler, LogicalKey, RecoveryConfig, Runtime, WorkerId,
 };
 use agent_effects_postgres::PostgresStore;
 use sqlx::Executor;
@@ -22,6 +22,8 @@ use sqlx::postgres::PgConnectOptions;
 
 const WORKER_ENV: &str = "AGENT_EFFECTS_POSTGRES_WORKER";
 const RECOVERY_ENV: &str = "AGENT_EFFECTS_RECOVERY_ONLY";
+/// Effects each recovery process works on at once; unset is sequential.
+const CONCURRENCY_ENV: &str = "AGENT_EFFECTS_RECOVERY_CONCURRENCY";
 const EFFECTS: u32 = 150;
 const WORKERS: usize = 3;
 
@@ -139,9 +141,15 @@ fn worker() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
             if std::env::var_os(RECOVERY_ENV).is_some() {
+                let config =
+                    std::env::var(CONCURRENCY_ENV).map_or(RecoveryConfig::SEQUENTIAL, |n| {
+                        RecoveryConfig::SEQUENTIAL
+                            .max_concurrency(n.parse().unwrap())
+                            .batch_size(16)
+                    });
                 tokio::time::timeout(Duration::from_secs(60), async {
                     loop {
-                        let report = rt.recover().await.unwrap();
+                        let report = rt.recover_with(config).await.unwrap();
                         assert!(report.resume_errors.is_empty(), "{report:?}");
                         if Path::new(&dir).join(format!("claimed-{name}")).exists() {
                             break;
@@ -256,6 +264,17 @@ async fn processes_sharing_a_database_run_each_effect_once() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recovery_processes_share_durable_pending_intents_without_duplicate_actions() {
+    recovery_processes(None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_recovery_processes_share_durable_pending_intents_without_duplicate_actions() {
+    recovery_processes(Some(8)).await;
+}
+
+/// Several recovery processes, each working on `concurrency` effects at
+/// once (sequentially for `None`), share one backlog of durable intents.
+async fn recovery_processes(concurrency: Option<usize>) {
     let Ok(url) = std::env::var("AGENT_EFFECTS_POSTGRES_URL") else {
         assert!(
             std::env::var_os("AGENT_EFFECTS_REQUIRE_POSTGRES").is_none(),
@@ -301,6 +320,7 @@ async fn recovery_processes_share_durable_pending_intents_without_duplicate_acti
                     format!("{url}|{schema}|{}|recover-{index}", dir.display()),
                 )
                 .env(RECOVERY_ENV, "1")
+                .envs(concurrency.map(|n| (CONCURRENCY_ENV, n.to_string())))
                 .spawn()
                 .unwrap(),
         );

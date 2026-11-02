@@ -35,6 +35,7 @@ use crate::id::{EffectId, EffectName, WorkerId};
 use crate::kind::EffectKind;
 use crate::observer::{EffectObserver, Observation};
 use crate::policy::{RiskPolicy, UnknownPlan};
+use crate::recovery::RecoveryConfig;
 use crate::redaction::{Field, Redactor};
 use crate::retention::RetentionPolicy;
 use crate::retry::RetryPolicy;
@@ -65,6 +66,7 @@ struct Inner<S> {
     redactor: Option<Arc<dyn Redactor>>,
     observers: Vec<Arc<dyn EffectObserver>>,
     retention: RetentionPolicy,
+    recovery: RecoveryConfig,
     #[cfg(feature = "fault-injection")]
     faults: Option<Arc<FaultInjector>>,
 }
@@ -91,11 +93,20 @@ pub struct RuntimeBuilder<S> {
     redactor: Option<Arc<dyn Redactor>>,
     observers: Vec<Arc<dyn EffectObserver>>,
     retention: RetentionPolicy,
+    recovery: RecoveryConfig,
     #[cfg(feature = "fault-injection")]
     faults: Option<Arc<FaultInjector>>,
 }
 
 impl<S: EffectStore> RuntimeBuilder<S> {
+    /// How [`Runtime::recover`] and [`Runtime::run_recovery`] schedule their
+    /// work; see [`RecoveryConfig`]. Defaults to
+    /// [`RecoveryConfig::SEQUENTIAL`], one effect at a time.
+    pub fn recovery(mut self, config: RecoveryConfig) -> Self {
+        self.recovery = config;
+        self
+    }
+
     /// How long settled records are kept before [`Runtime::prune`] (and
     /// every round of [`Runtime::run_recovery`]) deletes them; see
     /// [`retention`](crate::retention). Defaults to keeping them forever.
@@ -208,6 +219,7 @@ impl<S: EffectStore> RuntimeBuilder<S> {
                 redactor: self.redactor,
                 observers: self.observers,
                 retention: self.retention,
+                recovery: self.recovery,
                 #[cfg(feature = "fault-injection")]
                 faults: self.faults,
             }),
@@ -251,6 +263,7 @@ impl<S: EffectStore> Runtime<S> {
             redactor: None,
             observers: Vec::new(),
             retention: RetentionPolicy::KEEP_ALL,
+            recovery: RecoveryConfig::SEQUENTIAL,
             #[cfg(feature = "fault-injection")]
             faults: None,
         }
@@ -395,6 +408,10 @@ impl<S: EffectStore> Runtime<S> {
 
     pub(crate) fn retention(&self) -> RetentionPolicy {
         self.inner.retention
+    }
+
+    pub(crate) fn recovery_config(&self) -> RecoveryConfig {
+        self.inner.recovery
     }
 
     pub(crate) fn lease_ttl(&self) -> Duration {
