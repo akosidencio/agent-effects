@@ -103,8 +103,8 @@ jobs:
             target
           key: msrv-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: msrv-${{ runner.os }}-
-      - name: Rust 1.90 (all crates but the SQL stores and the CLI)
-        run: cargo +1.90 test --workspace --exclude agent-effects-sqlite --exclude agent-effects-postgres --exclude agent-effects-cli --all-features --locked
+      - name: Rust 1.90 (crates without SQL dependencies)
+        run: cargo +1.90 test --workspace --exclude agent-effects-sqlite --exclude agent-effects-postgres --exclude agent-effects-cli --exclude agent-effects-bench --all-features --locked
       - name: Rust 1.94 (agent-effects-sqlite, agent-effects-postgres, agent-effects-cli)
         # The Postgres tests skip here; the postgres job runs them for real.
         run: cargo +1.94 test -p agent-effects-sqlite -p agent-effects-postgres -p agent-effects-cli --locked
@@ -161,6 +161,31 @@ jobs:
       # then the operator CLI against both.
       - run: cargo +stable test -p agent-effects-postgres --locked
       - run: cargo +stable test -p agent-effects-cli --locked --test postgres
+      - name: PostgreSQL benchmark smoke
+        run: cargo +stable run --locked -p agent-effects-bench -- --store postgres --workload recovery --effects 100 --runs 1 --warmup 0
+
+  benchmarks:
+    name: Benchmark smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal --no-self-update
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: benchmarks-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+      - name: Deterministic workloads (performance is measured separately)
+        run: |
+          cargo +stable build --locked -p agent-effects-bench
+          for store in memory sqlite; do
+            for workload in unique duplicate transitions lease-contention recovery retry retry-holding-leases compensation prune; do
+              target/debug/agent-effects-bench --store "$store" --workload "$workload" --effects 100 --runs 1 --warmup 0 --backoff-ms 50
+            done
+          done
 
   docs:
     name: Docs
@@ -210,7 +235,7 @@ jobs:
   ci-pass:
     name: CI pass
     if: always()
-    needs: [fmt, clippy, test, msrv, postgres, docs, package]
+    needs: [fmt, clippy, test, msrv, postgres, benchmarks, docs, package]
     runs-on: ubuntu-latest
     steps:
       - name: All jobs succeeded

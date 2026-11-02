@@ -407,9 +407,9 @@ pub async fn recovery<S: EffectStore + Clone>(store: S, p: &Params) -> Measured 
 }
 
 /// Every effect fails transiently once, then succeeds after `backoff`, with
-/// a 300 ms lease: backoffs of 300 ms or more are waited out without the
-/// lease. With `hold_leases`, the lease is kept (and renewed every 100 ms)
-/// through the wait instead.
+/// a 300 ms lease. Explicit thresholds exercise lease-free scheduling even
+/// with the shorter backoffs used by smoke checks. With `hold_leases`, the
+/// lease is kept (and renewed every 100 ms) through the wait instead.
 pub async fn retry<S: EffectStore + Clone>(store: S, p: &Params, hold_leases: bool) -> Measured {
     let policy = RetryPolicy {
         max_attempts: 2,
@@ -418,12 +418,14 @@ pub async fn retry<S: EffectStore + Clone>(store: S, p: &Params, hold_leases: bo
         multiplier: 1.0,
         jitter: false,
     };
-    let mut builder = Runtime::builder(store.clone())
+    let builder = Runtime::builder(store.clone())
         .retry_policy(policy)
-        .lease_ttl(Duration::from_millis(300));
-    if hold_leases {
-        builder = builder.lease_free_backoff(Duration::MAX);
-    }
+        .lease_ttl(Duration::from_millis(300))
+        .lease_free_backoff(if hold_leases {
+            Duration::MAX
+        } else {
+            Duration::ZERO
+        });
     let rt = builder.build();
     let executions = Arc::new(AtomicU32::new(0));
     let (wall, latencies) = timed(p.effects, p.concurrency, {
@@ -531,6 +533,11 @@ pub async fn prune<S: EffectStore + Clone>(store: S, p: &Params) -> Measured {
     let started = Instant::now();
     let report = rt.prune().await.unwrap();
     let wall = started.elapsed();
+    assert_eq!(
+        report.total(),
+        p.effects as u64,
+        "records were not all pruned"
+    );
     Measured {
         wall,
         latencies: Vec::new(),

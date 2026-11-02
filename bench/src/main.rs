@@ -35,13 +35,13 @@ struct Args {
     #[arg(long, value_enum)]
     workload: Workload,
     /// Effects (or operations) per run.
-    #[arg(long, default_value_t = 1000)]
+    #[arg(long, default_value_t = 1000, value_parser = positive)]
     effects: usize,
     /// Concurrent callers, or recovery slots.
-    #[arg(long, default_value_t = 16)]
+    #[arg(long, default_value_t = 16, value_parser = positive)]
     concurrency: usize,
     /// Measured runs.
-    #[arg(long, default_value_t = 3)]
+    #[arg(long, default_value_t = 3, value_parser = positive)]
     runs: usize,
     /// Untimed warm-up runs before the measured ones, on their own store.
     #[arg(long, default_value_t = 1)]
@@ -90,6 +90,13 @@ enum Workload {
     Compensation,
     /// Deleting settled effects with a retention policy.
     Prune,
+}
+
+fn positive(text: &str) -> Result<usize, String> {
+    match text.parse::<usize>() {
+        Ok(n) if n > 0 => Ok(n),
+        _ => Err("must be a positive integer".into()),
+    }
 }
 
 fn main() {
@@ -157,6 +164,11 @@ async fn run(args: Args) {
             continue;
         }
         println!("{record}");
+        assert_eq!(
+            record["duplicate_side_effects"], 0,
+            "duplicate external actions"
+        );
+        assert_eq!(record["unresolved"], 0, "workload left unresolved effects");
         summaries.push(record);
     }
     summarize(&args, &summaries);
