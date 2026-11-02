@@ -7,7 +7,7 @@
 //! application configures a redactor.
 
 use std::fmt::Write as _;
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_effects::store::{EffectEvent, LateObservation};
 use agent_effects::{EffectRecord, EffectStatus};
@@ -16,9 +16,18 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 pub(crate) fn timestamp(at: SystemTime) -> String {
-    OffsetDateTime::from(at)
-        .format(&Rfc3339)
-        .unwrap_or_else(|_| format!("{at:?}"))
+    // Stored timestamps can be outside time's calendar range. Its From
+    // conversion panics there, before a formatting fallback can run.
+    let nanos = match at.duration_since(UNIX_EPOCH) {
+        Ok(after) => i128::try_from(after.as_nanos()).ok(),
+        Err(before) => i128::try_from(before.duration().as_nanos())
+            .ok()
+            .map(|nanos| -nanos),
+    };
+    nanos
+        .and_then(|nanos| OffsetDateTime::from_unix_timestamp_nanos(nanos).ok())
+        .and_then(|at| at.format(&Rfc3339).ok())
+        .unwrap_or_else(|| format!("{at:?}"))
 }
 
 fn optional_time(at: Option<SystemTime>) -> Value {
@@ -192,5 +201,23 @@ fn cell(value: &Value) -> String {
         Value::Null => "-".into(),
         Value::String(s) => s.clone(),
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod timestamp_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn timestamps_outside_the_calendar_range_have_a_safe_fallback() {
+        assert_eq!(timestamp(UNIX_EPOCH), "1970-01-01T00:00:00Z");
+        let delta = Duration::from_millis(i64::MAX.unsigned_abs());
+        for at in [UNIX_EPOCH.checked_add(delta), UNIX_EPOCH.checked_sub(delta)]
+            .into_iter()
+            .flatten()
+        {
+            assert_eq!(timestamp(at), format!("{at:?}"));
+        }
     }
 }

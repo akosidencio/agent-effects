@@ -40,7 +40,6 @@ jobs:
   compatibility:
     name: v0.2.0 consumer and database compatibility
     runs-on: ubuntu-latest
-    timeout-minutes: 30
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -208,7 +207,6 @@ jobs:
   benchmarks:
     name: Benchmark smoke
     runs-on: ubuntu-latest
-    timeout-minutes: 30
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0

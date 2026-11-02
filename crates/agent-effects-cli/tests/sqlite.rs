@@ -47,6 +47,30 @@ impl Fixture {
 }
 
 #[tokio::test]
+async fn inspecting_extreme_stored_timestamps_does_not_panic() {
+    let fixture = fixture().await;
+    for millis in [i64::MIN, i64::MAX] {
+        sqlx::query("UPDATE effects SET updated_at = ?, next_attempt_at = ? WHERE id = ?")
+            .bind(millis)
+            .bind(millis)
+            .bind(fixture.ids.awaiting.to_string())
+            .execute(fixture.store.pool())
+            .await
+            .unwrap();
+        let result = fixture
+            .run(&[
+                "--format",
+                "json",
+                "inspect",
+                &fixture.ids.awaiting.to_string(),
+            ])
+            .await;
+        assert_eq!(result.code, exit::OK, "{}", result.err);
+        assert!(result.json()["updated_at"].is_string());
+    }
+}
+
+#[tokio::test]
 async fn list_filters_by_status_and_pages_by_id() {
     let f = fixture().await;
     let all = f.run(&["--format", "json", "list"]).await;
