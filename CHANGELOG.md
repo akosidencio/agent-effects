@@ -19,11 +19,29 @@ break the API or storage format.
   already started.
 - `RecoveryReport::not_due` (scheduled retries a pass left for later) and
   `RecoveryReport::stopped` (the pass ended early for a shutdown).
+- Lease-free retry scheduling. A retry backoff at least
+  `RuntimeBuilder::lease_free_backoff` long (default: a third of the lease
+  TTL) is waited out without the lease: the retry's time is stored first,
+  the lease released, and a fresh lease taken, with the record re-read, when
+  it is due. No lease renewals during long backoffs, and a worker that dies
+  meanwhile leaves nothing to expire. `Duration::MAX` keeps 0.2.0's
+  behavior. Compensation retries are scheduled the same way.
+- `FaultPoint::AfterRetryScheduled` and `FaultPoint::AfterBackoffLeaseReleased`
+  for crash tests.
+- Store conformance: a scheduled retry survives releasing and retaking the
+  lease, and is visible to pending scans while nobody holds it.
 
 ### Changed
 
 - A recovery pass that hits a store error now waits for the effects it
   already started before returning the error.
+- A recovery pass no longer waits through a long retry backoff while
+  holding a slot: it stores the retry and reports the effect as `Pending`,
+  and a later pass resumes it once due.
+- A call that waited out a backoff without the lease and finds another
+  worker running the retry waits for that worker and reports its outcome,
+  instead of returning `InProgress`. While a retry waits without its lease,
+  `Runtime::wait` reports it `InProgress` immediately.
 
 ## [0.2.0]
 

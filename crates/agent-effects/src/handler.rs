@@ -440,6 +440,7 @@ async fn resume<S: EffectStore, H: EffectHandler>(
             actor: Some(format!("recovery:{}", runtime.worker_id())),
             retry: handler.effect.retry_policy(),
             attempt_timeout: handler.effect.attempt_timeout(),
+            return_on_backoff: true,
         };
         runtime.compensate_effect(spec, compensate).await?;
         let settled = runtime
@@ -535,6 +536,9 @@ async fn run<S: EffectStore, H: EffectHandler>(
         risk: effect.risk(),
         automatic_retry: true,
         input_stored: stored.from_record,
+        // Only recovery resumes from a record; it comes back for a retry
+        // once it is due instead of holding a slot until then.
+        return_on_backoff: stored.from_record,
     };
     let action = {
         let (effect, input) = (Arc::clone(&effect), Arc::clone(&input));
@@ -609,6 +613,7 @@ impl<'a, S: EffectStore, H: EffectHandler> IntoFuture for CompensationSubmission
                 actor: self.actor,
                 retry: handler.effect.retry_policy(),
                 attempt_timeout: handler.effect.attempt_timeout(),
+                return_on_backoff: false,
             };
             let record = self
                 .runtime

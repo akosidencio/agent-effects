@@ -156,6 +156,8 @@ pub(crate) struct CompensationSpec {
     pub(crate) actor: Option<String>,
     pub(crate) retry: Option<RetryPolicy>,
     pub(crate) attempt_timeout: Option<Duration>,
+    /// Report a retry that is not due yet as in progress (recovery).
+    pub(crate) return_on_backoff: bool,
 }
 
 /// Undoes a closure effect. Created by [`Runtime::compensation`].
@@ -257,6 +259,7 @@ impl<'a, S: EffectStore> CompensationBuilder<'a, S> {
             actor: self.actor,
             retry: self.retry,
             attempt_timeout: self.attempt_timeout,
+            return_on_backoff: false,
         };
         self.runtime.compensate_effect(spec, compensate).await
     }
@@ -308,7 +311,12 @@ impl<S: EffectStore> Runtime<S> {
                     key: spec.key.to_string(),
                 })?;
         tracing::Span::current().record("effect.id", field::display(record.id));
-        for _ in 0..MAX_ROUNDS {
+        // As for effects: a lease-free backoff is not a lost round, and after
+        // one, another holder is waited for (see `Runtime::execute`).
+        let mut lost = 0;
+        let mut waited_out = false;
+        let mut pause = Duration::from_millis(10);
+        while lost < MAX_ROUNDS {
             if let Some(outcome) = observe_compensation(&record) {
                 return Ok(outcome);
             }
@@ -317,6 +325,14 @@ impl<S: EffectStore> Runtime<S> {
                 .await
             {
                 Ok(lease) => lease,
+                Err(StoreError::LeaseHeld { .. }) if waited_out => {
+                    self.pause_for_holder(&mut pause).await;
+                    record = store
+                        .get(record.id)
+                        .await?
+                        .ok_or(StoreError::NotFound(record.id))?;
+                    continue;
+                }
                 Err(StoreError::LeaseHeld { .. }) => {
                     return Ok(CompensationOutcome::InProgress { id: record.id });
                 }
@@ -337,14 +353,22 @@ impl<S: EffectStore> Runtime<S> {
                     return Ok(observe_compensation(&settled)
                         .unwrap_or(CompensationOutcome::InProgress { id: settled.id }));
                 }
-                Err(Interrupt::LeaseLost) => {
-                    record = store
-                        .get(record.id)
-                        .await?
-                        .ok_or(StoreError::NotFound(record.id))?;
+                Err(Interrupt::LeaseLost) => lost += 1,
+                Err(Interrupt::Backoff(at)) => {
+                    if spec.return_on_backoff {
+                        return Ok(CompensationOutcome::InProgress { id: record.id });
+                    }
+                    self.checkpoint(FaultPoint::AfterBackoffLeaseReleased);
+                    self.sleep_until_due(at).await;
+                    waited_out = true;
+                    pause = Duration::from_millis(10);
                 }
                 Err(Interrupt::Error(e)) => return Err(e),
             }
+            record = store
+                .get(record.id)
+                .await?
+                .ok_or(StoreError::NotFound(record.id))?;
         }
         Ok(CompensationOutcome::InProgress { id: record.id })
     }
@@ -363,6 +387,9 @@ impl<S: EffectStore> Runtime<S> {
             // A retry that was scheduled but has not started: it is not an
             // attempt yet. Wait for it, then start it.
             Some(at) => {
+                if let Some(due) = self.lease_free_until(at) {
+                    return Err(Interrupt::Backoff(due));
+                }
                 self.sleep_leased(lease, at).await?;
                 None
             }
@@ -480,6 +507,10 @@ impl<S: EffectStore> Runtime<S> {
                     },
                 )
                 .await?;
+            self.checkpoint(FaultPoint::AfterRetryScheduled);
+            if let Some(due) = self.lease_free_until(at) {
+                return Err(Interrupt::Backoff(due));
+            }
             self.sleep_leased(lease, at).await?;
             record = self
                 .transition_leased(
