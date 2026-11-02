@@ -78,7 +78,9 @@ PostgreSQL. Smoke timings share CI resources and are not performance claims.
 
 Compare recovery with `--concurrency 1` and `16` under the same simulated
 remote latency. Compare retry scheduling with `retry` and
-`retry-holding-leases`: both have the same attempt budget and backoff. The
+`retry-holding-leases`: both have the same attempt budget and backoff.
+Use `--lease-ms 300` with the 1 s backoff to measure renewal pressure on a
+fast store; keep the TTL above the store's worst write latency. The
 lease-free workload explicitly opts into releasing leases for every wait,
 so even short smoke-test delays exercise the scheduler. The production
 default remains the lease TTL. Count duplicate actions and unresolved

@@ -38,6 +38,8 @@ pub struct Params {
     pub prefix: String,
     /// The retry workloads' backoff.
     pub backoff: Duration,
+    /// Retry workload lease TTL, independently configurable for slow stores.
+    pub lease: Duration,
 }
 
 const NO_JITTER: RetryPolicy = RetryPolicy {
@@ -407,9 +409,9 @@ pub async fn recovery<S: EffectStore + Clone>(store: S, p: &Params) -> Measured 
 }
 
 /// Every effect fails transiently once, then succeeds after `backoff`, with
-/// a 300 ms lease. Explicit thresholds exercise lease-free scheduling even
+/// a configurable lease. Explicit thresholds exercise lease-free scheduling even
 /// with the shorter backoffs used by smoke checks. With `hold_leases`, the
-/// lease is kept (and renewed every 100 ms) through the wait instead.
+/// lease is kept and renewed through the wait instead.
 pub async fn retry<S: EffectStore + Clone>(store: S, p: &Params, hold_leases: bool) -> Measured {
     let policy = RetryPolicy {
         max_attempts: 2,
@@ -420,7 +422,7 @@ pub async fn retry<S: EffectStore + Clone>(store: S, p: &Params, hold_leases: bo
     };
     let builder = Runtime::builder(store.clone())
         .retry_policy(policy)
-        .lease_ttl(Duration::from_millis(300))
+        .lease_ttl(p.lease)
         .lease_free_backoff(if hold_leases {
             Duration::MAX
         } else {

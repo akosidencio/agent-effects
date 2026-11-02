@@ -49,9 +49,12 @@ struct Args {
     /// Simulated remote latency inside each action, in milliseconds.
     #[arg(long, default_value_t = 0)]
     work_ms: u64,
-    /// The retry workloads' backoff, in milliseconds (the lease is 300 ms).
+    /// The retry workloads' backoff, in milliseconds.
     #[arg(long, default_value_t = 1000)]
     backoff_ms: u64,
+    /// Retry workload lease TTL; keep above the store's worst write latency.
+    #[arg(long, default_value_t = 30_000)]
+    lease_ms: u64,
     /// Where SQLite files go. Use a real disk: tmpfs skips fsync.
     #[arg(long, default_value = "target/bench-data")]
     data_dir: PathBuf,
@@ -123,6 +126,7 @@ async fn run(args: Args) {
             work: Duration::from_millis(args.work_ms),
             prefix: format!("r{round}"),
             backoff: Duration::from_millis(args.backoff_ms),
+            lease: Duration::from_millis(args.lease_ms),
         };
         let record = match args.store {
             Store::Memory => measure(Counted::new(MemoryStore::new()), &args, &params).await,
@@ -232,6 +236,7 @@ async fn measure<S: EffectStore + Clone>(
         "concurrency": params.concurrency,
         "work_ms": args.work_ms,
         "backoff_ms": args.backoff_ms,
+        "lease_ms": args.lease_ms,
         "wall_s": measured.wall.as_secs_f64(),
         "throughput_per_s": throughput,
         "latency_ms": {
