@@ -23,7 +23,7 @@ sqlx = { workspace = true, features = ["postgres", "time", "uuid", "json"] }
 time.workspace = true
 
 [dev-dependencies]
-agent-effects = { workspace = true, features = ["testkit"] }
+agent-effects = { workspace = true, features = ["testkit", "fault-injection"] }
 agent-effects-store = { workspace = true, features = ["testkit"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
 
