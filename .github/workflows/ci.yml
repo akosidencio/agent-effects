@@ -92,8 +92,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Keep in sync with `rust-version` in Cargo.toml and
-      # crates/agent-effects-sqlite/Cargo.toml (sqlx 0.9 needs 1.94).
+      # Keep in sync with `rust-version` in Cargo.toml and the crates that
+      # depend on sqlx 0.9, which needs 1.94: the SQL stores and the CLI.
       - run: rustup toolchain install 1.90 1.94 --profile minimal --no-self-update
       - uses: actions/cache@v4
         with:
@@ -103,11 +103,11 @@ jobs:
             target
           key: msrv-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: msrv-${{ runner.os }}-
-      - name: Rust 1.90 (all crates but the SQL stores)
-        run: cargo +1.90 test --workspace --exclude agent-effects-sqlite --exclude agent-effects-postgres --all-features --locked
-      - name: Rust 1.94 (agent-effects-sqlite, agent-effects-postgres)
+      - name: Rust 1.90 (all crates but the SQL stores and the CLI)
+        run: cargo +1.90 test --workspace --exclude agent-effects-sqlite --exclude agent-effects-postgres --exclude agent-effects-cli --all-features --locked
+      - name: Rust 1.94 (agent-effects-sqlite, agent-effects-postgres, agent-effects-cli)
         # The Postgres tests skip here; the postgres job runs them for real.
-        run: cargo +1.94 test -p agent-effects-sqlite -p agent-effects-postgres --locked
+        run: cargo +1.94 test -p agent-effects-sqlite -p agent-effects-postgres -p agent-effects-cli --locked
 
   postgres:
     name: PostgreSQL
@@ -157,8 +157,10 @@ jobs:
           key: postgres-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: postgres-${{ runner.os }}-
       # Conformance, database clock, lock-skipping scans, the runtime, three
-      # worker processes on one database, a schema of its own, and PgBouncer.
+      # worker processes on one database, a schema of its own, and PgBouncer;
+      # then the operator CLI against both.
       - run: cargo +stable test -p agent-effects-postgres --locked
+      - run: cargo +stable test -p agent-effects-cli --locked --test postgres
 
   docs:
     name: Docs

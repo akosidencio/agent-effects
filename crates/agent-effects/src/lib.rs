@@ -91,7 +91,7 @@ pub use handler::{
 pub use observer::{EffectObserver, Observation};
 pub use payload::{PayloadError, PayloadSchema};
 pub use policy::{Capabilities, PolicyBuilder, Requirements, RiskLevel, RiskPolicy, UnknownPlan};
-pub use recovery::{RecoveryConfig, RecoveryReport, Resolution};
+pub use recovery::{OperatorDecision, RecoveryConfig, RecoveryReport, Resolution};
 pub use redaction::{RedactKeys, Redactor, Secret};
 pub use retention::{PruneReport, RetentionPolicy};
 pub use retry::RetryPolicy;

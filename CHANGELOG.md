@@ -30,6 +30,18 @@ break the API or storage format.
   for crash tests.
 - Store conformance: a scheduled retry survives releasing and retaking the
   lease, and is visible to pending scans while nobody holds it.
+- `agent-effects-cli`, an optional crate installing the `agent-effects`
+  operator command for SQLite and PostgreSQL (direct or through PgBouncer):
+  `list`, `pending`, `inspect`, `history`, `late`, `stats`, `approve`,
+  `deny`, `resolve` and `retry`, with JSON output, paging, a read-only mode,
+  read-only connections for inspection, confirmation of writes, operator
+  policies by authenticated database identity, and documented exit codes.
+  It never creates or migrates a database.
+- `OperatorDecision` and `Runtime::{resolve_as, approve_as, deny_as}`: an
+  operator's decision can require the record version the operator reviewed,
+  so a decision is never applied to a state they did not see.
+- `SqliteStore::attach`: use a pool without migrating it, for tools and
+  read-only pools.
 
 ### Changed
 
