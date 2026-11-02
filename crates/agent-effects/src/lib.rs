@@ -88,7 +88,7 @@ pub use error::RuntimeError;
 pub use handler::{
     CompensableEffect, CompensationSubmission, EffectHandler, Handler, Submission, VerifiableEffect,
 };
-pub use observer::{EffectObserver, Observation};
+pub use observer::{EffectObserver, Observation, RuntimeEvent};
 pub use payload::{PayloadError, PayloadSchema};
 pub use policy::{Capabilities, PolicyBuilder, Requirements, RiskLevel, RiskPolicy, UnknownPlan};
 pub use recovery::{OperatorDecision, RecoveryConfig, RecoveryReport, Resolution};

@@ -13,8 +13,8 @@
 //!
 //! - **Short waits** (under
 //!   [`RuntimeBuilder::lease_free_backoff`](crate::RuntimeBuilder::lease_free_backoff),
-//!   a third of the lease TTL by default) keep the lease: they cost no
-//!   renewal.
+//!   the lease TTL by default) keep the lease: they cost at most a few
+//!   renewals, fewer store round trips than releasing and retaking it.
 //! - **Longer waits** release the lease. The caller sleeps without it, then
 //!   takes a fresh lease, re-reads the record and continues from whatever
 //!   it finds: the scheduled retry, or another worker's result. A call that

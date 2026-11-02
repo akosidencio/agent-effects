@@ -33,7 +33,7 @@ const TTL: Duration = Duration::from_secs(30);
 const NAME: &str = "remote.create";
 const RES: &str = "res";
 /// One minute between attempts: well over the default lease-free
-/// threshold (a third of the TTL).
+/// threshold (the lease TTL).
 const MINUTE: RetryPolicy = RetryPolicy {
     max_attempts: 3,
     initial_delay: Duration::from_secs(60),
@@ -176,7 +176,7 @@ async fn a_short_backoff_keeps_the_lease() {
     assert_eq!(
         waiting.live_lease_owner(clock.now()),
         Some(&WorkerId::new("w")),
-        "below the threshold the wait costs no renewal, so the lease is kept"
+        "below the threshold (the lease TTL) the lease is kept"
     );
     assert_eq!(
         call.await.unwrap().unwrap(),

@@ -55,6 +55,7 @@ use tracing::{Instrument, Span, info, warn};
 
 use crate::error::RuntimeError;
 use crate::id::EffectId;
+use crate::observer::RuntimeEvent;
 use crate::runtime::Runtime;
 use crate::state::{EffectStatus, Transition};
 use crate::store::{
@@ -138,6 +139,10 @@ pub struct RecoveryReport {
     /// Effects whose scheduled retry was not due yet. A later pass resumes
     /// them once it is.
     pub not_due: Vec<EffectId>,
+    /// Effects waiting for a person: escalated (`NeedsIntervention`), a
+    /// failed compensation, or awaiting approval. Recovery leaves them
+    /// alone.
+    pub waiting_for_operator: Vec<EffectId>,
     /// The pass stopped early for a shutdown
     /// ([`Runtime::run_recovery_until`]). Effects it did not reach are left
     /// for a later pass.
@@ -278,6 +283,20 @@ impl<S: EffectStore> Runtime<S> {
         config: RecoveryConfig,
         shutdown: &mut Shutdown<'_, F>,
     ) -> Result<RecoveryReport, RuntimeError> {
+        let started = tokio::time::Instant::now();
+        let pass = self.recovery_steps(config, shutdown).await;
+        self.emit(&RuntimeEvent::RecoveryPass {
+            report: pass.as_ref().ok(),
+            duration: started.elapsed(),
+        });
+        pass
+    }
+
+    async fn recovery_steps<F: Future<Output = ()>>(
+        &self,
+        config: RecoveryConfig,
+        shutdown: &mut Shutdown<'_, F>,
+    ) -> Result<RecoveryReport, RuntimeError> {
         let mut report = RecoveryReport::default();
         self.mark_abandoned(config, &mut report, shutdown).await?;
         if !shutdown.fired() {
@@ -322,7 +341,7 @@ impl<S: EffectStore> Runtime<S> {
                 }
                 let runtime = self.clone();
                 let id = record.id;
-                tasks.spawn(id, async move { runtime.mark_unknown(id).await });
+                tasks.spawn(id, async move { runtime.mark_unknown(&record).await });
             }
             if !full || shutdown.check() {
                 break;
@@ -362,6 +381,7 @@ impl<S: EffectStore> Runtime<S> {
                         | EffectStatus::AwaitingApproval
                 );
                 if operator {
+                    report.waiting_for_operator.push(id);
                     continue;
                 }
                 if record.next_attempt_at.is_some_and(|at| at > self.now()) {
@@ -710,14 +730,19 @@ impl<S: EffectStore> Runtime<S> {
 
     /// Moves one effect with an expired lease to `Unknown`. Returns `false`
     /// if someone else got to it first.
-    async fn mark_unknown(&self, id: EffectId) -> Result<bool, RuntimeError> {
-        let store = self.store();
+    async fn mark_unknown(&self, found: &EffectRecord) -> Result<bool, RuntimeError> {
+        let (store, id) = (self.store(), found.id);
         let lease = match store
             .acquire_lease(id, self.worker_id(), self.now(), self.lease_ttl())
             .await
         {
             Ok(lease) => lease,
-            Err(StoreError::LeaseHeld { .. }) => return Ok(false),
+            Err(StoreError::LeaseHeld { .. }) => {
+                self.emit(&RuntimeEvent::LeaseConflict {
+                    name: &found.key.name,
+                });
+                return Ok(false);
+            }
             Err(e) => return Err(e.into()),
         };
         let marked = async {

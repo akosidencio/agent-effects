@@ -20,6 +20,8 @@ agent-effects-store.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx = { workspace = true, features = ["sqlite"] }
+# An in-process write queue (tokio::sync::Mutex is first come, first served).
+tokio = { workspace = true, features = ["sync"] }
 uuid.workspace = true
 
 [dev-dependencies]
