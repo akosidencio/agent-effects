@@ -67,7 +67,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - run: rustup toolchain install nightly --profile minimal --no-self-update
+      - run: rustup toolchain install stable nightly --profile minimal --no-self-update
       - run: cargo +stable install cargo-fuzz --version 0.13.2 --locked
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
