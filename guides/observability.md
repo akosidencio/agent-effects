@@ -67,8 +67,10 @@ are chosen by the application and should stay a small, fixed set (`payment.charg
 | `agent_effects.pruned` | counter, `status`; no effect attributes | Settled records deleted by retention |
 
 Up/down counters record changes seen by each process since it started, so
-their sum across processes drifts after restarts. For exact current levels,
-use the recovery backlog gauge or `agent-effects stats`.
+their sum across processes drifts after restarts. The recovery backlog gauge
+is a per-worker snapshot of what its latest pass encountered, including work
+it subsequently finished; it is not an atomic global queue length. Use
+`agent-effects stats` to inspect stored levels, allowing for concurrent writes.
 
 ## Reading the numbers
 

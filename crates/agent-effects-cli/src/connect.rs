@@ -46,8 +46,9 @@ pub(crate) async fn open(cli: &Cli, write: bool) -> Result<(Store, Identity), Fa
 
 async fn open_sqlite(url: &str, write: bool) -> Result<(Store, Identity), Failure> {
     let options = if url.starts_with("sqlite:") {
-        SqliteConnectOptions::from_str(url)
-            .map_err(|e| Failure::Usage(format!("invalid SQLite URL: {e}")))?
+        SqliteConnectOptions::from_str(url).map_err(|_| {
+            Failure::Usage("invalid SQLite URL; check the connection options".into())
+        })?
     } else {
         SqliteConnectOptions::new().filename(url)
     };
@@ -81,9 +82,12 @@ async fn open_sqlite(url: &str, write: bool) -> Result<(Store, Identity), Failur
 }
 
 async fn open_postgres(cli: &Cli, url: &str, write: bool) -> Result<(Store, Identity), Failure> {
+    // A parser error may quote a secret query value. A malformed authority
+    // cannot be safely redacted as a URL either, so show neither here.
+    let mut options = PgConnectOptions::from_str(url).map_err(|_| {
+        Failure::Usage("invalid PostgreSQL URL; check the connection options".into())
+    })?;
     let shown = redact_url(url);
-    let mut options = PgConnectOptions::from_str(url)
-        .map_err(|e| Failure::Usage(format!("invalid PostgreSQL URL {shown}: {e}")))?;
     if cli.transaction_pooling {
         // A strict PgBouncer refuses startup parameters it does not know.
         options = options.extra_float_digits(None);

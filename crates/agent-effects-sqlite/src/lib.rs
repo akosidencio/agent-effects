@@ -272,7 +272,7 @@ impl EffectStore for SqliteStore {
         rows.iter()
             .map(|row| {
                 let json: String = get(row, "observation")?;
-                serde_json::from_str(&json).map_err(StoreError::backend)
+                serde_json::from_str(&json).map_err(|_| corrupt("late observation JSON", ""))
             })
             .collect()
     }
@@ -656,10 +656,8 @@ fn parse_id(id: &str) -> Result<EffectId, StoreError> {
         .map_err(|_| corrupt("id", id))
 }
 
-fn corrupt(column: &str, value: &str) -> StoreError {
-    StoreError::backend(format!(
-        "unreadable {column} in effects database: {value:?}"
-    ))
+fn corrupt(column: &str, _value: &str) -> StoreError {
+    StoreError::backend(format!("unreadable {column} in effects database"))
 }
 
 fn json<T: Serialize>(value: Option<&T>) -> Result<Option<String>, StoreError> {
@@ -672,7 +670,7 @@ fn json<T: Serialize>(value: Option<&T>) -> Result<Option<String>, StoreError> {
 fn from_json<T: DeserializeOwned>(text: Option<String>) -> Result<Option<T>, StoreError> {
     text.map(|t| serde_json::from_str(&t))
         .transpose()
-        .map_err(StoreError::backend)
+        .map_err(|_| corrupt("JSON", ""))
 }
 
 fn to_i64(value: u64) -> Result<i64, StoreError> {

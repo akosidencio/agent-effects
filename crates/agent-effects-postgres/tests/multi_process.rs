@@ -26,6 +26,10 @@ const RECOVERY_ENV: &str = "AGENT_EFFECTS_RECOVERY_ONLY";
 const CONCURRENCY_ENV: &str = "AGENT_EFFECTS_RECOVERY_CONCURRENCY";
 const EFFECTS: u32 = 150;
 const WORKERS: usize = 3;
+// Each scenario still has three competing OS processes. Avoid running
+// nine processes from independent scenarios against one service at once:
+// shared disk latency otherwise consumes the worker watchdog budget.
+static PROCESS_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn connect(url: &str, schema: &str) -> PostgresStore {
     let options: PgConnectOptions = url.parse().unwrap();
@@ -194,6 +198,7 @@ fn worker() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn processes_sharing_a_database_run_each_effect_once() {
+    let _turn = PROCESS_TESTS.lock().await;
     let Ok(url) = std::env::var("AGENT_EFFECTS_POSTGRES_URL") else {
         assert!(
             std::env::var_os("AGENT_EFFECTS_REQUIRE_POSTGRES").is_none(),
@@ -218,7 +223,7 @@ async fn processes_sharing_a_database_run_each_effect_once() {
     let dir = std::env::temp_dir().join(&schema);
     std::fs::create_dir_all(&dir).unwrap();
     let exe = std::env::current_exe().unwrap();
-    let mut children: Vec<_> = (0..WORKERS)
+    let children: Vec<_> = (0..WORKERS)
         .map(|i| {
             Command::new(&exe)
                 .args(["worker", "--exact", "--nocapture", "--test-threads=1"])
@@ -230,10 +235,9 @@ async fn processes_sharing_a_database_run_each_effect_once() {
                 .unwrap()
         })
         .collect();
+    let mut children = RecoveryChildren(children);
     std::fs::write(dir.join("go"), b"").unwrap();
-    for child in &mut children {
-        assert!(child.wait().unwrap().success(), "a worker process failed");
-    }
+    children.finish().await;
 
     let log = std::fs::read_to_string(dir.join("side-effects.log")).unwrap();
     let mut runs = vec![0u32; EFFECTS as usize];
@@ -275,6 +279,7 @@ async fn concurrent_recovery_processes_share_durable_pending_intents_without_dup
 /// Several recovery processes, each working on `concurrency` effects at
 /// once (sequentially for `None`), share one backlog of durable intents.
 async fn recovery_processes(concurrency: Option<usize>) {
+    let _turn = PROCESS_TESTS.lock().await;
     let Ok(url) = std::env::var("AGENT_EFFECTS_POSTGRES_URL") else {
         assert!(
             std::env::var_os("AGENT_EFFECTS_REQUIRE_POSTGRES").is_none(),

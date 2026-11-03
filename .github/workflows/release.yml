@@ -34,8 +34,9 @@ jobs:
     outputs:
       version: ${{ steps.parse.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Tag points at a commit on main
@@ -114,7 +115,9 @@ jobs:
       VERSION: ${{ needs.preflight.outputs.version }}
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - run: rustup toolchain install stable --profile minimal --no-self-update
 
       # Re-running a release that failed partway skips the crates that
@@ -145,7 +148,9 @@ jobs:
       VERSION: ${{ needs.preflight.outputs.version }}
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Release notes from CHANGELOG.md
         run: |

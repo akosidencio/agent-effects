@@ -1,0 +1,48 @@
+[package]
+name = "agent-effects-fuzz"
+publish = false
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Not a workspace member: cargo-fuzz needs nightly and sanitizers.
+[workspace]
+
+[dependencies]
+agent-effects = { path = "../crates/agent-effects" }
+arbitrary = "1.4.2"
+libfuzzer-sys = "0.4.10"
+serde = "1.0.229"
+serde_json = "1.0.151"
+
+[[bin]]
+name = "stored_records"
+path = "fuzz_targets/stored_records.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "state_machine"
+path = "fuzz_targets/state_machine.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stored_text"
+path = "fuzz_targets/stored_text.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "retry_delays"
+path = "fuzz_targets/retry_delays.rs"
+test = false
+doc = false
+bench = false

@@ -6,6 +6,62 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use agent_effects::{EffectFailure, EffectOutcome, EffectStore, Runtime};
 use agent_effects_sqlite::SqliteStore;
 
+#[tokio::test]
+async fn corrupt_stored_columns_fail_closed_without_echoing_their_contents() {
+    use agent_effects::store::{ListQuery, NewEffect};
+    use agent_effects::{EffectKey, EffectKind, EffectName, LogicalKey};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = SqliteStore::open(dir.path().join("corrupt.db"))
+        .await
+        .unwrap();
+    for (column, value) in [
+        ("status", "'secret-corrupt-value'"),
+        ("kind", "'secret-corrupt-value'"),
+        ("attempt_count", "-1"),
+        ("compensation_attempts", "-1"),
+        ("lease_epoch", "-1"),
+        ("version", "-1"),
+        ("input_schema_version", "-1"),
+        ("execution_contract", "'{}'"),
+        ("last_error", "'{'"),
+        (
+            "last_error",
+            r#"'{"class":{"class":"secret-corrupt-value"},"message":"hidden"}'"#,
+        ),
+    ] {
+        let key = EffectKey::new(
+            EffectName::new("corrupt.record").unwrap(),
+            LogicalKey::new(column).unwrap(),
+        );
+        let record = store
+            .insert_or_get(NewEffect::new(
+                key,
+                EffectKind::IrreversibleWrite,
+                std::time::SystemTime::now(),
+            ))
+            .await
+            .unwrap()
+            .record;
+        // Identifiers and expressions above are fixed test constants.
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE effects SET {column} = {value} WHERE id = ?"
+        )))
+        .bind(record.id.to_string())
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let error = store.get(record.id).await.unwrap_err();
+        assert!(!error.to_string().contains("secret-corrupt-value"));
+        assert!(store.list(ListQuery::statuses([])).await.is_err());
+        sqlx::query("DELETE FROM effects WHERE id = ?")
+            .bind(record.id.to_string())
+            .execute(store.pool())
+            .await
+            .unwrap();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn passes_the_conformance_suite() {
     let dir = tempfile::tempdir().unwrap();
