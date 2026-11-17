@@ -15,6 +15,10 @@
 //!   since the observer started; for exact current numbers, query
 //!   [`Runtime::pending`](crate::Runtime::pending).
 //!
+//! Things the runtime does that are not stored transitions arrive at
+//! [`EffectObserver::on_event`] as a [`RuntimeEvent`]: lease conflicts,
+//! lease renewal failures, recovery passes and pruning.
+//!
 //! The core crate depends on no metrics library; `agent-effects-otel`
 //! implements an observer with OpenTelemetry. An observer that panics is
 //! caught and logged: a metrics bug must never break an effect whose
@@ -22,6 +26,8 @@
 
 use std::time::Duration;
 
+use crate::id::EffectName;
+use crate::recovery::RecoveryReport;
 use crate::state::{EffectStatus, Transition};
 use crate::store::EffectRecord;
 
@@ -44,7 +50,39 @@ pub struct Observation<'a> {
     pub since_created: Duration,
 }
 
-/// Receives effect lifecycle events, for metrics. Both methods default to
+/// Something the runtime did that is not a stored transition.
+///
+/// New variants may be added in any release; match with a wildcard arm.
+#[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
+pub enum RuntimeEvent<'a> {
+    /// This worker found another one holding an effect's lease and left
+    /// the effect alone: normal under contention, not an error.
+    LeaseConflict {
+        /// The effect's name.
+        name: &'a EffectName,
+    },
+    /// Renewing a held lease failed with a store error (not because the
+    /// lease was lost). The runtime keeps working and tries again; if
+    /// renewals keep failing, the lease expires and the work is fenced off.
+    LeaseRenewalFailed,
+    /// A recovery pass ended.
+    RecoveryPass {
+        /// What the pass did, or `None` if it failed with a store error.
+        report: Option<&'a RecoveryReport>,
+        /// How long it took.
+        duration: Duration,
+    },
+    /// Retention deleted settled records.
+    Pruned {
+        /// Their status.
+        status: EffectStatus,
+        /// How many.
+        count: u64,
+    },
+}
+
+/// Receives effect lifecycle events, for metrics. Every method defaults to
 /// doing nothing.
 ///
 /// Calls are synchronous and run on the runtime's tasks: keep them cheap
@@ -59,5 +97,10 @@ pub trait EffectObserver: Send + Sync + 'static {
     /// A transition was stored.
     fn on_transition(&self, observation: &Observation<'_>) {
         let _ = observation;
+    }
+
+    /// Something happened that is not a stored transition.
+    fn on_event(&self, event: &RuntimeEvent<'_>) {
+        let _ = event;
     }
 }

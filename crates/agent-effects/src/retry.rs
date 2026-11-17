@@ -3,6 +3,40 @@
 //! Whether a failure may be retried at all is decided elsewhere, by its
 //! [`FailureClass`] and [`crate::policy`]. This module only does the counting
 //! and the arithmetic.
+//!
+//! # Scheduling
+//!
+//! A retry is decided and stored before anyone waits for it: under the
+//! effect's lease, the runtime records `ScheduleRetry` with the time the next
+//! attempt may start (`next_attempt_at`), which is the policy's backoff or a
+//! provider's `retry_after`, whichever is later. Only then does it wait.
+//!
+//! - **Short waits** (under
+//!   [`RuntimeBuilder::lease_free_backoff`](crate::RuntimeBuilder::lease_free_backoff),
+//!   the lease TTL by default) keep the lease: they cost at most a few
+//!   renewals, fewer store round trips than releasing and retaking it.
+//! - **Longer waits** release the lease. The caller sleeps without it, then
+//!   takes a fresh lease, re-reads the record and continues from whatever
+//!   it finds: the scheduled retry, or another worker's result. A call that
+//!   finds another worker holding the lease at that point waits for it and
+//!   reports its outcome.
+//! - **Recovery** stores the retry and moves on; a later pass resumes it
+//!   once it is due ([`RecoveryReport::not_due`](crate::RecoveryReport::not_due)
+//!   until then).
+//!
+//! Whoever starts the retry checks the stored time again under its own
+//! lease and waits if it is not due, so a released lease never lets a retry
+//! start early. A worker that dies during the wait leaves a `Pending` record
+//! with its schedule: recovery, or the next call with the same key, resumes
+//! it when it is due, without first waiting for a lease to expire.
+//!
+//! Releasing the lease never grants a retry. The decision was made, and
+//! stored, under the lease before the wait, from the failure's class, the
+//! effect's execution contract and its lifetime attempt budget. In
+//! particular a provider's `Retry-After` only sets *when* an attempt may
+//! start: an ambiguous outcome is re-run only if the effect is idempotent,
+//! remotely idempotent, or verified not to have applied.
+//! Compensation retries are scheduled the same way.
 
 use std::time::Duration;
 
@@ -71,7 +105,12 @@ impl RetryPolicy {
             } else {
                 0.0
             };
-            backoff.mul_f64(0.5 + 0.5 * sample).min(backoff)
+            // Duration::MAX rounds up to 2^64 seconds as f64. Even a
+            // multiplier of 1 can then overflow mul_f64; retain the cap
+            // rather than panicking on a valid (very large) policy.
+            Duration::try_from_secs_f64(backoff.as_secs_f64() * (0.5 + 0.5 * sample))
+                .unwrap_or(backoff)
+                .min(backoff)
         } else {
             backoff
         };
@@ -122,6 +161,21 @@ mod tests {
         let policy = RetryPolicy::default();
         assert!(policy.allows_another(4));
         assert!(!policy.allows_another(5));
+    }
+
+    #[test]
+    fn jitter_at_the_duration_limit_does_not_overflow() {
+        let policy = RetryPolicy {
+            initial_delay: Duration::MAX,
+            max_delay: Duration::MAX,
+            ..RetryPolicy::default()
+        };
+        assert_eq!(policy.delay(0, FailureClass::Transient, 1.0), Duration::MAX);
+        for sample in [0.0, 0.5, 0.99, 1.0, f64::NAN, f64::INFINITY] {
+            let delay = policy.delay(u32::MAX, FailureClass::Transient, sample);
+            assert!(delay <= policy.max_delay);
+            assert!(delay >= policy.max_delay / 2);
+        }
     }
 
     proptest! {

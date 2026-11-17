@@ -1,6 +1,6 @@
 [package]
 # This matrix shares workspace-only test fixtures; keep package tests self-contained.
-exclude = ["tests/reliability_matrix.rs", "tests/concurrent_recovery.rs"]
+exclude = ["tests/reliability_matrix.rs", "tests/concurrent_recovery.rs", "tests/retry_scheduling.rs"]
 name = "agent-effects-sqlite"
 description = "SQLite store for agent-effects"
 keywords = ["agents", "idempotency", "side-effects", "sqlite"]
@@ -20,6 +20,8 @@ agent-effects-store.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx = { workspace = true, features = ["sqlite"] }
+# An in-process write queue (tokio::sync::Mutex is first come, first served).
+tokio = { workspace = true, features = ["sync"] }
 uuid.workspace = true
 
 [dev-dependencies]

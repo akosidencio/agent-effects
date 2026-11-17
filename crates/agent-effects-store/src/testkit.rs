@@ -58,6 +58,7 @@ where
     a_new_attempt_clears_the_output(make_store().await).await;
     compensation_is_persisted(make_store().await).await;
     approval_is_persisted(make_store().await).await;
+    a_scheduled_retry_survives_releasing_the_lease(make_store().await).await;
     pruning_removes_only_settled_idle_old_records(make_store().await).await;
 }
 
@@ -886,6 +887,75 @@ async fn compensation_is_persisted<S: EffectStore>(store: S) {
         .await
         .unwrap();
     assert_eq!(listed, [record]);
+}
+
+/// The runtime stores a retry's time, releases the lease for the wait, and
+/// takes a new one when the retry is due. Releasing and acquiring a lease
+/// must leave the schedule, the attempt count and the version untouched,
+/// and a scheduled record nobody holds must be found by a pending scan.
+async fn a_scheduled_retry_survives_releasing_the_lease<S: EffectStore>(store: S) {
+    let record = insert(&store, 1).await;
+    let first = store
+        .acquire_lease(record.id, &worker("a"), t(0), TTL)
+        .await
+        .unwrap();
+    let record = drive(
+        &store,
+        record,
+        Some(&first),
+        &[Transition::StartAttempt],
+        t(1),
+    )
+    .await;
+    let mut retry = TransitionRequest::new(&record, Some(&first), Transition::ScheduleRetry, t(2));
+    retry.next_attempt_at = Some(t(600));
+    let scheduled = store.transition(retry).await.unwrap();
+    store.release_lease(&first).await.unwrap();
+
+    let idle = reload(&store, scheduled.id).await;
+    assert_eq!(idle.status, EffectStatus::Pending);
+    assert_eq!(idle.next_attempt_at, Some(t(600)));
+    assert_eq!((idle.attempt_count, idle.version), (1, scheduled.version));
+    assert_eq!(idle.lease_owner, None, "release clears the holder");
+    let mut pending = ListQuery::statuses([EffectStatus::Pending]);
+    pending.lease_expired_at = Some(t(3));
+    assert_eq!(
+        store.list(pending).await.unwrap(),
+        std::slice::from_ref(&idle),
+        "a released, scheduled retry is visible to scans at once"
+    );
+
+    let second = store
+        .acquire_lease(idle.id, &worker("b"), t(600), TTL)
+        .await
+        .unwrap();
+    assert_eq!(second.epoch, first.epoch + 1);
+    let retaken = reload(&store, idle.id).await;
+    assert_eq!(retaken.next_attempt_at, Some(t(600)), "acquiring keeps it");
+    assert_eq!(retaken.version, idle.version, "leases do not version");
+    let started = drive(
+        &store,
+        retaken,
+        Some(&second),
+        &[Transition::StartAttempt],
+        t(600),
+    )
+    .await;
+    assert_eq!((started.attempt_count, started.next_attempt_at), (2, None));
+    assert!(
+        matches!(
+            store
+                .transition(TransitionRequest::new(
+                    &started,
+                    Some(&first),
+                    Transition::Succeeded,
+                    t(601),
+                ))
+                .await,
+            Err(StoreError::LeaseLost)
+        ),
+        "the first holder stays fenced off"
+    );
 }
 
 async fn approval_is_persisted<S: EffectStore>(store: S) {

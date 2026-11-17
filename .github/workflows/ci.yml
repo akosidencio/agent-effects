@@ -13,7 +13,6 @@ on:
   # and a skipped workflow never reports one, so a docs-only PR would wait
   # forever.
   pull_request:
-    branches: [main]
   workflow_dispatch:
   # release.yml re-runs the whole suite at the tagged commit before publishing.
   workflow_call:
@@ -32,21 +31,53 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  security:
+    name: Security
+    uses: ./.github/workflows/security.yml
+    permissions:
+      contents: read
+
+  compatibility:
+    name: v0.2.0 consumer and database compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: rustup toolchain install 1.94 --profile minimal --no-self-update
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            target/compatibility
+          key: compatibility-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      # Populate dependencies before the fixture's deliberately offline runs.
+      - run: cargo +1.94 fetch --locked
+      - run: python3 scripts/check-compatibility.py
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - run: rustup toolchain install stable --profile minimal --component rustfmt --no-self-update
       - run: cargo +stable fmt --all --check
 
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - run: rustup toolchain install stable --profile minimal --component clippy --no-self-update
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -68,10 +99,13 @@ jobs:
       matrix:
         os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-latest"]' || '["ubuntu-latest", "macos-latest"]') }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - run: rustup toolchain install stable --profile minimal --no-self-update
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -90,12 +124,15 @@ jobs:
   msrv:
     name: MSRV
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      # Keep in sync with `rust-version` in Cargo.toml and
-      # crates/agent-effects-sqlite/Cargo.toml (sqlx 0.9 needs 1.94).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      # Keep in sync with `rust-version` in Cargo.toml and the crates that
+      # depend on sqlx 0.9, which needs 1.94: the SQL stores and the CLI.
       - run: rustup toolchain install 1.90 1.94 --profile minimal --no-self-update
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -103,15 +140,16 @@ jobs:
             target
           key: msrv-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: msrv-${{ runner.os }}-
-      - name: Rust 1.90 (all crates but the SQL stores)
-        run: cargo +1.90 test --workspace --exclude agent-effects-sqlite --exclude agent-effects-postgres --all-features --locked
-      - name: Rust 1.94 (agent-effects-sqlite, agent-effects-postgres)
+      - name: Rust 1.90 (crates without SQL dependencies)
+        run: cargo +1.90 test --workspace --exclude agent-effects-sqlite --exclude agent-effects-postgres --exclude agent-effects-cli --exclude agent-effects-bench --all-features --locked
+      - name: Rust 1.94 (agent-effects-sqlite, agent-effects-postgres, agent-effects-cli)
         # The Postgres tests skip here; the postgres job runs them for real.
-        run: cargo +1.94 test -p agent-effects-sqlite -p agent-effects-postgres --locked
+        run: cargo +1.94 test -p agent-effects-sqlite -p agent-effects-postgres -p agent-effects-cli --locked
 
   postgres:
     name: PostgreSQL
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:17
@@ -146,9 +184,11 @@ jobs:
       AGENT_EFFECTS_REQUIRE_POSTGRES: "1"
       AGENT_EFFECTS_REQUIRE_PGBOUNCER: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - run: rustup toolchain install stable --profile minimal --no-self-update
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -157,18 +197,50 @@ jobs:
           key: postgres-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: postgres-${{ runner.os }}-
       # Conformance, database clock, lock-skipping scans, the runtime, three
-      # worker processes on one database, a schema of its own, and PgBouncer.
+      # worker processes on one database, a schema of its own, and PgBouncer;
+      # then the operator CLI against both.
       - run: cargo +stable test -p agent-effects-postgres --locked
+      - run: cargo +stable test -p agent-effects-cli --locked --test postgres
+      - name: PostgreSQL benchmark smoke
+        run: cargo +stable run --locked -p agent-effects-bench -- --store postgres --workload recovery --effects 100 --runs 1 --warmup 0
+
+  benchmarks:
+    name: Benchmark smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal --no-self-update
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: benchmarks-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+      - name: Deterministic workloads (performance is measured separately)
+        run: |
+          cargo +stable build --locked -p agent-effects-bench
+          for store in memory sqlite; do
+            for workload in unique duplicate transitions lease-contention recovery retry retry-holding-leases compensation prune; do
+              target/debug/agent-effects-bench --store "$store" --workload "$workload" --effects 100 --runs 1 --warmup 0 --backoff-ms 50
+            done
+          done
 
   docs:
     name: Docs
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       RUSTDOCFLAGS: -D warnings
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - run: rustup toolchain install stable --profile minimal --no-self-update
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -183,8 +255,11 @@ jobs:
   package:
     name: Package (publish dry run)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - run: rustup toolchain install stable --profile minimal --no-self-update
       # Downloads only: no `target/` and no `~/.cargo/registry/src`. The dry
       # run compiles our own crates as registry crates from a temporary
@@ -192,7 +267,7 @@ jobs:
       # an unchanged version. A cached build of agent-effects-store 0.1.0
       # from an earlier commit would be reused as is, verifying the package
       # against stale code (this happened when a field was added).
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry/index
@@ -208,8 +283,9 @@ jobs:
   ci-pass:
     name: CI pass
     if: always()
-    needs: [fmt, clippy, test, msrv, postgres, docs, package]
+    needs: [fmt, clippy, test, msrv, postgres, benchmarks, docs, package, security, compatibility]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: All jobs succeeded
         run: |

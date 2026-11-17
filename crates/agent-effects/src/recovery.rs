@@ -55,6 +55,7 @@ use tracing::{Instrument, Span, info, warn};
 
 use crate::error::RuntimeError;
 use crate::id::EffectId;
+use crate::observer::RuntimeEvent;
 use crate::runtime::Runtime;
 use crate::state::{EffectStatus, Transition};
 use crate::store::{
@@ -138,6 +139,10 @@ pub struct RecoveryReport {
     /// Effects whose scheduled retry was not due yet. A later pass resumes
     /// them once it is.
     pub not_due: Vec<EffectId>,
+    /// Effects waiting for a person: escalated (`NeedsIntervention`), a
+    /// failed compensation, or awaiting approval. Recovery leaves them
+    /// alone.
+    pub waiting_for_operator: Vec<EffectId>,
     /// The pass stopped early for a shutdown
     /// ([`Runtime::run_recovery_until`]). Effects it did not reach are left
     /// for a later pass.
@@ -163,6 +168,59 @@ pub enum Resolution {
     /// For a failed compensation: the operator undid the effect by hand. It
     /// ends `Compensated`.
     Compensated,
+}
+
+/// An operator's identity, reason and, optionally, the record version the
+/// decision was made on, for [`Runtime::resolve_as`], [`Runtime::approve_as`]
+/// and [`Runtime::deny_as`].
+///
+/// The actor and note are recorded in the audit trail; they are labels, not
+/// credentials. Authorize the operator before calling: nothing here checks
+/// who they are.
+///
+/// With [`Self::expect_version`], the decision applies only if the record is
+/// still at that version, so an operator who reviewed an effect cannot
+/// accidentally decide on a state they never saw. Otherwise the call fails
+/// with [`StoreError::VersionConflict`] and changes nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct OperatorDecision {
+    /// Who decided, e.g. `operator:alice`.
+    pub actor: String,
+    /// Why, for the audit trail; for [`Resolution::NotApplied`] and a
+    /// denial, also the effect's recorded error.
+    pub note: String,
+    /// The record version the decision was made on, if it must still hold.
+    pub expected_version: Option<u64>,
+    /// Schema of the output supplied with [`Resolution::Applied`]; 1 unless
+    /// set.
+    pub output_schema_version: u32,
+}
+
+impl OperatorDecision {
+    /// A decision by `actor`, for the reason `note`.
+    pub fn new(actor: impl Into<String>, note: impl Into<String>) -> Self {
+        Self {
+            actor: actor.into(),
+            note: note.into(),
+            expected_version: None,
+            output_schema_version: 1,
+        }
+    }
+
+    /// Applies the decision only if the record is still at `version`.
+    #[must_use]
+    pub fn expect_version(mut self, version: u64) -> Self {
+        self.expected_version = Some(version);
+        self
+    }
+
+    /// The schema version of an applied output.
+    #[must_use]
+    pub fn output_schema_version(mut self, version: u32) -> Self {
+        self.output_schema_version = version;
+        self
+    }
 }
 
 impl Resolution {
@@ -225,6 +283,20 @@ impl<S: EffectStore> Runtime<S> {
         config: RecoveryConfig,
         shutdown: &mut Shutdown<'_, F>,
     ) -> Result<RecoveryReport, RuntimeError> {
+        let started = tokio::time::Instant::now();
+        let pass = self.recovery_steps(config, shutdown).await;
+        self.emit(&RuntimeEvent::RecoveryPass {
+            report: pass.as_ref().ok(),
+            duration: started.elapsed(),
+        });
+        pass
+    }
+
+    async fn recovery_steps<F: Future<Output = ()>>(
+        &self,
+        config: RecoveryConfig,
+        shutdown: &mut Shutdown<'_, F>,
+    ) -> Result<RecoveryReport, RuntimeError> {
         let mut report = RecoveryReport::default();
         self.mark_abandoned(config, &mut report, shutdown).await?;
         if !shutdown.fired() {
@@ -269,7 +341,7 @@ impl<S: EffectStore> Runtime<S> {
                 }
                 let runtime = self.clone();
                 let id = record.id;
-                tasks.spawn(id, async move { runtime.mark_unknown(id).await });
+                tasks.spawn(id, async move { runtime.mark_unknown(&record).await });
             }
             if !full || shutdown.check() {
                 break;
@@ -309,6 +381,7 @@ impl<S: EffectStore> Runtime<S> {
                         | EffectStatus::AwaitingApproval
                 );
                 if operator {
+                    report.waiting_for_operator.push(id);
                     continue;
                 }
                 if record.next_attempt_at.is_some_and(|at| at > self.now()) {
@@ -495,12 +568,31 @@ impl<S: EffectStore> Runtime<S> {
         actor: impl Into<String>,
         note: impl Into<String>,
     ) -> Result<EffectRecord, RuntimeError> {
-        let record = self
-            .store()
-            .get(id)
-            .await?
-            .ok_or(StoreError::NotFound(id))?;
-        let note = note.into();
+        let decision =
+            OperatorDecision::new(actor, note).output_schema_version(output_schema_version);
+        self.resolve_as(id, resolution, decision).await
+    }
+
+    /// Like [`Self::resolve`], with the details of an [`OperatorDecision`],
+    /// including the record version it must still be at.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::resolve`]; [`StoreError::VersionConflict`] if the
+    /// record is not at the expected version.
+    pub async fn resolve_as(
+        &self,
+        id: EffectId,
+        resolution: Resolution,
+        decision: OperatorDecision,
+    ) -> Result<EffectRecord, RuntimeError> {
+        let record = self.decided_record(id, &decision).await?;
+        let OperatorDecision {
+            actor,
+            note,
+            output_schema_version,
+            ..
+        } = decision;
         let transition = match resolution {
             Resolution::Applied { .. } => Transition::ResolvedApplied,
             Resolution::NotApplied => Transition::ResolvedNotApplied,
@@ -508,7 +600,7 @@ impl<S: EffectStore> Runtime<S> {
             Resolution::Compensated => Transition::ResolvedCompensated,
         };
         let mut request = TransitionRequest::new(&record, None, transition, self.now());
-        request.actor = Some(actor.into());
+        request.actor = Some(actor);
         request.payload = Some(json!({ "note": note }));
         match resolution {
             Resolution::Applied { output } => {
@@ -542,8 +634,22 @@ impl<S: EffectStore> Runtime<S> {
         actor: impl Into<String>,
         note: impl Into<String>,
     ) -> Result<EffectRecord, RuntimeError> {
-        self.decide(id, Transition::Approve, actor.into(), note.into())
+        self.decide(id, Transition::Approve, OperatorDecision::new(actor, note))
             .await
+    }
+
+    /// Like [`Self::approve`], with the details of an [`OperatorDecision`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::approve`]; [`StoreError::VersionConflict`] if the
+    /// record is not at the expected version.
+    pub async fn approve_as(
+        &self,
+        id: EffectId,
+        decision: OperatorDecision,
+    ) -> Result<EffectRecord, RuntimeError> {
+        self.decide(id, Transition::Approve, decision).await
     }
 
     /// Denies an effect waiting in `AwaitingApproval`. It ends `Rejected`,
@@ -558,22 +664,56 @@ impl<S: EffectStore> Runtime<S> {
         actor: impl Into<String>,
         reason: impl Into<String>,
     ) -> Result<EffectRecord, RuntimeError> {
-        self.decide(id, Transition::Deny, actor.into(), reason.into())
+        self.decide(id, Transition::Deny, OperatorDecision::new(actor, reason))
             .await
     }
 
-    async fn decide(
+    /// Like [`Self::deny`], with the details of an [`OperatorDecision`]; its
+    /// note is the reason.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::deny`]; [`StoreError::VersionConflict`] if the record
+    /// is not at the expected version.
+    pub async fn deny_as(
         &self,
         id: EffectId,
-        transition: Transition,
-        actor: String,
-        note: String,
+        decision: OperatorDecision,
+    ) -> Result<EffectRecord, RuntimeError> {
+        self.decide(id, Transition::Deny, decision).await
+    }
+
+    /// The record a decision applies to, checked against the version the
+    /// operator saw. The store re-checks that version atomically when the
+    /// transition is written.
+    async fn decided_record(
+        &self,
+        id: EffectId,
+        decision: &OperatorDecision,
     ) -> Result<EffectRecord, RuntimeError> {
         let record = self
             .store()
             .get(id)
             .await?
             .ok_or(StoreError::NotFound(id))?;
+        match decision.expected_version {
+            Some(expected) if expected != record.version => Err(StoreError::VersionConflict {
+                expected,
+                actual: record.version,
+            }
+            .into()),
+            _ => Ok(record),
+        }
+    }
+
+    async fn decide(
+        &self,
+        id: EffectId,
+        transition: Transition,
+        decision: OperatorDecision,
+    ) -> Result<EffectRecord, RuntimeError> {
+        let record = self.decided_record(id, &decision).await?;
+        let OperatorDecision { actor, note, .. } = decision;
         let mut request = TransitionRequest::new(&record, None, transition, self.now());
         request.actor = Some(actor);
         if transition == Transition::Deny {
@@ -590,14 +730,19 @@ impl<S: EffectStore> Runtime<S> {
 
     /// Moves one effect with an expired lease to `Unknown`. Returns `false`
     /// if someone else got to it first.
-    async fn mark_unknown(&self, id: EffectId) -> Result<bool, RuntimeError> {
-        let store = self.store();
+    async fn mark_unknown(&self, found: &EffectRecord) -> Result<bool, RuntimeError> {
+        let (store, id) = (self.store(), found.id);
         let lease = match store
             .acquire_lease(id, self.worker_id(), self.now(), self.lease_ttl())
             .await
         {
             Ok(lease) => lease,
-            Err(StoreError::LeaseHeld { .. }) => return Ok(false),
+            Err(StoreError::LeaseHeld { .. }) => {
+                self.emit(&RuntimeEvent::LeaseConflict {
+                    name: &found.key.name,
+                });
+                return Ok(false);
+            }
             Err(e) => return Err(e.into()),
         };
         let marked = async {

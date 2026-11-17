@@ -1,0 +1,34 @@
+# cargo-deny policy: run `cargo deny check` (CI does on every pull request).
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+# Yanked crates usually mean a broken or compromised release.
+yanked = "deny"
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+# Permissive licenses compatible with distributing under MIT OR Apache-2.0.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+[bans]
+# Duplicate versions cost build time, not safety; report them, do not fail.
+multiple-versions = "warn"
+wildcards = "deny"
+# Path dependencies inside the workspace carry no version requirement.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

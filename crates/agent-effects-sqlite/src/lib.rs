@@ -29,11 +29,22 @@
 //! record and then both write it. The record update also checks the version
 //! it read, as a second guard.
 //!
+//! SQLite admits one writer at a time, and its busy handler is not fair:
+//! under contention a waiting writer can lose the race for the lock again
+//! and again until its busy timeout runs out. So writers in one process
+//! (every clone of one store) queue for their turn, first come, first
+//! served, before asking SQLite for the lock; only writers in other
+//! processes meet the busy timeout. Every commit is an `fsync`, so write
+//! throughput is bounded by the disk: tens of commits per second on some
+//! encrypted or copy-on-write filesystems, thousands on a fast SSD.
+//!
 //! Times are stored as Unix milliseconds; sub-millisecond precision is
 //! dropped, as the [`EffectStore`] contract allows.
 
+use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent_effects_store::{
@@ -47,7 +58,8 @@ use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteRow,
     SqliteSynchronous,
 };
-use sqlx::{AssertSqlSafe, Row, Sqlite, Transaction};
+use sqlx::{AssertSqlSafe, Row, Sqlite, SqliteConnection, Transaction};
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use uuid::Uuid;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -60,10 +72,42 @@ const COLUMNS: &str = "id, effect_name, logical_key, kind, status, input, input_
 
 /// An [`EffectStore`] in a SQLite database.
 ///
-/// Cheap to clone; clones share the connection pool.
+/// Cheap to clone; clones share the connection pool and take turns to
+/// write (see [the crate docs](crate#durability-and-concurrency)).
 #[derive(Clone, Debug)]
 pub struct SqliteStore {
     pool: SqlitePool,
+    /// This process's turn to write: held for every write, in order.
+    writes: Arc<Mutex<()>>,
+}
+
+/// A write transaction, with this process's turn to write.
+struct Write {
+    tx: Transaction<'static, Sqlite>,
+    _turn: OwnedMutexGuard<()>,
+}
+
+impl Write {
+    async fn commit(self) -> Result<(), StoreError> {
+        self.tx.commit().await.map_err(StoreError::backend)
+    }
+
+    async fn rollback(self) -> Result<(), StoreError> {
+        self.tx.rollback().await.map_err(StoreError::backend)
+    }
+}
+
+impl Deref for Write {
+    type Target = SqliteConnection;
+    fn deref(&self) -> &SqliteConnection {
+        &self.tx
+    }
+}
+
+impl DerefMut for Write {
+    fn deref_mut(&mut self) -> &mut SqliteConnection {
+        &mut self.tx
+    }
 }
 
 impl SqliteStore {
@@ -98,7 +142,61 @@ impl SqliteStore {
     /// [`StoreError::Backend`] if migrating fails.
     pub async fn from_pool(pool: SqlitePool) -> Result<Self, StoreError> {
         MIGRATOR.run(&pool).await.map_err(StoreError::backend)?;
-        Ok(Self { pool })
+        Ok(Self::with_pool(pool))
+    }
+
+    fn with_pool(pool: SqlitePool) -> Self {
+        Self {
+            pool,
+            writes: Arc::new(Mutex::new(())),
+        }
+    }
+
+    /// Uses an existing pool without migrating, after checking that every
+    /// migration is applied. For tools that must never change the schema,
+    /// such as an operator CLI, or a pool opened read-only
+    /// (`?mode=ro`), where reads work and every write fails.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Backend`] if the database has no migration history, or
+    /// lacks or differs from one of this crate's migrations.
+    pub async fn attach(pool: SqlitePool) -> Result<Self, StoreError> {
+        let applied: Vec<(i64, Vec<u8>)> =
+            sqlx::query_as("SELECT version, checksum FROM _sqlx_migrations WHERE success")
+                .fetch_all(&pool)
+                .await
+                .map_err(|e| {
+                    StoreError::backend(format!(
+                        "no agent-effects migration history ({e}): open the database with \
+                         SqliteStore::open first"
+                    ))
+                })?;
+        for migration in MIGRATOR.iter() {
+            if migration.migration_type.is_down_migration() {
+                continue;
+            }
+            match applied
+                .iter()
+                .find(|(version, _)| *version == migration.version)
+            {
+                None => {
+                    return Err(StoreError::backend(format!(
+                        "migration {} ({}) is not applied: open the database with \
+                         SqliteStore::open first",
+                        migration.version, migration.description
+                    )));
+                }
+                Some((_, checksum)) if checksum.as_slice() != &*migration.checksum => {
+                    return Err(StoreError::backend(format!(
+                        "migration {} differs from agent-effects' own",
+                        migration.version
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
+        Ok(Self::with_pool(pool))
     }
 
     /// The underlying pool.
@@ -106,11 +204,17 @@ impl SqliteStore {
         &self.pool
     }
 
-    async fn begin(&self) -> Result<Transaction<'static, Sqlite>, StoreError> {
-        self.pool
+    /// Waits for this process's turn to write, then starts a write
+    /// transaction. The turn comes first, so no connection is held while
+    /// waiting for it.
+    async fn begin(&self) -> Result<Write, StoreError> {
+        let turn = Arc::clone(&self.writes).lock_owned().await;
+        let tx = self
+            .pool
             .begin_with("BEGIN IMMEDIATE")
             .await
-            .map_err(StoreError::backend)
+            .map_err(StoreError::backend)?;
+        Ok(Write { tx, _turn: turn })
     }
 
     /// Loads `id` under a write transaction, applies `change`, and saves the
@@ -120,7 +224,7 @@ impl SqliteStore {
         &self,
         id: EffectId,
         change: impl FnOnce(&mut EffectRecord) -> Result<T, StoreError>,
-    ) -> Result<(T, EffectRecord, Transaction<'static, Sqlite>), StoreError> {
+    ) -> Result<(T, EffectRecord, Write), StoreError> {
         let mut tx = self.begin().await?;
         let row = sqlx::query(AssertSqlSafe(format!(
             "SELECT {COLUMNS} FROM effects WHERE id = ?"
@@ -143,6 +247,7 @@ impl EffectStore for SqliteStore {
         &self,
         observation: agent_effects_store::LateObservation,
     ) -> Result<(), StoreError> {
+        let _turn = self.writes.lock().await;
         sqlx::query("INSERT INTO late_observations (id, effect_id, observation) VALUES (?, ?, ?) ON CONFLICT (id) DO NOTHING")
             .bind(observation.id.to_string()).bind(observation.effect_id.to_string())
             .bind(serde_json::to_string(&observation).map_err(StoreError::backend)?)
@@ -167,7 +272,7 @@ impl EffectStore for SqliteStore {
         rows.iter()
             .map(|row| {
                 let json: String = get(row, "observation")?;
-                serde_json::from_str(&json).map_err(StoreError::backend)
+                serde_json::from_str(&json).map_err(|_| corrupt("late observation JSON", ""))
             })
             .collect()
     }
@@ -175,6 +280,7 @@ impl EffectStore for SqliteStore {
     async fn insert_or_get(&self, new: NewEffect) -> Result<InsertOutcome, StoreError> {
         let mut record = EffectRecord::new(new);
         normalize(&mut record);
+        let turn = self.writes.lock().await;
         let inserted = bind_record(
             sqlx::query(AssertSqlSafe(format!(
                 "INSERT INTO effects ({COLUMNS}) \
@@ -188,6 +294,7 @@ impl EffectStore for SqliteStore {
         .map_err(StoreError::backend)?
         .rows_affected()
             == 1;
+        drop(turn);
         if inserted {
             return Ok(InsertOutcome {
                 record,
@@ -241,7 +348,7 @@ impl EffectStore for SqliteStore {
         let (mut lease, _, tx) = self
             .modify(id, |record| record.acquire_lease(owner, now, ttl))
             .await?;
-        tx.commit().await.map_err(StoreError::backend)?;
+        tx.commit().await?;
         lease.expires_at = round_trip(lease.expires_at);
         Ok(lease)
     }
@@ -257,7 +364,7 @@ impl EffectStore for SqliteStore {
                 record.renew_lease(lease, now, ttl)
             })
             .await?;
-        tx.commit().await.map_err(StoreError::backend)?;
+        tx.commit().await?;
         renewed.expires_at = round_trip(renewed.expires_at);
         Ok(renewed)
     }
@@ -267,9 +374,9 @@ impl EffectStore for SqliteStore {
             .modify(lease.effect_id, |record| Ok(record.release_lease(lease)))
             .await?;
         if released {
-            tx.commit().await.map_err(StoreError::backend)?;
+            tx.commit().await?;
         } else {
-            tx.rollback().await.map_err(StoreError::backend)?;
+            tx.rollback().await?;
         }
         Ok(())
     }
@@ -295,7 +402,7 @@ impl EffectStore for SqliteStore {
         .execute(&mut *tx)
         .await
         .map_err(StoreError::backend)?;
-        tx.commit().await.map_err(StoreError::backend)?;
+        tx.commit().await?;
         Ok(record)
     }
 
@@ -390,14 +497,14 @@ impl EffectStore for SqliteStore {
                     .map_err(StoreError::backend)?;
             }
         }
-        tx.commit().await.map_err(StoreError::backend)?;
+        tx.commit().await?;
         Ok(ids.len() as u64)
     }
 }
 
 /// Writes `record` over the row last read at `read_version`.
 async fn save(
-    tx: &mut Transaction<'static, Sqlite>,
+    tx: &mut SqliteConnection,
     record: &EffectRecord,
     read_version: u64,
 ) -> Result<(), StoreError> {
@@ -428,7 +535,7 @@ async fn save(
     .bind(i64::from(record.output_schema_version))
     .bind(record.id.to_string())
     .bind(to_i64(read_version)?)
-    .execute(&mut **tx)
+    .execute(&mut *tx)
     .await
     .map_err(StoreError::backend)?
     .rows_affected();
@@ -549,10 +656,8 @@ fn parse_id(id: &str) -> Result<EffectId, StoreError> {
         .map_err(|_| corrupt("id", id))
 }
 
-fn corrupt(column: &str, value: &str) -> StoreError {
-    StoreError::backend(format!(
-        "unreadable {column} in effects database: {value:?}"
-    ))
+fn corrupt(column: &str, _value: &str) -> StoreError {
+    StoreError::backend(format!("unreadable {column} in effects database"))
 }
 
 fn json<T: Serialize>(value: Option<&T>) -> Result<Option<String>, StoreError> {
@@ -565,7 +670,7 @@ fn json<T: Serialize>(value: Option<&T>) -> Result<Option<String>, StoreError> {
 fn from_json<T: DeserializeOwned>(text: Option<String>) -> Result<Option<T>, StoreError> {
     text.map(|t| serde_json::from_str(&t))
         .transpose()
-        .map_err(StoreError::backend)
+        .map_err(|_| corrupt("JSON", ""))
 }
 
 fn to_i64(value: u64) -> Result<i64, StoreError> {

@@ -6,6 +6,62 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use agent_effects::{EffectFailure, EffectOutcome, EffectStore, Runtime};
 use agent_effects_sqlite::SqliteStore;
 
+#[tokio::test]
+async fn corrupt_stored_columns_fail_closed_without_echoing_their_contents() {
+    use agent_effects::store::{ListQuery, NewEffect};
+    use agent_effects::{EffectKey, EffectKind, EffectName, LogicalKey};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = SqliteStore::open(dir.path().join("corrupt.db"))
+        .await
+        .unwrap();
+    for (column, value) in [
+        ("status", "'secret-corrupt-value'"),
+        ("kind", "'secret-corrupt-value'"),
+        ("attempt_count", "-1"),
+        ("compensation_attempts", "-1"),
+        ("lease_epoch", "-1"),
+        ("version", "-1"),
+        ("input_schema_version", "-1"),
+        ("execution_contract", "'{}'"),
+        ("last_error", "'{'"),
+        (
+            "last_error",
+            r#"'{"class":{"class":"secret-corrupt-value"},"message":"hidden"}'"#,
+        ),
+    ] {
+        let key = EffectKey::new(
+            EffectName::new("corrupt.record").unwrap(),
+            LogicalKey::new(column).unwrap(),
+        );
+        let record = store
+            .insert_or_get(NewEffect::new(
+                key,
+                EffectKind::IrreversibleWrite,
+                std::time::SystemTime::now(),
+            ))
+            .await
+            .unwrap()
+            .record;
+        // Identifiers and expressions above are fixed test constants.
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE effects SET {column} = {value} WHERE id = ?"
+        )))
+        .bind(record.id.to_string())
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let error = store.get(record.id).await.unwrap_err();
+        assert!(!error.to_string().contains("secret-corrupt-value"));
+        assert!(store.list(ListQuery::statuses([])).await.is_err());
+        sqlx::query("DELETE FROM effects WHERE id = ?")
+            .bind(record.id.to_string())
+            .execute(store.pool())
+            .await
+            .unwrap();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn passes_the_conformance_suite() {
     let dir = tempfile::tempdir().unwrap();
@@ -164,4 +220,81 @@ async fn versioned_outputs_replay_after_reopening_with_a_new_schema() {
         replay,
         EffectOutcome::Committed(serde_json::json!({ "result": 7 }))
     );
+}
+
+#[tokio::test]
+async fn attach_never_migrates_and_accepts_read_only_pools() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("attach.db");
+
+    // An empty database is refused, not migrated.
+    let empty = sqlx::SqlitePool::connect(&format!("sqlite://{}?mode=rwc", path.display()))
+        .await
+        .unwrap();
+    let error = SqliteStore::attach(empty.clone()).await.unwrap_err();
+    assert!(error.to_string().contains("migration history"), "{error}");
+    let tables: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE type = 'table'")
+        .fetch_one(&empty)
+        .await
+        .unwrap();
+    assert_eq!(tables, 0, "attach created nothing");
+    empty.close().await;
+
+    SqliteStore::open(&path).await.unwrap();
+    let read_only = sqlx::sqlite::SqlitePoolOptions::new()
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&path)
+                .read_only(true),
+        )
+        .await
+        .unwrap();
+    let store = SqliteStore::attach(read_only).await.unwrap();
+    let records = store
+        .list(agent_effects_store::ListQuery::statuses([]))
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 0, "reads work on a read-only pool");
+}
+
+/// Writers in one process take turns instead of racing SQLite's busy
+/// handler, which is not first-come-first-served: before they did, a writer
+/// could be starved past the busy timeout under contention and fail with
+/// "database is locked", leaving an effect whose action had succeeded
+/// unrecorded. A 50 ms busy timeout makes the race certain on any disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_writers_in_one_process_never_hit_the_busy_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("contended.db");
+    SqliteStore::open(&path).await.unwrap();
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(8)
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&path)
+                .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+                .synchronous(sqlx::sqlite::SqliteSynchronous::Full)
+                .busy_timeout(std::time::Duration::from_millis(50)),
+        )
+        .await
+        .unwrap();
+    let rt = Runtime::new(SqliteStore::attach(pool).await.unwrap());
+    let calls: Vec<_> = (0..32)
+        .map(|task| {
+            let rt = rt.clone();
+            tokio::spawn(async move {
+                for n in 0..25 {
+                    let outcome = rt
+                        .effect("contended.write", format!("{task}-{n}"))
+                        .run(|_| async { Ok::<_, EffectFailure>(()) })
+                        .await
+                        .expect("no store error under in-process contention");
+                    assert!(matches!(outcome, EffectOutcome::Committed(())));
+                }
+            })
+        })
+        .collect();
+    for call in calls {
+        call.await.unwrap();
+    }
 }

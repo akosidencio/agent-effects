@@ -516,6 +516,7 @@ impl<S: EffectStore, V> EffectBuilder<S, V> {
             risk: self.risk,
             automatic_retry: true,
             input_stored: false,
+            return_on_backoff: false,
             handler_version: self.handler_version,
             adapter: self.adapter,
             input_schema_version: self.input_schema_version,
@@ -526,6 +527,8 @@ impl<S: EffectStore, V> EffectBuilder<S, V> {
 }
 
 /// Everything about an effect except its action and verifier.
+// Independent switches, each set from a different source.
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct EffectSpec {
     pub(crate) input_schema_version: u32,
     pub(crate) output_schema: crate::PayloadSchema,
@@ -547,6 +550,9 @@ pub(crate) struct EffectSpec {
     /// The input comes from the store (a resumed effect): it is already
     /// redacted, and `fingerprint` is the stored one, used as is.
     pub(crate) input_stored: bool,
+    /// Report a retry that is not due yet as in progress, rather than wait
+    /// for it: recovery resumes it in a later pass.
+    pub(crate) return_on_backoff: bool,
 }
 
 impl EffectSpec {

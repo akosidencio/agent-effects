@@ -1,0 +1,38 @@
+[package]
+name = "agent-effects-cli"
+description = "Operator CLI for agent-effects: inspect, approve and reconcile effects in SQLite or PostgreSQL"
+keywords = ["agents", "idempotency", "side-effects", "operations", "cli"]
+categories = ["command-line-utilities", "database"]
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.94"   # through the SQL stores (sqlx 0.9)
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/agent-effects-cli"
+authors.workspace = true
+
+[[bin]]
+name = "agent-effects"
+path = "src/main.rs"
+
+[dependencies]
+agent-effects.workspace = true
+agent-effects-postgres.workspace = true
+agent-effects-sqlite.workspace = true
+clap = { version = "4.6.7", features = ["derive", "env"] }
+serde.workspace = true
+serde_json.workspace = true
+sqlx = { workspace = true, features = ["sqlite", "postgres"] }
+time = { workspace = true, features = ["formatting"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+uuid.workspace = true
+
+[dev-dependencies]
+agent-effects-memory.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
+
+[lints]
+workspace = true

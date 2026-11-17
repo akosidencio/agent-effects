@@ -10,7 +10,7 @@
 
 [![crates.io](https://img.shields.io/crates/v/agent-effects.svg)](https://crates.io/crates/agent-effects)
 [![docs.rs](https://img.shields.io/docsrs/agent-effects)](https://docs.rs/agent-effects)
-[![Version: 0.2.0 (unreleased)](https://img.shields.io/badge/Version-v0.2.0--unreleased-blue)](CHANGELOG.md)
+[![Version: 0.2.0](https://img.shields.io/badge/Version-v0.2.0-blue)](CHANGELOG.md)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT_OR_Apache--2.0-blue.svg)](#license)
 [![Rust: 2024 Edition](https://img.shields.io/badge/Rust-2024_Edition-orange?logo=rust)](Cargo.toml)
 [![MSRV: Rust 1.90](https://img.shields.io/badge/MSRV-1.90%2B-orange?logo=rust)](#rust-crates-and-storage-backends)
@@ -186,7 +186,9 @@ Pick the protection your remote system allows:
   durable handlers, several at once with a bounded `RecoveryConfig`, and
   `run_recovery_until(interval, shutdown)` stops it gracefully;
   `runtime.pending(..)` lists unresolved effects and
-  `runtime.resolve(..)` records an operator's decision. Use
+  `runtime.resolve(..)` records an operator's decision, optionally pinned to
+  the record version the operator reviewed (`OperatorDecision`). The
+  optional `agent-effects` CLI does the same from a terminal. Use
   `runtime.wait(id, timeout)` to wait for another caller's effect.
 
 ## Examples
@@ -236,17 +238,23 @@ consequential actions. It does not supply application authorization.
 | [`agent-effects`](crates/agent-effects) | The runtime; the crate applications depend on. Features: `testkit` (`FakeRemote`), `fault-injection` (`FaultInjector`). |
 | [`agent-effects-sqlite`](crates/agent-effects-sqlite) | SQLite store; several processes may share one file. |
 | [`agent-effects-http`](crates/agent-effects-http) | HTTP requests as effects (reqwest): failure classification, `Idempotency-Key`. |
-| [`agent-effects-otel`](crates/agent-effects-otel) | OpenTelemetry metrics through an `EffectObserver`. |
+| [`agent-effects-otel`](crates/agent-effects-otel) | OpenTelemetry metrics through an `EffectObserver`: outcomes, retries, verification, approvals, leases, recovery backlog and throughput. |
 | [`agent-effects-postgres`](crates/agent-effects-postgres) | PostgreSQL store for many workers on many hosts; leases use the database's clock. Can share an application's database, in a schema of its own, through PgBouncer in transaction mode. |
 | [`agent-effects-memory`](crates/agent-effects-memory) | In-memory store for tests and development. |
+| [`agent-effects-cli`](crates/agent-effects-cli) | Optional operator CLI (`agent-effects`): list, inspect, history, stats, approve, deny, resolve and retry effects in SQLite or PostgreSQL. |
 | [`agent-effects-store`](crates/agent-effects-store) | Storage contract and state machine, for writing new backends; includes the backend conformance suite (`testkit`). |
 
-MSRV: Rust 1.90; `agent-effects-sqlite` and `agent-effects-postgres` need 1.94 (sqlx).
+MSRV: Rust 1.90; `agent-effects-sqlite`, `agent-effects-postgres` and `agent-effects-cli` need 1.94 (sqlx).
 
 ## Documentation
 
 - [Rust API documentation](https://docs.rs/agent-effects)
 - [Recovery configuration and worker lifecycle](guides/recovery.md)
+- [Operator CLI](crates/agent-effects-cli/README.md)
+- [Observability: metrics, alerts and traces](guides/observability.md)
+- [Benchmarks and how to reproduce them](guides/benchmarks.md)
+- [Production operations](guides/operations.md)
+- [Security disclosure policy](SECURITY.md)
 - [Release changelog](CHANGELOG.md)
 
 ## Development
@@ -261,8 +269,8 @@ and PgBouncer tests require isolated test services and their environment flags.
 cargo test --workspace --all-features
 cargo clippy --workspace --all-targets --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
-cargo +1.90 test --workspace --exclude agent-effects-sqlite --exclude agent-effects-postgres --all-features   # MSRV
-cargo +1.94 test -p agent-effects-sqlite -p agent-effects-postgres                                           # their MSRV (sqlx)
+cargo +1.90 test --workspace --exclude agent-effects-sqlite --exclude agent-effects-postgres --exclude agent-effects-cli --all-features   # MSRV
+cargo +1.94 test -p agent-effects-sqlite -p agent-effects-postgres -p agent-effects-cli                                                # their MSRV (sqlx)
 
 # PostgreSQL tests (they skip without a database), and through PgBouncer in
 # transaction mode (skipped without AGENT_EFFECTS_PGBOUNCER_URL):

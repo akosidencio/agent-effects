@@ -32,6 +32,7 @@ use std::time::Duration;
 use tracing::debug;
 
 use crate::error::RuntimeError;
+use crate::observer::RuntimeEvent;
 use crate::runtime::Runtime;
 use crate::state::EffectStatus;
 use crate::store::{EffectStore, PruneQuery};
@@ -162,13 +163,26 @@ impl<S: EffectStore> Runtime<S> {
         let now = self.now();
         for (status, older_than) in self.retention().rules() {
             let query = PruneQuery::new(status, older_than, now);
-            loop {
-                let deleted = self.store().prune(query.clone()).await?;
-                report.add(status, deleted);
-                if deleted < query.limit as u64 {
-                    break;
+            let mut pruned = 0;
+            let result = loop {
+                match self.store().prune(query.clone()).await {
+                    Ok(deleted) => {
+                        pruned += deleted;
+                        if deleted < query.limit as u64 {
+                            break Ok(());
+                        }
+                    }
+                    Err(e) => break Err(e),
                 }
+            };
+            report.add(status, pruned);
+            if pruned > 0 {
+                self.emit(&RuntimeEvent::Pruned {
+                    status,
+                    count: pruned,
+                });
             }
+            result?;
         }
         if report.total() > 0 {
             debug!(?report, "pruned settled effects");

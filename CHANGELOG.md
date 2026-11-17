@@ -19,11 +19,85 @@ break the API or storage format.
   already started.
 - `RecoveryReport::not_due` (scheduled retries a pass left for later) and
   `RecoveryReport::stopped` (the pass ended early for a shutdown).
+- Lease-free retry scheduling. A retry backoff at least
+  `RuntimeBuilder::lease_free_backoff` long (default: the lease TTL) is
+  waited out without the lease: the retry's time is stored first,
+  the lease released, and a fresh lease taken, with the record re-read, when
+  it is due. No lease renewals during long backoffs, and a worker that dies
+  meanwhile leaves nothing to expire. `Duration::MAX` keeps 0.2.0's
+  behavior. Compensation retries are scheduled the same way.
+- `FaultPoint::AfterRetryScheduled` and `FaultPoint::AfterBackoffLeaseReleased`
+  for crash tests.
+- Store conformance: a scheduled retry survives releasing and retaking the
+  lease, and is visible to pending scans while nobody holds it.
+- `agent-effects-cli`, an optional crate installing the `agent-effects`
+  operator command for SQLite and PostgreSQL (direct or through PgBouncer):
+  `list`, `pending`, `inspect`, `history`, `late`, `stats`, `approve`,
+  `deny`, `resolve` and `retry`, with JSON output, paging, a read-only mode,
+  read-only connections for inspection, confirmation of writes, operator
+  policies by authenticated database identity, and documented exit codes.
+  It never creates or migrates a database.
+- `OperatorDecision` and `Runtime::{resolve_as, approve_as, deny_as}`: an
+  operator's decision can require the record version the operator reviewed,
+  so a decision is never applied to a state they did not see.
+- `SqliteStore::attach`: use a pool without migrating it, for tools and
+  read-only pools.
+- `EffectObserver::on_event` with `RuntimeEvent` (non-exhaustive): lease
+  conflicts, lease renewal failures, recovery passes and pruning, which are
+  not stored transitions. The method has a default, so existing observers
+  compile unchanged. `RecoveryReport::waiting_for_operator` lists the
+  effects a pass left for a person.
+- `agent-effects-otel`: instruments for attempts (first or retry), retry
+  delay, verification starts and outcomes, approval decisions and latency,
+  operator resolutions, effects awaiting intervention, lease expiries,
+  conflicts and renewal failures, recovery passes, duration, per-effect
+  outcomes and backlog, and pruned records. Every attribute is bounded: no
+  ids, keys, actors or messages.
+- `agent-effects-bench` (not published) and `bench/run-matrix.sh`:
+  reproducible workloads for memory, SQLite and PostgreSQL; see
+  `guides/benchmarks.md`.
+
+### Security
+
+- Automated RustSec audit, cargo-deny advisory/license/source checks, and
+  redacted secret scans. CI covers stacked PRs and pins external actions.
+- Fuzz targets for stored records/text, state transitions and retry delays.
+- Stored enum/JSON decoding errors omit potentially sensitive corrupt values;
+  CLI URL parsing errors omit credentials and query values.
+- Security disclosure policy and a production operations guide.
+- An unchanged v0.2.0 consumer/custom store and a SQLite database upgrade
+  fixture run in CI without modifying the release tag or migration history.
+
+### Fixed
+
+- CLI timestamp rendering handles stored dates beyond the calendar range
+  without panicking.
+- Retry jitter no longer panics when a very large duration rounds beyond
+  the floating-point representation accepted by `Duration`. Found by fuzzing;
+  normal delay rounding and retry authorization remain unchanged.
+- SQLite: writers sharing a store and its clones now take turns (a first-come, first-served
+  queue) instead of racing SQLite's busy handler, which is not fair. Under
+  write contention on storage with slow `fsync`, a writer could be starved
+  past the 5 s busy timeout and fail with "database is locked", leaving an
+  effect whose action had succeeded unrecorded (it then became unknown). Found
+  by the new benchmarks: 11 of 15 runs of 200 effects with 16 callers failed
+  on a btrfs-on-LUKS disk; none fail now. Writers in other processes still
+  wait on the busy timeout.
 
 ### Changed
 
 - A recovery pass that hits a store error now waits for the effects it
   already started before returning the error.
+- A recovery pass no longer waits through a long retry backoff while
+  holding a slot: it stores the retry and reports the effect as `Pending`,
+  and a later pass resumes it once due.
+- The lease-free backoff threshold defaults to the lease TTL. Measured:
+  for shorter waits, holding the lease (a renewal every third of the TTL)
+  costs fewer store round trips than releasing and retaking it.
+- A call that waited out a backoff without the lease and finds another
+  worker running the retry waits for that worker and reports its outcome,
+  instead of returning `InProgress`. While a retry waits without its lease,
+  `Runtime::wait` reports it `InProgress` immediately.
 
 ## [0.2.0]
 
