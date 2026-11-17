@@ -22,8 +22,8 @@ use agent_effects::testkit::{Behavior, FakeRemote};
 use agent_effects::{
     Clock, CompensableEffect, CompensationContext, CompensationOutcome, EffectContext,
     EffectFailure, EffectHandler, EffectId, EffectKey, EffectKind, EffectName, EffectOutcome,
-    EffectRecord, EffectStatus, FailureClass, Handler, LogicalKey, RetryPolicy, Runtime,
-    RuntimeBuilder, TokioClock, VerifiableEffect, Verification, WorkerId,
+    EffectRecord, EffectStatus, FailureClass, Handler, LogicalKey, RecoveryConfig, RetryPolicy,
+    Runtime, RuntimeBuilder, TokioClock, VerifiableEffect, Verification, WorkerId,
 };
 use agent_effects_memory::MemoryStore;
 use fault_store::FaultStore;
@@ -831,4 +831,45 @@ async fn compensation_retries_honour_retry_after() {
         start.elapsed()
     );
     assert_eq!(undo.compensations.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn retries_that_are_not_due_never_starve_an_eligible_effect() {
+    quiet_crashes();
+    let (store, clock) = setup();
+    // Five failures for five blocked effects; the next request succeeds.
+    let remote = FakeRemote::new(clock).script([Behavior::Fail(FailureClass::Transient); 5]);
+    let doomed = |point| {
+        builder(&store, clock, "doomed")
+            .register(handler(&remote).0)
+            .fault_injector(Arc::new(FaultInjector::new().at(point).crash()))
+            .build()
+    };
+    // Five retries a minute away, their workers lost after releasing the
+    // lease: every scan returns them, and they are not due.
+    let mut blocked = Vec::new();
+    for i in 0..5 {
+        let key = format!("blocked-{i}");
+        let rt = doomed(FaultPoint::AfterBackoffLeaseReleased);
+        assert!(rt.submit::<Create>(&key, format!("res-{i}")).await.is_err());
+        blocked.push(record(&store, &key).await.id);
+    }
+    // Then one intent that is due now, ordered after all of them.
+    let rt = doomed(FaultPoint::AfterInsert);
+    assert!(rt.submit::<Create>("due", RES.into()).await.is_err());
+    let due = record(&store, "due").await.id;
+    assert!(blocked.iter().all(|b| *b < due), "scan order puts it last");
+
+    // Pages of two: the first two and a half pages hold nothing to do.
+    let (create, _) = handler(&remote);
+    let rt = builder(&store, clock, "recovery").register(create).build();
+    let report = rt
+        .recover_with(RecoveryConfig::SEQUENTIAL.batch_size(2))
+        .await
+        .unwrap();
+    assert_eq!(report.resumed, [(due, EffectStatus::Committed)]);
+    let mut not_due = report.not_due.clone();
+    not_due.sort();
+    assert_eq!(not_due, blocked);
+    assert_eq!(remote.applications(RES), 1);
 }
