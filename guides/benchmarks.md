@@ -48,6 +48,8 @@ Actions do nothing unless `--work-ms` adds a simulated remote call.
   as a share of one core. The database server's CPU is not included.
 - **Peak memory**: the process's peak resident set (`VmHWM`) at the end of
   the run; it includes the warm-up and earlier runs of the same invocation.
+- CPU and peak memory are read from `/proc`, so they are reported only on
+  Linux; elsewhere they are `null`. Every other measurement is portable.
 - **Duplicate side effects**: actions that ran more often than the workload
   allows, counted by the actions themselves. Must be 0.
 - **Unresolved**: effects not settled at the end, where all should be. Must

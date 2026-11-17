@@ -216,9 +216,16 @@ async fn dispatch<S: EffectStore>(
             print_list(io, format, &records, next.as_deref(), now)
         }
         Command::Pending { page } => {
-            let runtime = Runtime::new(store);
-            let records = runtime.pending(page.after, usize::from(page.limit)).await?;
+            // `Runtime::pending` is a work-finding scan: on PostgreSQL it
+            // locks rows (`FOR UPDATE SKIP LOCKED`), which a read-only
+            // connection and a SELECT-only role both refuse. A plain read
+            // of the same statuses, minus the effects someone is working
+            // on, shows the same thing without taking locks.
+            let mut query = ListQuery::statuses(PENDING_STATUSES).limit(usize::from(page.limit));
+            query.after = page.after;
+            let mut records = store.list(query).await?;
             let next = next_cursor(&records, page);
+            records.retain(|r| r.live_lease_owner(now).is_none());
             print_list(io, format, &records, next.as_deref(), now)
         }
         Command::Inspect { id, show_payloads } => {
@@ -533,6 +540,18 @@ async fn get<S: EffectStore>(store: &S, id: EffectId) -> Result<EffectRecord, Fa
         .await?
         .ok_or_else(|| Failure::NotFound(format!("no effect {id}")))
 }
+
+/// The statuses `Runtime::pending` lists; a test keeps the two in step.
+const PENDING_STATUSES: [EffectStatus; 8] = [
+    EffectStatus::Pending,
+    EffectStatus::AwaitingApproval,
+    EffectStatus::Executing,
+    EffectStatus::Verifying,
+    EffectStatus::Unknown,
+    EffectStatus::NeedsIntervention,
+    EffectStatus::Compensating,
+    EffectStatus::CompensationFailed,
+];
 
 fn next_cursor(records: &[EffectRecord], page: &Page) -> Option<String> {
     (records.len() == usize::from(page.limit))

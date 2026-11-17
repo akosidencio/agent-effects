@@ -476,6 +476,7 @@ impl<S: EffectStore> Runtime<S> {
             };
             debug!(%failure, "compensation attempt failed");
             let class = failure.class();
+            let asked = failure.retry_after();
             let error = failure.to_record();
             // Compensations are idempotent, so an ambiguous failure is
             // simply retried; only a permanent one gives up early.
@@ -487,17 +488,22 @@ impl<S: EffectStore> Runtime<S> {
                     })
                     .await;
             }
-            let retry_class = if class == FailureClass::Ambiguous {
-                FailureClass::Transient
-            } else {
-                class
+            // The class only sets the delay here: whether to retry was
+            // decided above. A provider's `Retry-After` (an ambiguous 429 or
+            // 503, say) is honoured as for the effect itself.
+            let retry_class = match asked {
+                Some(delay) => FailureClass::RateLimited {
+                    retry_after: Some(delay),
+                },
+                None if class == FailureClass::Ambiguous => FailureClass::Transient,
+                None => class,
             };
             let delay = policy.delay(
                 record.compensation_attempts.saturating_sub(1),
                 retry_class,
                 jitter_sample(),
             );
-            let at = self.now() + delay;
+            let at = crate::retry::retry_due_at(self.now(), delay);
             record = self
                 .transition_leased(
                     &record,

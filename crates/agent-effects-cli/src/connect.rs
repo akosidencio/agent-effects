@@ -32,19 +32,32 @@ pub(crate) async fn open(cli: &Cli, write: bool) -> Result<(Store, Identity), Fa
     let url = cli.database_url.as_deref().ok_or_else(|| {
         Failure::Usage("no database: pass --database-url or set AGENT_EFFECTS_DATABASE_URL".into())
     })?;
-    if url.starts_with("postgres://") || url.starts_with("postgresql://") {
-        open_postgres(cli, url, write).await
-    } else {
-        if cli.schema.is_some() || cli.transaction_pooling {
-            return Err(Failure::Usage(
-                "--schema and --transaction-pooling apply to PostgreSQL only".into(),
-            ));
+    // Anything else with `://` is not a file name: opening it as one would
+    // fail and print the URL, credentials and all.
+    let scheme = url
+        .split_once("://")
+        .map(|(scheme, _)| scheme.to_ascii_lowercase());
+    match scheme.as_deref() {
+        Some("postgres" | "postgresql") => open_postgres(cli, url, write).await,
+        None | Some("sqlite") => {
+            if cli.schema.is_some() || cli.transaction_pooling {
+                return Err(Failure::Usage(
+                    "--schema and --transaction-pooling apply to PostgreSQL only".into(),
+                ));
+            }
+            open_sqlite(url, write).await
         }
-        open_sqlite(url, write).await
+        Some(_) => Err(Failure::Usage(
+            "unsupported database URL scheme: use postgres://, postgresql://, \
+             sqlite: or a SQLite file path"
+                .into(),
+        )),
     }
 }
 
 async fn open_sqlite(url: &str, write: bool) -> Result<(Store, Identity), Failure> {
+    // Connection options in the query may hold secrets (a key, say).
+    let shown = url.split_once('?').map_or(url, |(path, _)| path);
     let options = if url.starts_with("sqlite:") {
         SqliteConnectOptions::from_str(url).map_err(|_| {
             Failure::Usage("invalid SQLite URL; check the connection options".into())
@@ -65,10 +78,10 @@ async fn open_sqlite(url: &str, write: bool) -> Result<(Store, Identity), Failur
         .acquire_timeout(Duration::from_secs(10))
         .connect_with(options)
         .await
-        .map_err(|e| Failure::Connection(format!("cannot open SQLite database {url}: {e}")))?;
+        .map_err(|e| Failure::Connection(format!("cannot open SQLite database {shown}: {e}")))?;
     let store = SqliteStore::attach(pool)
         .await
-        .map_err(|e| Failure::Connection(format!("{url} is not an agent-effects store: {e}")))?;
+        .map_err(|e| Failure::Connection(format!("{shown} is not an agent-effects store: {e}")))?;
     let name = std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
         .unwrap_or_else(|_| "unknown".into());

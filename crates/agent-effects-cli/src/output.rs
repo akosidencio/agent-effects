@@ -199,15 +199,51 @@ pub(crate) fn fields(value: &Value, indent: usize) -> String {
 fn cell(value: &Value) -> String {
     match value {
         Value::Null => "-".into(),
-        Value::String(s) => s.clone(),
+        Value::String(s) => printable(s),
         other => other.to_string(),
     }
+}
+
+/// `text` safe to print on a terminal. Stored strings come from remote
+/// systems (a provider's error message) and from other operators: escape
+/// sequences in them could rewrite the screen, and bidirectional overrides
+/// could make a line read differently from what it says. JSON output is
+/// escaped by the serializer already.
+fn printable(text: &str) -> String {
+    let unsafe_char =
+        |c: char| c.is_control() || matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
+    if !text.chars().any(unsafe_char) {
+        return text.to_owned();
+    }
+    text.chars()
+        .map(|c| {
+            if unsafe_char(c) {
+                c.escape_unicode().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod timestamp_tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn terminal_control_sequences_are_escaped() {
+        let hostile = Value::String("ok\u{1b}[2J\u{1b}]0;title\u{7}\r\u{202e}gnp.exe".into());
+        let shown = cell(&hostile);
+        assert!(!shown.chars().any(char::is_control), "{shown}");
+        assert!(!shown.contains('\u{202e}'), "{shown}");
+        assert!(shown.starts_with("ok\\u{1b}[2J"), "{shown}");
+        // Ordinary text, accents and all, is left alone.
+        assert_eq!(
+            cell(&Value::String("café: 500 réessayer".into())),
+            "café: 500 réessayer"
+        );
+    }
 
     #[test]
     fn timestamps_outside_the_calendar_range_have_a_safe_fallback() {
