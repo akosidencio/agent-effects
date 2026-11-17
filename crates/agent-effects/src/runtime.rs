@@ -1318,8 +1318,8 @@ impl<S: EffectStore, F, V> Driver<'_, S, F, V> {
     ) -> Result<EffectRecord, Interrupt> {
         let retry = record.attempt_count.saturating_sub(1);
         let delay = self.retry().delay(retry, class, jitter_sample());
-        let at =
-            (self.rt.now() + delay).max(record.next_attempt_at.unwrap_or(SystemTime::UNIX_EPOCH));
+        let at = crate::retry::retry_due_at(self.rt.now(), delay)
+            .max(record.next_attempt_at.unwrap_or(SystemTime::UNIX_EPOCH));
         debug!(?delay, ?class, "retry scheduled");
         let scheduled = self
             .transition(record, Transition::ScheduleRetry, |r| {
