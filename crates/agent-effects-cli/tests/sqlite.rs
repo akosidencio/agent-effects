@@ -632,6 +632,40 @@ async fn wrong_states_versions_and_ids_are_refused_with_distinct_codes() {
 }
 
 #[tokio::test]
+async fn pending_matches_the_runtime_without_locking_rows() {
+    let f = fixture().await;
+    // Someone is working on the escalated effect: neither lists it.
+    f.store
+        .acquire_lease(
+            f.ids.escalated,
+            &agent_effects::WorkerId::new("busy"),
+            std::time::SystemTime::now(),
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    let listed = f.run(&["--format", "json", "pending"]).await.json();
+    let mut cli_ids: Vec<String> = listed["effects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["id"].as_str().unwrap().to_owned())
+        .collect();
+    let mut runtime_ids: Vec<String> = Runtime::new(f.store.clone())
+        .pending(None, 1000)
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.id.to_string())
+        .collect();
+    cli_ids.sort();
+    runtime_ids.sort();
+    assert_eq!(cli_ids, runtime_ids);
+    assert!(!cli_ids.contains(&f.ids.escalated.to_string()));
+    assert!(cli_ids.contains(&f.ids.awaiting.to_string()));
+}
+
+#[tokio::test]
 async fn a_held_effect_is_not_decided_over_a_worker() {
     let f = fixture().await;
     let lease = f

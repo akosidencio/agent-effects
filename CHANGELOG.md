@@ -5,7 +5,7 @@ All notable changes are listed here, following
 [Semantic Versioning](https://semver.org/). Before 1.0, minor releases may
 break the API or storage format.
 
-## [Unreleased]
+## [0.2.1]
 
 ### Added
 
@@ -64,12 +64,38 @@ break the API or storage format.
 - Fuzz targets for stored records/text, state transitions and retry delays.
 - Stored enum/JSON decoding errors omit potentially sensitive corrupt values;
   CLI URL parsing errors omit credentials and query values.
+- Known advisory RUSTSEC-2026-0459 (C SQLite CVE-2026-119375, bundled through
+  sqlx's `libsqlite3-sys` 0.37, also in 0.2.0): local, and needs a crafted
+  database and `-wal` file. sqlx 0.9.0 does not allow the fixed
+  `libsqlite3-sys` 0.39, so CI ignores this advisory, with a reason and a
+  removal condition, until it does. Do not open SQLite files from untrusted
+  sources; see SECURITY.md.
+- CLI: a URL with an unrecognised scheme (`mysql://`, a typo) is refused
+  instead of being opened as a SQLite file name, whose error printed the URL
+  with its password. SQLite errors omit the URL's query string. Human output
+  escapes control characters and bidirectional overrides in stored text
+  (provider error messages, notes), so they cannot drive the terminal.
 - Security disclosure policy and a production operations guide.
 - An unchanged v0.2.0 consumer/custom store and a SQLite database upgrade
   fixture run in CI without modifying the release tag or migration history.
 
 ### Fixed
 
+- A retry delay too large for the clock no longer panics. A provider's
+  `Retry-After: 18446744073709551615` (a valid header) overflowed
+  `SystemTime` in the effect's task: the caller got `Internal`, and the
+  rate-limited attempt, which never applied, was left to expire into
+  `Unknown`. Retries are now scheduled at most a hundred years ahead (also
+  for compensations). Present since 0.1.
+- PostgreSQL: a time beyond the year 9999 is stored as the latest
+  representable time instead of panicking during the write.
+- Compensation retries honour a provider's `Retry-After` on an ambiguous
+  failure (a 503, say), as effect retries already did; they used the
+  policy's backoff alone. Whether to retry is unchanged.
+- CLI: `pending` failed on every direct PostgreSQL connection ("cannot
+  execute SELECT FOR UPDATE in a read-only transaction") and for the
+  SELECT-only role the README recommends: it used the recovery scan, which
+  locks rows. It now reads without locks and lists the same effects.
 - CLI timestamp rendering handles stored dates beyond the calendar range
   without panicking.
 - Retry jitter no longer panics when a very large duration rounds beyond

@@ -38,7 +38,7 @@
 //! remotely idempotent, or verified not to have applied.
 //! Compensation retries are scheduled the same way.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
@@ -121,6 +121,24 @@ impl RetryPolicy {
     }
 }
 
+/// The furthest ahead a retry is ever scheduled: a hundred years.
+///
+/// A delay comes from the policy or from a provider's `Retry-After`, which
+/// is remote input: `Retry-After: 18446744073709551615` is a valid header.
+/// Without a cap, `now + delay` overflows `SystemTime` and panics, and a
+/// time past the year 9999 cannot be stored in PostgreSQL. A hundred years
+/// is later than any real retry yet stays representable everywhere, so the
+/// cap never brings a retry forward in practice.
+pub(crate) const MAX_RETRY_HORIZON: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
+
+/// When a retry `delay` after `now` becomes due, at most
+/// [`MAX_RETRY_HORIZON`] ahead. Never panics.
+pub(crate) fn retry_due_at(now: SystemTime, delay: Duration) -> SystemTime {
+    // `checked_add` fails only for a clock already within a hundred years of
+    // `SystemTime`'s upper bound (hundreds of billions of years away).
+    now.checked_add(delay.min(MAX_RETRY_HORIZON)).unwrap_or(now)
+}
+
 impl Default for RetryPolicy {
     fn default() -> Self {
         Self {
@@ -138,6 +156,24 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+
+    #[test]
+    fn retry_times_are_capped_instead_of_overflowing() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        // `Retry-After: 18446744073709551615` is a valid header.
+        assert_eq!(
+            retry_due_at(now, Duration::from_secs(u64::MAX)),
+            now + MAX_RETRY_HORIZON
+        );
+        assert_eq!(retry_due_at(now, Duration::MAX), now + MAX_RETRY_HORIZON);
+        // Real delays are kept exactly.
+        let minute = Duration::from_secs(60);
+        assert_eq!(retry_due_at(now, minute), now + minute);
+        assert_eq!(
+            retry_due_at(now, MAX_RETRY_HORIZON),
+            now + MAX_RETRY_HORIZON
+        );
+    }
 
     #[test]
     fn default_backoff_doubles_up_to_the_cap() {

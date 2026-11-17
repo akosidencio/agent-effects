@@ -72,6 +72,14 @@ is a per-worker snapshot of what its latest pass encountered, including work
 it subsequently finished; it is not an atomic global queue length. Use
 `agent-effects stats` to inspect stored levels, allowing for concurrent writes.
 
+Instruments count what *this observer's runtime* does. Decisions made
+elsewhere, with the `agent-effects` CLI or a runtime built without this
+observer, are not seen: `operator.resolutions` and `approval.decisions` miss
+them, and `pending_approval` and `awaiting_intervention` never count those
+effects back down. For "how many are waiting right now", alert on
+`recovery.backlog{state="awaiting_operator"}` (read from the store by every
+pass) or on `agent-effects --format json stats`, not on the up/down counters.
+
 ## Reading the numbers
 
 **`unknown` is the one to watch.** Each unknown outcome is an effect that may
@@ -104,7 +112,8 @@ are waited out without holding a lease.
 
 **Approvals.** `approval.duration` is how long agents wait for people.
 `pending_approval` rising without decisions means approvals are not being
-looked at.
+looked at, unless they are being decided with the CLI, which this observer
+does not see (above); check `agent-effects pending` before escalating.
 
 ## Example alerts (Prometheus)
 

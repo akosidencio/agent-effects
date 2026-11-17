@@ -22,8 +22,8 @@ use agent_effects::testkit::{Behavior, FakeRemote};
 use agent_effects::{
     Clock, CompensableEffect, CompensationContext, CompensationOutcome, EffectContext,
     EffectFailure, EffectHandler, EffectId, EffectKey, EffectKind, EffectName, EffectOutcome,
-    EffectRecord, EffectStatus, FailureClass, Handler, LogicalKey, RetryPolicy, Runtime,
-    RuntimeBuilder, TokioClock, VerifiableEffect, Verification, WorkerId,
+    EffectRecord, EffectStatus, FailureClass, Handler, LogicalKey, RecoveryConfig, RetryPolicy,
+    Runtime, RuntimeBuilder, TokioClock, VerifiableEffect, Verification, WorkerId,
 };
 use agent_effects_memory::MemoryStore;
 use fault_store::FaultStore;
@@ -736,4 +736,140 @@ mod real_time {
         )
         .await;
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unrepresentable_retry_after_is_capped_instead_of_panicking() {
+    let (store, clock) = setup();
+    let rt = builder(&store, clock, "w").build();
+    let calls = Arc::new(AtomicU32::new(0));
+    let start = Instant::now();
+    // `Retry-After: 18446744073709551615` parses to this. `now + delay`
+    // used to overflow `SystemTime` and panic the effect's task, leaving a
+    // rate-limited (so never applied) attempt to look unknown.
+    let outcome = rt
+        .effect(NAME, "k")
+        .kind(EffectKind::IdempotentWrite)
+        .run({
+            let calls = Arc::clone(&calls);
+            move |_| {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n == 0 {
+                        Err(EffectFailure::rate_limited(
+                            Some(Duration::from_secs(u64::MAX)),
+                            "slow down",
+                        ))
+                    } else {
+                        Ok::<_, EffectFailure>("done".to_string())
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(outcome, EffectOutcome::Committed("done".into()));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    // Capped at a hundred years, never brought forward to a real delay.
+    assert!(start.elapsed() >= Duration::from_secs(99 * 365 * 24 * 60 * 60));
+}
+
+/// Commits at once; its first compensation attempt fails ambiguously with a
+/// provider's `Retry-After`, as a 503 from `agent-effects-http` does.
+#[derive(Clone, Default)]
+struct Undo {
+    compensations: Arc<AtomicU32>,
+}
+
+impl EffectHandler for Undo {
+    const NAME: &'static str = "remote.undo";
+    type Input = String;
+    type Output = String;
+    type Error = EffectFailure;
+
+    async fn execute(&self, _: &EffectContext, _: &String) -> Result<String, EffectFailure> {
+        tokio::task::yield_now().await; // the remote call
+        Ok("done".into())
+    }
+}
+
+impl CompensableEffect for Undo {
+    async fn compensate(
+        &self,
+        _: &CompensationContext,
+        _: &String,
+        _: Option<&String>,
+    ) -> Result<(), EffectFailure> {
+        tokio::task::yield_now().await; // the remote call
+        if self.compensations.fetch_add(1, Ordering::SeqCst) == 0 {
+            Err(EffectFailure::ambiguous("503").with_retry_after(Duration::from_secs(300)))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn compensation_retries_honour_retry_after() {
+    let (store, clock) = setup();
+    let undo = Undo::default();
+    let rt = builder(&store, clock, "w")
+        .register(Handler::new(undo.clone()).compensable())
+        .build();
+    assert_eq!(
+        rt.submit::<Undo>("k", RES.into()).await.unwrap(),
+        EffectOutcome::Committed("done".into())
+    );
+    let start = Instant::now();
+    assert_eq!(
+        rt.compensate::<Undo>("k").await.unwrap(),
+        CompensationOutcome::Compensated
+    );
+    assert!(
+        start.elapsed() >= Duration::from_secs(300),
+        "waited the provider's Retry-After, not the one-minute backoff: {:?}",
+        start.elapsed()
+    );
+    assert_eq!(undo.compensations.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn retries_that_are_not_due_never_starve_an_eligible_effect() {
+    quiet_crashes();
+    let (store, clock) = setup();
+    // Five failures for five blocked effects; the next request succeeds.
+    let remote = FakeRemote::new(clock).script([Behavior::Fail(FailureClass::Transient); 5]);
+    let doomed = |point| {
+        builder(&store, clock, "doomed")
+            .register(handler(&remote).0)
+            .fault_injector(Arc::new(FaultInjector::new().at(point).crash()))
+            .build()
+    };
+    // Five retries a minute away, their workers lost after releasing the
+    // lease: every scan returns them, and they are not due.
+    let mut blocked = Vec::new();
+    for i in 0..5 {
+        let key = format!("blocked-{i}");
+        let rt = doomed(FaultPoint::AfterBackoffLeaseReleased);
+        assert!(rt.submit::<Create>(&key, format!("res-{i}")).await.is_err());
+        blocked.push(record(&store, &key).await.id);
+    }
+    // Then one intent that is due now, ordered after all of them.
+    let rt = doomed(FaultPoint::AfterInsert);
+    assert!(rt.submit::<Create>("due", RES.into()).await.is_err());
+    let due = record(&store, "due").await.id;
+    assert!(blocked.iter().all(|b| *b < due), "scan order puts it last");
+
+    // Pages of two: the first two and a half pages hold nothing to do.
+    let (create, _) = handler(&remote);
+    let rt = builder(&store, clock, "recovery").register(create).build();
+    let report = rt
+        .recover_with(RecoveryConfig::SEQUENTIAL.batch_size(2))
+        .await
+        .unwrap();
+    assert_eq!(report.resumed, [(due, EffectStatus::Committed)]);
+    let mut not_due = report.not_due.clone();
+    not_due.sort();
+    assert_eq!(not_due, blocked);
+    assert_eq!(remote.applications(RES), 1);
 }

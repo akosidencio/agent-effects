@@ -221,9 +221,23 @@ WAL archiving).
 - **In-flight requests can outlive a lease.** A worker that stalls past its
   lease is fenced off from writing, but its request may still reach the
   remote system; remote idempotency is the only full protection.
-- **Retry times use worker clocks**, even on PostgreSQL.
+- **Retry times use worker clocks**, even on PostgreSQL. A retry waited out
+  without its lease may be started by another host; if that host's clock is
+  ahead, it starts early by the difference. Timing only: whether a retry is
+  allowed was decided and stored before the wait. Keep hosts on NTP.
+- **Retries are capped a hundred years ahead.** A larger delay (a hostile or
+  broken `Retry-After`, say) is stored as a hundred years; nothing runs it
+  sooner unless an operator does.
+- **Waiting retries are re-read by every recovery pass.** A retry waited out
+  without its lease is a `Pending` record that each pass reads and reports as
+  `not_due`. With many long backoffs, pass cost grows with their number; use
+  a larger `batch_size` or a longer recovery interval.
 - **Up/down counters are per process** and drift across restarts; use the
-  recovery backlog gauge or `agent-effects stats` for exact levels.
+  recovery backlog gauge or `agent-effects stats` for exact levels. Decisions
+  made with the CLI are not seen by the application's metrics at all.
+- **Bundled SQLite has a known advisory** (RUSTSEC-2026-0459, local, needs
+  attacker-written files): never open a SQLite database you did not create.
+  See SECURITY.md.
 - **SQLite is single-host.** Several processes may share a file on one
   machine, not across machines.
 - **Pruning forgets.** A pruned key runs again on its next call; keep

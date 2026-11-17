@@ -1066,8 +1066,21 @@ fn to_u64(value: i64) -> Result<u64, StoreError> {
     u64::try_from(value).map_err(StoreError::backend)
 }
 
+/// `time` at its stored precision, clamped to the years `time` can represent
+/// (-9999 to 9999). `OffsetDateTime::from(SystemTime)` panics beyond them,
+/// and a far-future time can come from a caller's clock or a scheduled
+/// retry; PostgreSQL itself accepts every time in that range.
 fn timestamp(time: SystemTime) -> OffsetDateTime {
-    OffsetDateTime::from(round_trip(time))
+    match round_trip(time).duration_since(UNIX_EPOCH) {
+        Ok(after) => time::Duration::try_from(after)
+            .ok()
+            .and_then(|d| OffsetDateTime::UNIX_EPOCH.checked_add(d))
+            .unwrap_or(time::PrimitiveDateTime::MAX.assume_utc()),
+        Err(before) => time::Duration::try_from(before.duration())
+            .ok()
+            .and_then(|d| OffsetDateTime::UNIX_EPOCH.checked_sub(d))
+            .unwrap_or(time::PrimitiveDateTime::MIN.assume_utc()),
+    }
 }
 
 /// `time` at millisecond precision, the precision the store keeps.
@@ -1100,4 +1113,19 @@ fn normalize(record: &mut EffectRecord) {
     }
     record.created_at = round_trip(record.created_at);
     record.updated_at = round_trip(record.updated_at);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timestamps_beyond_the_representable_years_saturate_instead_of_panicking() {
+        let far = UNIX_EPOCH + Duration::from_secs(1 << 40); // year ~36,800
+        assert_eq!(timestamp(far), time::PrimitiveDateTime::MAX.assume_utc());
+        let early = UNIX_EPOCH - Duration::from_secs(1 << 40);
+        assert_eq!(timestamp(early), time::PrimitiveDateTime::MIN.assume_utc());
+        let now = UNIX_EPOCH + Duration::from_millis(1_800_000_000_123);
+        assert_eq!(SystemTime::from(timestamp(now)), now);
+    }
 }

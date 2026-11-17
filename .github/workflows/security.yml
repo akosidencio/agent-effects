@@ -38,7 +38,9 @@ jobs:
       - run: rustup toolchain install stable --profile minimal --no-self-update
       - run: cargo +stable install cargo-audit --version 0.22.2 --locked
       # Warnings (unmaintained, yanked) are reported; vulnerabilities fail.
-      - run: cargo +stable audit --deny unsound
+      # RUSTSEC-2026-0459: libsqlite3-sys via sqlx 0.9.0, no fix available
+      # yet; see the ignore list in deny.toml (keep the two in step).
+      - run: cargo +stable audit --deny unsound --ignore RUSTSEC-2026-0459
       - run: cargo +stable audit --file fuzz/Cargo.lock --deny unsound
 
   secrets:
