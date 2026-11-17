@@ -60,6 +60,11 @@ async fn postgres_inspect_and_decide_with_the_database_role_as_identity() {
     let stats = run(&["--format", "json", "stats"]).await;
     assert_eq!(stats.code, exit::OK, "{}", stats.err);
     assert_eq!(stats.json()["total"], 4);
+    // A read-only connection: `pending` must not take row locks.
+    let pending = run(&["--format", "json", "pending"]).await;
+    assert_eq!(pending.code, exit::OK, "{}", pending.err);
+    let listed = pending.json()["effects"].as_array().unwrap().len();
+    assert_eq!(listed, 3, "escalated, awaiting approval, scheduled retry");
     let inspect = run(&["--format", "json", "inspect", &ids.escalated.to_string()]).await;
     assert_eq!(
         inspect.json()["late_observations"]
@@ -214,19 +219,13 @@ async fn postgres_grants_are_the_boundary() {
     };
     let id = ids.awaiting.to_string();
     let viewer_url = as_role(&viewer);
-    let read = cli(
-        &[
-            "--database-url",
-            &viewer_url,
-            "--schema",
-            &schema,
-            "inspect",
-            &id,
-        ],
-        &mut Script::default(),
-    )
-    .await;
-    assert_eq!(read.code, exit::OK, "{}", read.err);
+    // SELECT alone is enough for every read command, `pending` included.
+    for command in [&["inspect", id.as_str()][..], &["pending"]] {
+        let mut args = vec!["--database-url", &viewer_url, "--schema", &schema];
+        args.extend_from_slice(command);
+        let read = cli(&args, &mut Script::default()).await;
+        assert_eq!(read.code, exit::OK, "{command:?}: {}", read.err);
+    }
     let write = cli(
         &[
             "--database-url",
