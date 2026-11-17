@@ -2,6 +2,12 @@
 //! approvals, operator resolutions, leases, recovery and pruning, and the
 //! guarantee that no attribute is unbounded or identifies an effect.
 
+#![allow(
+    clippy::float_cmp,
+    reason = "every compared value is a counter, gauge or histogram count: a sum of \
+              small integers, which f64 represents exactly"
+)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
