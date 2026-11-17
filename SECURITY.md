@@ -39,6 +39,20 @@ providers or authorization; denial of service by someone who can already
 write to the store; and anything requiring access the deployment already
 grants (database administrator, the host running the workers).
 
+## Known advisories
+
+- **RUSTSEC-2026-0459 / CVE-2026-119375** (SQLite before 3.54, bundled by
+  `libsqlite3-sys` < 0.39 through sqlx): opening a crafted database file
+  together with a crafted `-wal` file can return uninitialized process memory.
+  It affects `agent-effects-sqlite` and the CLI's SQLite support. The attack
+  is local: someone must be able to write both files the process opens.
+  Anyone who can write your effects database can already forge its records,
+  so for the store's own database the advisory adds little. **Do not open a
+  SQLite database from an untrusted source** with the CLI or the store.
+  No patched build is possible until sqlx allows `libsqlite3-sys` 0.39; CI
+  ignores this one advisory until then, and the ignore will be removed with
+  that upgrade. PostgreSQL deployments are not affected.
+
 ## Hardening in this repository
 
 - Every pull request runs `cargo deny` (advisories, licenses, sources) and a

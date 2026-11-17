@@ -235,6 +235,9 @@ WAL archiving).
 - **Up/down counters are per process** and drift across restarts; use the
   recovery backlog gauge or `agent-effects stats` for exact levels. Decisions
   made with the CLI are not seen by the application's metrics at all.
+- **Bundled SQLite has a known advisory** (RUSTSEC-2026-0459, local, needs
+  attacker-written files): never open a SQLite database you did not create.
+  See SECURITY.md.
 - **SQLite is single-host.** Several processes may share a file on one
   machine, not across machines.
 - **Pruning forgets.** A pruned key runs again on its next call; keep

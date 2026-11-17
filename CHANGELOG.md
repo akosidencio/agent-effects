@@ -64,6 +64,12 @@ break the API or storage format.
 - Fuzz targets for stored records/text, state transitions and retry delays.
 - Stored enum/JSON decoding errors omit potentially sensitive corrupt values;
   CLI URL parsing errors omit credentials and query values.
+- Known advisory RUSTSEC-2026-0459 (C SQLite CVE-2026-119375, bundled through
+  sqlx's `libsqlite3-sys` 0.37, also in 0.2.0): local, and needs a crafted
+  database and `-wal` file. sqlx 0.9.0 does not allow the fixed
+  `libsqlite3-sys` 0.39, so CI ignores this advisory, with a reason and a
+  removal condition, until it does. Do not open SQLite files from untrusted
+  sources; see SECURITY.md.
 - CLI: a URL with an unrecognised scheme (`mysql://`, a typo) is refused
   instead of being opened as a SQLite file name, whose error printed the URL
   with its password. SQLite errors omit the URL's query string. Human output
