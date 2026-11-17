@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agent-effects"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "agent-effects-store",
  "serde",
@@ -28,7 +28,7 @@ dependencies = [
 
 [[package]]
 name = "agent-effects-store"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "serde_json",
