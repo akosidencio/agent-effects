@@ -115,3 +115,48 @@ fn malformed_connection_options_do_not_echo_secret_values() {
         assert!(!stderr.contains("password"), "{stderr}");
     }
 }
+
+#[test]
+fn unrecognised_schemes_are_refused_without_echoing_credentials() {
+    // Once taken for SQLite file names: the failed open printed the URL.
+    for url in [
+        "mysql://app:hunter2-secret@127.0.0.1:9/effects",
+        "postgresql+psycopg://app:hunter2-secret@127.0.0.1:9/effects",
+    ] {
+        let output = agent_effects(&["--database-url", url, "--format", "json", "stats"]);
+        assert_eq!(code(&output), exit::USAGE);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("hunter2"), "{stderr}");
+        assert!(
+            stderr.contains("unsupported database URL scheme"),
+            "{stderr}"
+        );
+    }
+    // A scheme in capitals is still PostgreSQL, and still redacted.
+    let output = agent_effects(&[
+        "--database-url",
+        "POSTGRES://app:hunter2-secret@127.0.0.1:9/effects",
+        "--format",
+        "json",
+        "stats",
+    ]);
+    assert_eq!(code(&output), exit::CONNECTION);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("hunter2"), "{stderr}");
+}
+
+#[test]
+fn sqlite_open_errors_omit_query_values() {
+    let output = agent_effects(&[
+        "--database-url",
+        "sqlite:/nonexistent-dir/effects.db?mode=rw&cache=private",
+        "--format",
+        "json",
+        "stats",
+    ]);
+    assert_eq!(code(&output), exit::CONNECTION);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // The path is shown; the connection options are not.
+    assert!(stderr.contains("/nonexistent-dir/effects.db"), "{stderr}");
+    assert!(!stderr.contains("cache=private"), "{stderr}");
+}
