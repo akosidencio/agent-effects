@@ -76,6 +76,11 @@ reason. Inspecting never changes an effect: read commands open read-only
 connections (`mode=ro` for SQLite; `default_transaction_read_only` for a
 direct PostgreSQL connection) and never retry, verify or recover anything.
 
+Decisions made here are recorded in the audit trail, but not in the
+application's OpenTelemetry metrics: the CLI runs without the application's
+observer. See [Observability](../../guides/observability.md) for which
+metrics to alert on.
+
 ## Authorization and trust boundary
 
 The CLI is a local process. It opens no network listener and exposes no
