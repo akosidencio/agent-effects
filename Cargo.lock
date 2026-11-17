@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agent-effects"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "agent-effects",
  "agent-effects-memory",
@@ -20,7 +20,7 @@ dependencies = [
 
 [[package]]
 name = "agent-effects-bench"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "agent-effects",
  "agent-effects-memory",
@@ -35,7 +35,7 @@ dependencies = [
 
 [[package]]
 name = "agent-effects-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "agent-effects",
  "agent-effects-memory",
@@ -53,7 +53,7 @@ dependencies = [
 
 [[package]]
 name = "agent-effects-examples"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "agent-effects",
  "agent-effects-memory",
@@ -63,7 +63,7 @@ dependencies = [
 
 [[package]]
 name = "agent-effects-http"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "agent-effects",
  "agent-effects-memory",
@@ -76,7 +76,7 @@ dependencies = [
 
 [[package]]
 name = "agent-effects-memory"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "agent-effects-store",
  "tokio",
@@ -84,7 +84,7 @@ dependencies = [
 
 [[package]]
 name = "agent-effects-otel"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "agent-effects",
  "agent-effects-memory",
@@ -96,7 +96,7 @@ dependencies = [
 
 [[package]]
 name = "agent-effects-postgres"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "agent-effects",
  "agent-effects-store",
@@ -109,7 +109,7 @@ dependencies = [
 
 [[package]]
 name = "agent-effects-sqlite"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "agent-effects",
  "agent-effects-store",
@@ -123,7 +123,7 @@ dependencies = [
 
 [[package]]
 name = "agent-effects-store"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "proptest",
  "serde",
